@@ -56,13 +56,33 @@ This workstation also has `vendor-imgui` and `vendor-reshade` convenience remote
 Create vendor-only branches when preparing patches for a fork or upstream:
 
 ```bash
-git subtree split --prefix=src/vendor/imgui --branch=patches/imgui
-git subtree split --prefix=src/vendor/reshade --branch=patches/reshade
+git subtree split --prefix=src/vendor/imgui --branch=patches/imgui HEAD \
+    https://github.com/buwryme/imgui-material-3.git
+git subtree split --prefix=src/vendor/reshade --branch=patches/reshade HEAD \
+    https://github.com/buwryme/reshade-vkintox.git
 ```
 
 Use a new branch name if that name already exists. Splitting does not change
 the checked-out application branch or push anything. The exported histories
 start from the corresponding vendor baseline and contain VKIntox's vendor edits.
+
+Keep the repository URL on these commands: a fresh clone has the squashed
+vendor sources but may not have the original vendor commit objects. Git can
+fetch the missing baseline when exporting. Ordinary edits, commits and builds
+do not need that fetch.
+
+### migration verification
+
+- A plain clone built the native layer from scratch without submodule setup.
+  This workstation's existing local `wayland-protocols` package was supplied
+  through `PKG_CONFIG_PATH`; vendor sources needed no external checkout.
+- The Zig i686 build passed; all 15 Meson suites passed for each architecture,
+  including the enabled X11 input handoff check on an isolated display.
+- The clean-clone layer compiled DisplayDepth, resolved depth, and completed
+  23 depth rebuilds during an 11-second `vkcube` smoke run without crashing.
+- A transport-equivalent clone (`git clone --no-local`) exported both vendor
+  histories using the commands above. Exported trees matched the corresponding
+  VKIntox directories and retained their original vendor baseline ancestry.
 
 ### local migration backup
 
