@@ -44,7 +44,11 @@ namespace
     // publish is detectable as a null image
     VkImage sentinelImage(uintptr_t n)
     {
+#if VK_USE_64_BIT_PTR_DEFINES
         return reinterpret_cast<VkImage>(n);
+#else
+        return static_cast<VkImage>(n);
+#endif
     }
 
     void test_consume_without_publish_is_empty()

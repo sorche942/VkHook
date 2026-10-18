@@ -36,6 +36,16 @@ namespace VKIntox
 
         ensureRegistered();
         pumpX11Input();
+        if (x11CapturedMouseState(state))
+        {
+            scrollAccumulator = 0.0f;
+            return state;
+        }
+        if (!x11GameFocused())
+        {
+            scrollAccumulator = 0.0f;
+            return state;
+        }
 
         const Window root = DefaultRootWindow(display);
         Window rootRet = 0, childRet = 0;

@@ -21,6 +21,7 @@
 #include <sstream>
 #include <dlfcn.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #include <signal.h>
 #include <setjmp.h>
 #include <execinfo.h>
@@ -38,6 +39,7 @@
 #include "logical_device.hh"
 #include "vk_handle.hh"
 #include "logical_swapchain.hh"
+#include "native_capture.hh"
 
 #include "image_view.hh"
 #include "image.hh"
@@ -1278,6 +1280,9 @@ namespace VKIntox
             return;
         }
 
+        // New scope for each swapchain build/reload: history must not alias an
+        // old chain (possibly still in flight) or another swapchain's images.
+        ReshadeTexturePool texturePool(logicalDevice);
         for (uint32_t i = 0; i < effectStrings.size(); i++)
         {
             Logger::debug("creating effect " + std::to_string(i) + ": " + effectStrings[i]);
@@ -1348,7 +1353,7 @@ namespace VKIntox
                 {
                     auto reshadeEffect = std::make_shared<ReshadeEffect>(
                         logicalDevice, logicalSwapchain->format, logicalSwapchain->imageExtent,
-                        firstImages, secondImages, &effectRegistry, effectStrings[i], effectPath, customDefs);
+                        firstImages, secondImages, &effectRegistry, texturePool, effectStrings[i], effectPath, customDefs);
                     logicalSwapchain->effects.push_back(reshadeEffect);
                     if (reshadeEffect->getOutputWrites() == 0)
                     {
@@ -1512,7 +1517,7 @@ namespace VKIntox
             return VK_SUCCESS;
 
         VkCommandBuffer overlayCmd = logicalDevice->imguiOverlay->recordFrame(
-            index, swapchain->images[index], swapchain->imageViews[index],
+            index, swapchain->imageViews[index],
             swapchain->imageExtent.width, swapchain->imageExtent.height);
 
         if (overlayCmd == VK_NULL_HANDLE)
@@ -1978,6 +1983,22 @@ namespace VKIntox
                 break;
             }
         }
+        if (nativeCaptureEnabled())
+        {
+            logicalDevice->nativeCapture = std::make_shared<NativeCapture>();
+            auto& native = *logicalDevice->nativeCapture;
+            native.queueFamily = logicalDevice->queueFamilyIndex;
+            uint32_t graphicsQueueCount = 0;
+            for (uint32_t i = 0; i < pCreateInfo->queueCreateInfoCount; ++i)
+                if (pCreateInfo->pQueueCreateInfos[i].queueFamilyIndex == native.queueFamily)
+                    graphicsQueueCount += pCreateInfo->pQueueCreateInfos[i].queueCount;
+            // A recorded CB may be submitted to any queue in its pool's family.
+            // With multiple queues we cannot prove that a future replay won't
+            // overwrite a snapshot while an effect on another queue reads it.
+            native.queueSafe = logicalDevice->queue && graphicsQueueCount == 1;
+            if (!native.queueSafe)
+                Logger::warn("DDDA native G-buffer unavailable: requires one queue in the effect graphics family");
+        }
 
         if (!logicalDevice->queue)
         {
@@ -2075,6 +2096,12 @@ namespace VKIntox
             logicalDevice->vkd.DestroyPipelineCache(device, logicalDevice->pipelineCache, pAllocator);
             logicalDevice->pipelineCache = VK_NULL_HANDLE;
         }
+        // The application has finished its device work; retained snapshots must
+        // release their Vulkan objects before the underlying device disappears.
+        for (auto& entry : swapchainMap)
+            if (entry.second && entry.second->logicalDevice == logicalDevice)
+                entry.second->nativeMaterialSnapshots.clear();
+        logicalDevice->nativeCapture.reset();
 
         logicalDevice->vkd.DestroyDevice(device, pAllocator);
 
@@ -2196,8 +2223,8 @@ namespace VKIntox
         if (result == VK_SUCCESS && swapchain != nullptr && *swapchain != VK_NULL_HANDLE)
         {
             // NOW check if this handle already existed (recreation scenario)
-            uint64_t handle = (uint64_t)(uintptr_t)*swapchain;
-            auto oldIt = swapchainMap.find((VkSwapchainKHR)handle); // Cast back or use proper key type
+            const VkSwapchainKHR handle = *swapchain;
+            auto oldIt = swapchainMap.find(handle);
             
             // Since swapchain handles are opaque, we use the map key directly
             // If an entry with this key exists, we're recreating
@@ -2212,11 +2239,11 @@ namespace VKIntox
                     oldIt->second->destroy();
 
                 // Replace the old entry
-                swapchainMap[(VkSwapchainKHR)handle] = logicalSwapchain;
+                swapchainMap[handle] = logicalSwapchain;
             }
             else
             {
-                swapchainMap[(VkSwapchainKHR)handle] = logicalSwapchain;
+                swapchainMap[handle] = logicalSwapchain;
             }
             
             // clear depth state so nothing stale survives into the new swapchain
@@ -2362,7 +2389,7 @@ namespace VKIntox
         {
             VkCommandPoolCreateInfo poolCI = {};
             poolCI.sType            = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-            poolCI.flags            = 0;
+            poolCI.flags            = nativeCaptureEnabled() ? VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT : 0;
             poolCI.queueFamilyIndex = logicalDevice->queueFamilyIndex;
             VkResult poolResult = logicalDevice->vkd.CreateCommandPool(
                 logicalDevice->device, &poolCI, nullptr, &logicalSwapchain->commandPool);
@@ -2939,6 +2966,17 @@ namespace VKIntox
 
     VKAPI_ATTR VkResult VKAPI_CALL VKIntox_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPresentInfo)
     {
+        // Consume even on early soft-disable/resize/passthrough returns. Menus
+        // and a later re-enable must not resurrect an older native submission.
+        std::shared_ptr<NativeSnapshot> nativeFrame;
+        if (nativeCaptureEnabled())
+        {
+            scoped_lock nativeLock(globalLock);
+            const auto found = deviceMap.find(GetKey(queue));
+            if (found != deviceMap.end() && found->second->nativeCapture)
+                nativeFrame = found->second->nativeCapture->takeFrame(
+                    queue == found->second->queue ? queue : VK_NULL_HANDLE);
+        }
         // Soft-disable fast path: panicLayer() has flipped this bit. The layer
         // is no longer trusted to touch the GPU, so we pass straight through
         // to the driver — except we still submit an overlay-only frame so any
@@ -3003,7 +3041,7 @@ namespace VKIntox
                     }
 
                     VkCommandBuffer overlayCmd = passThroughDevice->imguiOverlay->recordFrame(
-                        index, swap->images[index], swap->imageViews[index],
+                        index, swap->imageViews[index],
                         swap->imageExtent.width, swap->imageExtent.height);
 
                     if (overlayCmd == VK_NULL_HANDLE)
@@ -3379,6 +3417,7 @@ namespace VKIntox
         if (!logicalDevice)
             return VK_ERROR_DEVICE_LOST;
 
+
         if (presentHasPassthrough)
         {
             // this swapchain was never faked, so submit no layer buffers for
@@ -3508,6 +3547,12 @@ namespace VKIntox
                 // fenced submissions, so skip our submit for this frame the way
                 // the depth-copy ring skips a busy slot.
                 const uint32_t presentImage = presentIndices[presentIndex];
+                if (nativeCaptureEnabled() && (presentImage >= sc->effectSubmitFences.size()
+                    || sc->effectSubmitFences[presentImage] == VK_NULL_HANDLE))
+                {
+                    bypassDepthForPresent = true;
+                    break;
+                }
                 if (presentImage < sc->effectSubmitFences.size()
                     && presentImage < sc->effectSubmitFenceUsed.size()
                     && sc->effectSubmitFenceUsed[presentImage]
@@ -3602,6 +3647,20 @@ namespace VKIntox
         {
             LogicalSwapchain* logicalSwapchain = presentSwapchains[i].get();
             uint32_t index = presentIndices[i];
+            if (nativeCaptureEnabled())
+            {
+                const bool valid = nativeFrame
+                    && nativeFrame->extent.width == logicalSwapchain->imageExtent.width
+                    && nativeFrame->extent.height == logicalSwapchain->imageExtent.height;
+                // The per-image fence gate above has completed. Retain the new
+                // allocation before updating descriptors, releasing the old one
+                // only now that its previous effect submission is no longer live.
+                logicalSwapchain->nativeMaterialSnapshots.resize(logicalSwapchain->imageCount);
+                logicalSwapchain->nativeMaterialSnapshots[index] = valid ? nativeFrame : nullptr;
+                for (auto& effect : logicalSwapchain->effects)
+                    effect->useNativeMaterial(index, valid ? nativeFrame->view : VK_NULL_HANDLE,
+                                             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, valid);
+            }
 
             // Update effect uniforms only when effects are active (saves CPU+GPU when off).
             // Wrapped in try/catch so a misbehaving effect's per-frame update can
@@ -3613,6 +3672,18 @@ namespace VKIntox
                 {
                     for (auto& effect : logicalSwapchain->effects)
                         effect->updateEffect();
+                    if (nativeCaptureEnabled())
+                    {
+                        // Updating ordinary descriptor bindings invalidates the
+                        // executable CB. Re-record only this fence-safe image.
+                        scoped_lock recordLock(globalLock);
+                        DepthState frameDepth = getDepthState(logicalDevice);
+                        if (!depthMatchesSwapchainExtent(frameDepth, logicalSwapchain)
+                            || !validateDepthStateForResolve(logicalDevice, frameDepth))
+                            frameDepth = {};
+                        writeCommandBuffers(logicalDevice, logicalSwapchain, logicalSwapchain->effects,
+                                            logicalSwapchain->commandBuffersEffect, frameDepth, index);
+                    }
                 }
                 catch (const std::exception& e)
                 {
@@ -4959,73 +5030,6 @@ namespace VKIntox
         }
     }
 
-    // ReShade-style depth preservation: when the app clears the depth attachment
-    // mid-render-pass (vkCmdClearAttachments), record a depth snapshot BEFORE
-    // the clear is issued. This captures the pre-clear depth so effects can use
-    // it even if the app clears depth at the end of the frame (which Roblox and
-    // many deferred renderers do). Without this, the end-of-render-pass snapshot
-    // would capture the cleared (empty) depth.
-    VKAPI_ATTR void VKAPI_CALL VKIntox_CmdClearAttachments(VkCommandBuffer commandBuffer,
-                                                           uint32_t attachmentCount,
-                                                           const VkClearAttachment* pAttachments,
-                                                           uint32_t rectCount,
-                                                           const VkClearRect* pRects)
-    {
-        if (!VKIntox::depthCaptureActive())
-        {
-            scoped_lock l(globalLock);
-            auto devIt = deviceMap.find(GetKey(commandBuffer));
-            if (devIt != deviceMap.end())
-                devIt->second->vkd.CmdClearAttachments(commandBuffer, attachmentCount, pAttachments, rectCount, pRects);
-            return;
-        }
-
-        LogicalDevice* logicalDevice = nullptr;
-        DepthState depthToPreserve = {};
-        DepthSnapshotTarget snapshotTarget = {};
-        bool hasDepthClear = false;
-        {
-            scoped_lock l(globalLock);
-            auto devIt = deviceMap.find(GetKey(commandBuffer));
-            if (devIt != deviceMap.end())
-            {
-                logicalDevice = devIt->second.get();
-
-                // Check if this clear includes the depth attachment we're tracking.
-                auto scopeIt = logicalDevice->commandBufferDepthStates.find(commandBuffer);
-                if (scopeIt != logicalDevice->commandBufferDepthStates.end()
-                    && scopeIt->second.inRenderScope
-                    && hasDepthState(scopeIt->second.depthState))
-                {
-                    for (uint32_t i = 0; i < attachmentCount; i++)
-                    {
-                        if (pAttachments[i].aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT)
-                        {
-                            depthToPreserve = scopeIt->second.depthState;
-                            snapshotTarget = scopeIt->second.snapshotTarget;
-                            hasDepthClear = true;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Record a snapshot BEFORE the clear captures the pre-clear depth.
-        // This is the key ReShade technique for preserving depth in deferred
-        // renderers that clear depth between passes.
-        if (logicalDevice && hasDepthClear && hasDepthState(depthToPreserve))
-        {
-            if (hasPresentableSnapshotTarget(snapshotTarget))
-                recordDepthResolveSnapshotForCommandBuffer(logicalDevice, commandBuffer, depthToPreserve, &snapshotTarget);
-            else
-                recordDepthResolveSnapshotForAllSwapchains(logicalDevice, commandBuffer, depthToPreserve);
-        }
-
-        if (logicalDevice)
-            logicalDevice->vkd.CmdClearAttachments(commandBuffer, attachmentCount, pAttachments, rectCount, pRects);
-    }
-
     // ReShade-style depth preservation for out-of-render-pass depth clears.
     // If the app calls vkCmdClearDepthStencilImage on a tracked depth image,
     // record a snapshot BEFORE the clear.
@@ -5045,34 +5049,25 @@ namespace VKIntox
             return;
         }
 
-        LogicalDevice* logicalDevice = nullptr;
-        DepthState depthToPreserve = {};
-        bool shouldPreserve = false;
-        {
-            scoped_lock l(globalLock);
-            auto devIt = deviceMap.find(GetKey(commandBuffer));
-            if (devIt != deviceMap.end())
-            {
-                logicalDevice = devIt->second.get();
+        scoped_lock l(globalLock);
+        auto devIt = deviceMap.find(GetKey(commandBuffer));
+        if (devIt == deviceMap.end())
+            return;
 
-                // If this image is the currently-active depth source, preserve it.
-                if (logicalDevice->activeDepthState.image == image && hasDepthState(logicalDevice->activeDepthState))
-                {
-                    depthToPreserve = logicalDevice->activeDepthState;
-                    shouldPreserve = true;
-                }
-            }
-        }
-
-        if (logicalDevice && shouldPreserve)
+        auto* logicalDevice = devIt->second.get();
+        const auto& activeDepth = logicalDevice->activeDepthState;
+        if (activeDepth.image == image && hasDepthState(activeDepth))
         {
+            // Snapshot helpers read tracked resources under globalLock. The
+            // clear's explicit layout is authoritative, not the last draw's.
+            DepthState sourceDepth = activeDepth;
+            sourceDepth.observedLayout = imageLayout;
             Logger::debug("CmdClearDepthStencilImage: preserving depth before clear of active depth image="
                           + convertToString(image));
-            recordDepthResolveSnapshotForAllSwapchains(logicalDevice, commandBuffer, depthToPreserve);
+            recordDepthResolveSnapshotForAllSwapchains(logicalDevice, commandBuffer, sourceDepth);
         }
 
-        if (logicalDevice)
-            logicalDevice->vkd.CmdClearDepthStencilImage(commandBuffer, image, imageLayout, pDepthStencil, rangeCount, pRanges);
+        logicalDevice->vkd.CmdClearDepthStencilImage(commandBuffer, image, imageLayout, pDepthStencil, rangeCount, pRanges);
     }
 
     VKAPI_ATTR void VKAPI_CALL VKIntox_CmdDraw(VkCommandBuffer commandBuffer,
@@ -5609,6 +5604,8 @@ namespace VKIntox
         }
         return VK_SUCCESS;
     }
+#include "native_intercepts.inc"
+
 } // namespace VKIntox
 
 extern "C"
@@ -5685,7 +5682,6 @@ extern "C"
     GETPROCADDR(CmdEndRendering); \
     GETPROCADDR(CmdEndRenderingKHR); \
     GETPROCADDR(CmdBlitImage); \
-    GETPROCADDR(CmdClearAttachments); \
     GETPROCADDR(CmdClearDepthStencilImage); \
     GETPROCADDR(CmdCopyImage); \
     GETPROCADDR(CmdExecuteCommands); \
@@ -5701,6 +5697,8 @@ extern "C"
     VK_SHADE_EXPORT PFN_vkVoidFunction VKAPI_CALL VKIntox_GetDeviceProcAddr(VkDevice device, const char* pName)
     {
         VKIntox::initConfigs();
+        if (auto native = VKIntox::nativeIntercept(pName))
+            return native;
 
         INTERCEPT_CALLS
 
@@ -5724,6 +5722,8 @@ extern "C"
     VK_SHADE_EXPORT PFN_vkVoidFunction VKAPI_CALL VKIntox_GetInstanceProcAddr(VkInstance instance, const char* pName)
     {
         VKIntox::initConfigs();
+        if (auto native = VKIntox::nativeIntercept(pName))
+            return native;
 
         INTERCEPT_CALLS
 

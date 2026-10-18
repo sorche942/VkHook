@@ -2,7 +2,6 @@
 #include "reshade_parser.hh"
 #include "config_serializer.hh"
 #include "logger.hh"
-#include "overlay/ui_icons.hh"
 #include "overlay/ui_theme.hh"
 
 #include <filesystem>
@@ -135,17 +134,17 @@ namespace VKIntox
         {
             const float progress = shaderTestQueue.empty() ? 1.0f :
                 static_cast<float>(shaderTestCurrentIndex) / static_cast<float>(shaderTestQueue.size());
-            ImGui::M3LinearProgress(progress, ImVec2(-1, 0), true);
+            ImGui::ProgressBar(progress);
             UI::TextSupport(("Testing " + std::to_string(shaderTestCurrentIndex) + "/" +
                              std::to_string(shaderTestQueue.size()) + " shaders...").c_str());
         }
         else
         {
             const bool alreadyTested = shaderTestComplete && overlayStateVersion == shaderTestStateVersion;
-            const std::string label = alreadyTested
-                ? std::string(Icon::RefreshUtf8) + "  Refresh paths and compile-test again"
-                : std::string(Icon::ScienceUtf8) + "  Compile-test shaders";
-            if (ImGui::M3Button(label.c_str(), alreadyTested ? ImGuiM3Button_Tonal : ImGuiM3Button_Filled))
+            const char* label = alreadyTested
+                ? "Refresh paths and compile-test again"
+                : "Compile-test shaders";
+            if (ImGui::Button(label))
                 startShaderTest();
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip(alreadyTested
@@ -165,7 +164,6 @@ namespace VKIntox
                     failCount++;
             }
             const int depthCount = static_cast<int>(depthShaders.size());
-            UI::PushSupport();
             if (failCount == 0)
                 ImGui::TextColored(UI::Success(), "All %d passed", passCount);
             else
@@ -184,7 +182,6 @@ namespace VKIntox
                 if (ImGui::IsItemHovered())
                     ImGui::SetTooltip("Identical files (symlinks or copies) found in multiple shader paths.\nEach unique file is tested exactly once.");
             }
-            UI::PopSupport();
         }
 
         ImGui::Spacing();
@@ -200,12 +197,7 @@ namespace VKIntox
         if (results.empty())
             return;
 
-        const ImGuiM3Metrics& m = ImGuiM3GetMetrics();
-        const float d = m.density;
-        const float rowStride = 30.0f * d;
-        const float maxBodyH = 240.0f * d;
-
-        // bucket the results once, so the bodies can be virtualized
+        // Group results by compilation status and depth requirements.
         std::vector<size_t> failed, depth, safe;
         for (size_t i = 0; i < results.size(); ++i)
         {
@@ -218,85 +210,42 @@ namespace VKIntox
                 safe.push_back(i);
         }
 
-        static bool failedOpen = false;
-        static bool depthOpen = false;
-        static bool safeOpen = false;
-
-        auto renderGroup = [&](const char* id, const char* label, const std::vector<size_t>& indices,
-                               const char* tooltip, bool* open, ImVec4 nameColor) {
+        auto renderGroup = [&](const char* label, const std::vector<size_t>& indices,
+                               const char* tooltip, ImVec4 nameColor) {
             if (indices.empty())
                 return;
-            const std::string badge = std::to_string(indices.size());
-            const float reveal = UI::FoldHeader(id, label, badge.c_str(), open);
-            if (!UI::FoldBodyBegin(id, reveal, indices.size() * rowStride, maxBodyH))
+            if (!ImGui::CollapsingHeader(label))
                 return;
-
-            ImDrawList* dl = ImGui::GetWindowDrawList();
-            const float gap = 4.0f * d;
-            ImFont* nameFont = ImGuiM3FontMedium();
-            const float namePx = ImGuiM3GetTypeStyle(ImGuiM3Type_BodyMedium).size * d;
-            const ImU32 nameCol = ImGui::GetColorU32(nameColor);
-
-            ImGuiListClipper clipper;
-            clipper.Begin(static_cast<int>(indices.size()), rowStride);
-            while (clipper.Step())
+            ImGui::PushID(label);
+            ImGui::TextDisabled("%zu shaders", indices.size());
+            ImGui::TextWrapped("%s", tooltip);
+            for (size_t index : indices)
             {
-                for (int k = clipper.DisplayStart; k < clipper.DisplayEnd; ++k)
+                const auto& [name, path, success, error] = results[index];
+                ImGui::PushID(static_cast<int>(index));
+                ImGui::PushStyleColor(ImGuiCol_Text, nameColor);
+                const bool expanded = ImGui::TreeNode("Result", "%s%s", name.c_str(),
+                                                     error.empty() ? "" : (success ? " (warnings)" : " (errors)"));
+                ImGui::PopStyleColor();
+                if (expanded)
                 {
-                    const auto& [name, path, success, error] = results[indices[static_cast<size_t>(k)]];
-                    ImGui::PushID(k);
-                    const ImVec2 itemMin = ImGui::GetCursorScreenPos();
-                    const float itemW = ImMax(ImGui::GetContentRegionAvail().x, 1.0f);
-                    ImGui::InvisibleButton("##shader_row", ImVec2(itemW, rowStride));
-                    const bool hovered = ImGui::IsItemHovered();
-                    const ImRect itemRect(ImVec2(itemMin.x, itemMin.y + gap * 0.5f),
-                                          ImVec2(itemMin.x + itemW, itemMin.y + rowStride - gap * 0.5f));
-                    const float rr = ImGuiM3Radius(ImGuiM3Shape_Small);
-                    const ImGuiM3ShapeRounding round{ rr, rr, rr, rr };
-                    ImGuiM3PathRoundedRect(dl, itemRect, round, ImGuiM3ColorU32(ImGuiM3Role_SurfaceContainer));
-                    if (hovered)
-                        ImGuiM3DrawStateLayer(dl, itemRect, round, ImGuiM3Role_OnSurface, ImGuiM3State_Hovered);
-
-                    const ImVec2 nameSize = ImGui::CalcTextSize(name.c_str());
-                    dl->AddText(nameFont, namePx,
-                                ImVec2(itemMin.x + 14.0f * d, itemRect.GetCenter().y - nameSize.y * 0.5f),
-                                nameCol, name.c_str());
-
+                    ImGui::TextWrapped("%s", path.c_str());
                     if (!error.empty())
                     {
-                        const float warnPx = 11.0f * d;
-                        ImFont* bodyBold = ImGuiM3FontBodyBold();
-                        dl->AddText(bodyBold, warnPx,
-                                    ImVec2(itemRect.Max.x - 16.0f * d - ImGui::CalcTextSize("warnings").x * 0.75f,
-                                           itemRect.GetCenter().y - warnPx * 0.7f),
-                                    ImGuiM3ColorU32(ImGuiM3Role_OnSurfaceVariant), "warnings");
+                        ImGui::PushTextWrapPos();
+                        ImGui::TextColored(UI::Attention(), "%s", error.c_str());
+                        ImGui::PopTextWrapPos();
                     }
-
-                    if (hovered)
-                    {
-                        ImGui::BeginTooltip();
-                        ImGui::TextUnformatted(path.c_str());
-                        if (!error.empty())
-                        {
-                            ImGui::PushTextWrapPos(460.0f * d);
-                            ImGui::TextColored(UI::Attention(), "%s", error.c_str());
-                            ImGui::PopTextWrapPos();
-                        }
-                        ImGui::EndTooltip();
-                    }
-                    ImGui::PopID();
+                    ImGui::TreePop();
                 }
+                ImGui::PopID();
             }
-            UI::FoldBodyEnd();
-            (void)tooltip;
+            ImGui::PopID();
         };
 
-        renderGroup("##failed_shader_group", "Failed shaders", failed,
-                    "These shaders did not compile.", &failedOpen, UI::Error());
-        renderGroup("##depth_shader_group", "Depth shaders", depth,
-                    "These shaders require depth buffer access.", &depthOpen, UI::Secondary());
-        renderGroup("##safe_shader_group", "Safe shaders", safe,
-                    "Compiled cleanly and need no depth buffer.", &safeOpen, UI::Success());
+        renderGroup("Failed shaders", failed, "These shaders did not compile.", UI::Error());
+        renderGroup("Depth shaders", depth, "These shaders require depth buffer access.", UI::Secondary());
+        renderGroup("Safe shaders", safe, "Compiled successfully and need no depth buffer.", UI::Success());
     }
 
 } // namespace VKIntox

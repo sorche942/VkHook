@@ -6,7 +6,6 @@
 #include <string>
 
 #include "config_serializer.hh"
-#include "vendor/imgui/imgui_m3.h"
 
 // every shipped default lives here so config_serializer and the overlay can
 // read them instead of carrying their own literals.
@@ -34,28 +33,6 @@ namespace VKIntox::DefaultConfig
         }
         return {};
     }
-    // the shipped preset is pink-based Expressive and dark.
-    inline constexpr uint32_t kThemeSource = 0xFFE91E63;
-    inline constexpr ImGuiM3Variant kThemeVariant = ImGuiM3Variant_Expressive;
-    inline constexpr ImGuiM3Contrast kThemeContrast = ImGuiM3Contrast_Medium;
-    inline constexpr bool kThemeDark = true;
-
-    inline ImGuiM3BlurSettings blurSettings()
-    {
-        ImGuiM3BlurSettings blur;
-        blur.blur = true;
-        blur.background_opacity = 0.70f;
-        blur.size = 7.5f;
-        blur.passes = 7;
-        return blur;
-    }
-
-    inline ImGuiM3BackgroundObject backgroundObject()
-    {
-        ImGuiM3BackgroundObject object;
-        object.BackgroundBlur = true;
-        return object;
-    }
 
     // depth capture is on by default so depth effects work on a game's first
     // launch instead of needing a restart.
@@ -65,8 +42,7 @@ namespace VKIntox::DefaultConfig
         settings.maxEffects = 10;
         settings.overlayBlockInput = true;
         settings.usePortalIntegration = true;
-        settings.navPosition = 1;   // 0 = top, 1 = bottom
-        settings.navStyle = 0;      // 0 = dock, 1 = pill row
+        settings.uiScale = 0.0f;
         settings.toggleKey = "End";
         settings.reloadKey = "F10";
         settings.overlayKey = "Home";

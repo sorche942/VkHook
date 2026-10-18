@@ -6,6 +6,7 @@ struct _XDisplay;
 
 namespace VKIntox
 {
+    struct MouseState;
     // Shared X11 connection for the input backends and the input blocker. One
     // connection means one event queue: XInput2 raw events, active-grab events,
     // and query-based polling all drain from the same place.
@@ -30,14 +31,14 @@ namespace VKIntox
     // to keep the redirected events flowing.
     //
     // The pointer grab blocks clicks and motion, the keyboard grab blocks keys.
-    // Both make the server emit NotifyGrab/NotifyUngrab focus events on the game
-    // window, and Wine reads those as "the window manager is manipulating the
-    // window" and throws away the game's cursor capture, so the keyboard grab is
-    // only requested while the overlay is actually consuming keys (see the input
-    // blocker). Every transition also hands the game's held keys/buttons over to
-    // it with synthetic events, because the grab would otherwise swallow their
-    // releases and leave the game holding them.
-    void x11SetGrabState(bool grab);
-    void x11SetKeyboardGrabState(bool grab);
+    // The keyboard is acquired first for an interactive menu: Wine reacts to
+    // NotifyGrab by releasing the game's capture. Failed grabs remain inactive
+    // and may be retried on the next frame.
+    void x11SetGrabStates(bool pointer, bool keyboard);
     bool x11GrabActive();
+    bool x11PointerGrabActive();
+    bool x11GameFocused();
+    // Supplies the virtual pointer and event-driven buttons while captured.
+    // Raw device deltas, not game-controlled absolute pointer warps, move it.
+    bool x11CapturedMouseState(MouseState& state);
 } // namespace VKIntox

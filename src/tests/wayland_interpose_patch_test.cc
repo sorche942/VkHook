@@ -2,7 +2,9 @@
 // DT_JMPREL) to absolute addresses in place at load time. A patcher that adds
 // the load base again dereferences a non-canonical pointer and takes the whole
 // client down. This drives the real scan against a real libwayland and
-// requires the jump slot's current value to match dlsym.
+// requires the GOT slot's current value to match dlsym. Build this test for
+// both native ELF classes: i386 uses REL, while x86_64 uses RELA. Libraries
+// built with -fno-plt use GLOB_DAT rather than a PLT JUMP_SLOT relocation.
 #include "wayland_interpose_patch.hh"
 
 #include <dlfcn.h>
@@ -35,7 +37,7 @@ int main()
 
     void* slot = nullptr;
     void* real = nullptr;
-    check(VKIntox::waylandMarshalSlotForTests(&slot, &real), "jump slot located without faulting");
+    check(VKIntox::waylandMarshalSlotForTests(&slot, &real), "marshal GOT slot located without faulting");
     if (!slot)
     {
         std::printf("%d failure(s)\n", failures ? failures : 1);

@@ -16,6 +16,7 @@
 namespace VKIntox
 {
     struct LogicalSwapchain;  // Forward declaration
+    struct NativeCapture;
 
     // Global lock guarding all layer state (defined in vkintox.cpp). Shared with
     // the overlay so it can read LogicalDevice state for the Advanced tab.
@@ -85,6 +86,7 @@ namespace VKIntox
         // Shared driver pipeline cache. Rebuilt effects reuse compiled pipelines
         // instead of making the driver recompile them on every chain reload.
         VkPipelineCache          pipelineCache = VK_NULL_HANDLE;
+        std::shared_ptr<NativeCapture> nativeCapture;
         bool                     supportsMutableFormat;
         bool                     isNvidiaGpu;
         // Real identity of the device the game is actually running on. The

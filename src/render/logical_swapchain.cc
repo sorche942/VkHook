@@ -36,6 +36,7 @@ namespace VKIntox
             Logger::info("[DESTROY-TRACE] destroying " + std::to_string(effects.size()) + " effects");
             effects.clear();
             defaultTransfer.reset();
+            nativeMaterialSnapshots.clear();
             Logger::info("[DESTROY-TRACE] effects destroyed");
 
             // The flush has to come AFTER the effects are cleared, not before.

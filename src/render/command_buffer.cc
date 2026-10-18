@@ -34,6 +34,9 @@ namespace VKIntox
     {
         if (getObservedDepthAttachmentLayout(depthState) == VK_IMAGE_LAYOUT_GENERAL)
             return VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+        if (getObservedDepthAttachmentLayout(depthState) == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+            || getObservedDepthAttachmentLayout(depthState) == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL)
+            return VK_PIPELINE_STAGE_TRANSFER_BIT;
 
         return VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
     }
@@ -42,6 +45,10 @@ namespace VKIntox
     {
         if (getObservedDepthAttachmentLayout(depthState) == VK_IMAGE_LAYOUT_GENERAL)
             return VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        if (getObservedDepthAttachmentLayout(depthState) == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
+            return VK_ACCESS_TRANSFER_WRITE_BIT;
+        if (getObservedDepthAttachmentLayout(depthState) == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL)
+            return VK_ACCESS_TRANSFER_READ_BIT;
 
         return VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
     }
@@ -349,9 +356,10 @@ namespace VKIntox
     }
     void writeCommandBuffers(LogicalDevice*                                 logicalDevice,
                              LogicalSwapchain*                              logicalSwapchain,
-                             std::vector<std::shared_ptr<VKIntox::Effect>> effects,
-                             std::vector<VkCommandBuffer>                   commandBuffers,
-                             const DepthState&                              depthState)
+                             const std::vector<std::shared_ptr<VKIntox::Effect>>& effects,
+                             const std::vector<VkCommandBuffer>&             commandBuffers,
+                             const DepthState&                              depthState,
+                             uint32_t                                       imageIndex)
     {
         VkCommandBufferBeginInfo beginInfo = {};
 
@@ -374,6 +382,8 @@ namespace VKIntox
 
         for (uint32_t i = 0; i < commandBuffers.size(); i++)
         {
+            if (imageIndex != UINT32_MAX && imageIndex != i)
+                continue;
             const VkImageView  boundDepthImageView = depthResolveTargetUsable
                 ? (logicalSwapchain->depthResolveMsaaTransform ? logicalSwapchain->depthResolveTransformedPerImage[i].imageView
                                                               : logicalSwapchain->depthResolvePerImage[i].imageView)
@@ -390,6 +400,11 @@ namespace VKIntox
 
             if (depthResolveTargetUsable && hasDepthState(depthState))
             {
+                // A native-binding re-record may replace a buffer which never
+                // ran. Its CPU recording flag is not evidence of GPU contents.
+                // This image's fence is complete and the snapshot is overwritten.
+                if (imageIndex != UINT32_MAX)
+                    logicalSwapchain->depthResolvePerImage[i].initialized = false;
                 recordDepthResolveSnapshot(
                     logicalDevice, logicalSwapchain, commandBuffers[i], i, depthState);
             }
@@ -727,6 +742,15 @@ namespace VKIntox
     {
         if (!logicalDevice || !logicalSwapchain)
             return;
+        // All snapshot backends need to run outside application rendering:
+        // transfer commands cannot run in a render pass, and shader resolves
+        // must not nest a render pass or overwrite live graphics bindings.
+        const auto scope = logicalDevice->commandBufferDepthStates.find(commandBuffer);
+        if (scope != logicalDevice->commandBufferDepthStates.end() && scope->second.inRenderScope)
+        {
+            Logger::warn("Skipping depth snapshot inside an active render scope");
+            return;
+        }
         if (!hasDepthState(depthState))
             return;
         if (depthState.extent.width == 0 || depthState.extent.height == 0)

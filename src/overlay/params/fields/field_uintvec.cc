@@ -1,8 +1,5 @@
 #include "../field_editor.hh"
 #include "../../../vendor/imgui/imgui.h"
-#include "../../../vendor/imgui/imgui_internal.h"
-#include "../../ui_dialog.hh"
-#include "../../ui_menu.hh"
 #include <cstring>
 #include <cstdio>
 #include <string>
@@ -24,7 +21,7 @@ namespace VKIntox
             char modalId[64];
             char inputId[64];
             snprintf(contextId, sizeof(contextId), "##uvcctx_%p", paramAddr);
-            snprintf(modalId, sizeof(modalId), "##uvcmodal_%p", paramAddr);
+            snprintf(modalId, sizeof(modalId), "Custom values###uvcmodal_%p", paramAddr);
             snprintf(inputId, sizeof(inputId), "##uvcinput_%p", paramAddr);
 
             // === Render the vector slider (using SliderScalarN for unsigned) ===
@@ -44,47 +41,41 @@ namespace VKIntox
             }
 
             // === Right-click context menu ===
-            if (UI::BeginM3MenuContext(contextId))
+            if (ImGui::BeginPopupContextItem(contextId))
             {
-                if (UI::M3MenuItem("Type in manually..."))
+                if (ImGui::MenuItem("Type in manually..."))
                 {
                     activeModalParam = paramAddr;
                     formatValues(p);
-                    popupPosition = ImGui::GetMousePos();
                     focusCustomValueInput = true;
                     modalOpenRequested = true;
                 }
-                if (UI::M3MenuItem("Reset to default"))
+                if (ImGui::MenuItem("Reset to default"))
                 {
                     resetToDefault(param);
                     changed = true;
                 }
-                UI::EndM3Menu();
+                ImGui::EndPopup();
             }
 
-            bool popupOpenedThisFrame = false;
             // === Deferred modal opening ===
             if (modalOpenRequested && activeModalParam == paramAddr)
             {
                 modalOpenRequested = false;
-                const ImGuiViewport* viewport = ImGui::GetMainViewport();
-                const ImVec2 popupSize = ImVec2(380.0f, 190.0f);
-                ImGui::SetNextWindowPos(customValuePopupPosition(
-                    popupPosition, viewport->Pos, viewport->Size, popupSize), ImGuiCond_Appearing);
                 ImGui::OpenPopup(modalId);
-                popupOpenedThisFrame = true;
             }
 
             // === Render custom value popup ===
             if (activeModalParam == paramAddr &&
-                !popupOpenedThisFrame && UI::BeginM3Dialog(modalId, ("Custom values: " + p.label).c_str()))
+                ImGui::BeginPopupModal(modalId, nullptr, ImGuiWindowFlags_AlwaysAutoResize))
             {
+                ImGui::TextUnformatted(p.label.c_str());
                 ImGui::TextDisabled("Components: %u (comma-separated unsigned integers)",
                     static_cast<unsigned int>(p.componentCount));
                 ImGui::TextDisabled("(values outside range are allowed)");
                 ImGui::Spacing();
 
-                ImGui::SetNextItemWidth(280.0f);
+                ImGui::SetNextItemWidth(ImGui::GetFontSize() * 24.0f);
                 if (focusCustomValueInput)
                 {
                     ImGui::SetKeyboardFocusHere();
@@ -94,13 +85,9 @@ namespace VKIntox
                     sizeof(customValueBuf), ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll);
 
                 ImGui::Spacing();
-                const UI::M3DialogAction actions[] = {
-                    {"Cancel", ImGuiM3Button_Outlined},
-                    {"OK", ImGuiM3Button_Filled},
-                };
-                const int action = UI::M3DialogActions(actions, 2);
-                const bool ok = (action == 1);
-                const bool cancel = (action == 0);
+                const bool cancel = ImGui::Button("Cancel");
+                ImGui::SameLine();
+                const bool ok = ImGui::Button("OK");
 
                 if (submit || ok)
                 {
@@ -115,7 +102,7 @@ namespace VKIntox
                     activeModalParam = nullptr;
                 }
 
-                UI::EndM3Dialog();
+                ImGui::EndPopup();
             }
 
             return changed;
@@ -170,7 +157,6 @@ namespace VKIntox
         const void* activeModalParam = nullptr;
         bool modalOpenRequested = false;
         bool focusCustomValueInput = false;
-        ImVec2 popupPosition = ImVec2(0.0f, 0.0f);
     };
 
     REGISTER_FIELD_EDITOR(ParamType::UintVec, UintVecFieldEditor)

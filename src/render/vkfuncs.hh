@@ -28,7 +28,6 @@
     FORVKFUNC(CmdBindPipeline) \
     FORVKFUNC(CmdBindVertexBuffers) \
     FORVKFUNC(CmdBlitImage) \
-    FORVKFUNC(CmdClearAttachments) \
     FORVKFUNC(CmdClearColorImage) \
     FORVKFUNC(CmdClearDepthStencilImage) \
     FORVKFUNC(CmdCopyBufferToImage) \

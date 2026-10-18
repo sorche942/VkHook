@@ -2,7 +2,6 @@
 #include "config_serializer.hh"
 #include "logger.hh"
 #include "overlay/ui_theme.hh"
-#include "overlay/ui_icons.hh"
 #include "input_blocker.hh"
 #include "wayland_display.hh"
 
@@ -431,7 +430,7 @@ namespace VKIntox
 
         // Helper to draw a graph with label
         void drawGraph(const char* label, const char* id, RingBuffer<float, 300>& history, float minVal, float maxVal,
-                       const char* overlayFmt, ImVec4 color = UI::GraphColor(0))
+                       const char* overlayFmt, ImVec4 color = UI::Primary())
         {
             ImGui::Text("%s", label);
 
@@ -446,17 +445,15 @@ namespace VKIntox
             snprintf(overlay, sizeof(overlay), overlayFmt, history.size() > 0 ? history.get(history.size() - 1) : 0.0f);
 
             ImGui::PlotLines(id, data, static_cast<int>(history.size()), 0, overlay,
-                            minVal, maxVal, ImVec2(-1, 60));
+                            minVal, maxVal, ImVec2(-1, ImGui::GetTextLineHeight() * 4.0f));
 
             ImGui::PopStyleColor(2);
 
             // Stats below graph
             if (history.size() > 0)
             {
-                UI::PushSupport();
                 ImGui::TextDisabled("Min: %.1f  Avg: %.1f  Max: %.1f",
                     history.min(), history.avg(), history.max());
-                UI::PopSupport();
             }
         }
     }
@@ -531,8 +528,7 @@ namespace VKIntox
 
     void ImGuiOverlay::renderDiagnosticsView()
     {
-        // Pushed page: the crumb leads back to Settings, where it lives now.
-        if (UI::BreadcrumbBar("Go back", Icon::ChevronLeftUtf8))
+        if (ImGui::Button("Back to settings"))
         {
             openSubView = SubView_None;
             return;
@@ -548,31 +544,24 @@ namespace VKIntox
         const float fps01Low = g_dispFps01Low;
 
         // --- Performance ---
-        ImGui::M3CardBegin("diag_perf", "Performance", Icon::SpeedUtf8);
+        ImGui::SeparatorText("Performance");
         {
-            ImGuiM3PushTextStyle(ImGuiM3Type_DisplaySmall);
             ImGui::TextColored(UI::Success(), "%.0f FPS", fps);
-            ImGuiM3PopTextStyle();
             ImGui::SameLine();
-            UI::PushSupport();
             ImGui::TextDisabled("(1%% low: %.0f   ·   0.1%% low: %.0f)", fps1Low, fps01Low);
-            UI::PopSupport();
         }
         ImGui::Spacing();
-        drawGraph("Frame Time", "##frametime", frameTimeHistory, 0.0f, 50.0f, "%.1f ms", UI::GraphColor(0));
-        ImGui::M3CardEnd();
+        drawGraph("Frame Time", "##frametime", frameTimeHistory, 0.0f, 50.0f, "%.1f ms", UI::Primary());
 
         // --- GPU ---
         ImGui::Spacing();
-        ImGui::M3CardBegin("diag_gpu", "GPU", Icon::MemoryUtf8);
+        ImGui::SeparatorText("GPU");
         {
             // report what the game is really running on, not a vendor guessed
             // from DRM card order
             if (!deviceInfo.gpuName.empty())
             {
-                ImGuiM3PushTextStyle(ImGuiM3Type_TitleMedium);
                 ImGui::TextUnformatted(deviceInfo.gpuName.c_str());
-                ImGuiM3PopTextStyle();
 
                 std::string info;
                 if (deviceInfo.gpuApiVersion)
@@ -583,9 +572,7 @@ namespace VKIntox
                     info += info.empty() ? deviceInfo.gpuDriverInfo : "  ·  " + deviceInfo.gpuDriverInfo;
                 if (!info.empty())
                 {
-                    UI::PushSupport();
                     ImGui::TextDisabled("%s", info.c_str());
-                    UI::PopSupport();
                 }
             }
             else if (gpuInfo.vendor != GpuVendor::Unknown)
@@ -599,12 +586,10 @@ namespace VKIntox
                 if (g_dispGpuUsage >= 0)
                 {
                     const char* usageLabel = (gpuInfo.vendor == GpuVendor::Intel) ? "GPU Frequency" : "GPU Usage";
-                    drawGraph(usageLabel, "##gpuusage", gpuUsageHistory, 0.0f, 100.0f, "%.0f%%", UI::GraphColor(1));
+                    drawGraph(usageLabel, "##gpuusage", gpuUsageHistory, 0.0f, 100.0f, "%.0f%%", UI::Secondary());
                     if (gpuInfo.vendor == GpuVendor::Intel)
                     {
-                        UI::PushSupport();
                         ImGui::TextDisabled("(estimated from frequency ratio)");
-                        UI::PopSupport();
                     }
                     ImGui::Spacing();
                 }
@@ -622,30 +607,27 @@ namespace VKIntox
                 ImGui::Text("GTT (shared): %.0f / %.0f MB", g_dispGttUsed, g_dispGttTotal);
                 ImGui::ProgressBar(g_dispGttUsed / g_dispGttTotal, ImVec2(-1, 0));
                 ImGui::Spacing();
-                drawGraph("Memory Usage", "##gttusage", gttUsageHistory, 0.0f, 100.0f, "%.0f%%", UI::GraphColor(2));
+                drawGraph("Memory Usage", "##gttusage", gttUsageHistory, 0.0f, 100.0f, "%.0f%%", UI::Tertiary());
             }
             else if (g_dispHasVram)
             {
-                drawGraph("VRAM Usage", "##vramusage", vramUsageHistory, 0.0f, 100.0f, "%.0f%%", UI::GraphColor(2));
+                drawGraph("VRAM Usage", "##vramusage", vramUsageHistory, 0.0f, 100.0f, "%.0f%%", UI::Tertiary());
             }
         }
         if (deviceInfo.gpuName.empty())
         {
-            UI::PushSupport();
             ImGui::TextDisabled("GPU stats not available.");
             ImGui::TextDisabled("No AMD/Intel/NVIDIA GPU detected via sysfs.");
-            UI::PopSupport();
         }
-        ImGui::M3CardEnd();
 
         // --- Game ---
         ImGui::Spacing();
-        ImGui::M3CardBegin("diag_game", "Game", Icon::JoystickUtf8);
+        ImGui::SeparatorText("Game");
         if (!detectedGameName.empty())
         {
             ImGui::Text("Executable: %s", detectedGameName.c_str());
             if (!autoDetectedConfig.empty())
-                ImGui::TextColored(UI::Success(), "%s  Config: %s.conf (auto-detected)", Icon::CheckCircleUtf8, autoDetectedConfig.c_str());
+                ImGui::TextColored(UI::Success(), "Config: %s.conf (auto-detected)", autoDetectedConfig.c_str());
             else
                 UI::TextSupport("No per-game config found.");
         }
@@ -653,11 +635,10 @@ namespace VKIntox
         {
             UI::TextSupport("Could not detect the game executable.");
         }
-        ImGui::M3CardEnd();
 
         // --- Input ---
         ImGui::Spacing();
-        ImGui::M3CardBegin("diag_input", "Input", Icon::KeyboardUtf8);
+        ImGui::SeparatorText("Input");
         {
             const SurfaceKind kind = getSurfaceKind();
             const bool wayland = kind == SurfaceKind::Wayland;
@@ -714,7 +695,6 @@ namespace VKIntox
                     ImGui::TextDisabled("no");
             }
         }
-        ImGui::M3CardEnd();
 
         ImGui::EndChild();
     }

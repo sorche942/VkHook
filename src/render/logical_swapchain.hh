@@ -12,6 +12,7 @@
 namespace VKIntox
 {
     class Config;
+    struct NativeSnapshot;
 
     // for each swapchain, we have the Images and the other stuff we need to execute the compute shader
     // Per-image depth resolve resources — kept together so they
@@ -89,6 +90,8 @@ namespace VKIntox
         // descriptor set that's still bound to an in-flight CB → VK_ERROR_DEVICE_LOST.
         std::vector<VkFence>                  effectSubmitFences;
         std::vector<bool>                     effectSubmitFenceUsed;
+        // Own descriptor backing until this image's effect fence is safe.
+        std::vector<std::shared_ptr<NativeSnapshot>> nativeMaterialSnapshots;
         bool                                  depthReallocPending = false;
         bool                                  rebuildEffectsOnNextPresent = false;
 

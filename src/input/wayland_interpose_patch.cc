@@ -41,10 +41,12 @@ namespace
 
     // glibc rewrites DT_SYMTAB/DT_STRTAB/DT_JMPREL values in place to absolute
     // addresses at load time; a rare configuration leaves them relative.
-    // Accept both so a wild pointer can never come out of this.
+    // Accept both; the caller validates the resulting address against PT_LOAD.
     uintptr_t normalize(uintptr_t base, uintptr_t value)
     {
-        return value < base ? base + value : value;
+        if (value < base)
+            return value <= UINTPTR_MAX - base ? base + value : 0;
+        return value;
     }
 
     // restore the protection the page had before we touched it, read straight
@@ -107,7 +109,11 @@ namespace
             const ElfW(Phdr)& ph = info->dlpi_phdr[i];
             if (ph.p_type == PT_LOAD && ph.p_memsz)
             {
+                if (ph.p_vaddr > UINTPTR_MAX - base)
+                    return;
                 const uintptr_t segLo = base + static_cast<uintptr_t>(ph.p_vaddr);
+                if (ph.p_memsz > UINTPTR_MAX - segLo)
+                    return;
                 const uintptr_t segHi = segLo + static_cast<uintptr_t>(ph.p_memsz);
                 lo = segLo < lo ? segLo : lo;
                 hi = segHi > hi ? segHi : hi;
@@ -121,100 +127,185 @@ namespace
             return;
 
         auto inRange = [&](uintptr_t p, size_t len) {
-            return p >= lo && len <= hi - lo && p <= hi - len;
+            if (p < lo || len > hi - lo || p > hi - len)
+                return false;
+            // The envelope can contain unmapped gaps between load segments.
+            for (ElfW(Half) i = 0; i < info->dlpi_phnum; ++i)
+            {
+                const ElfW(Phdr)& ph = info->dlpi_phdr[i];
+                if (ph.p_type != PT_LOAD || !ph.p_memsz || !(ph.p_flags & PF_R))
+                    continue;
+                const uintptr_t start = base + static_cast<uintptr_t>(ph.p_vaddr);
+                if (p >= start && len <= ph.p_memsz && p - start <= ph.p_memsz - len)
+                    return true;
+            }
+            return false;
         };
         auto ptrIn = [&](const void* p, size_t len) {
             return inRange(reinterpret_cast<uintptr_t>(p), len);
         };
 
+        if (dynPhdr->p_vaddr > UINTPTR_MAX - base)
+            return;
         const auto* dynamic = reinterpret_cast<const ElfW(Dyn)*>(base + static_cast<uintptr_t>(dynPhdr->p_vaddr));
-        if (!ptrIn(dynamic, sizeof(ElfW(Dyn))))
+        if (!ptrIn(dynamic, dynPhdr->p_memsz))
             return;
 
         const ElfW(Sym)* symtab = nullptr;
         const char* strtab = nullptr;
-        const ElfW(Rela)* jmprel = nullptr;
+        const void* jmprel = nullptr;
+        const ElfW(Rel)* rels = nullptr;
+        const ElfW(Rela)* relas = nullptr;
+        size_t strsz = 0;
         size_t pltrelsz = 0;
-        for (const ElfW(Dyn)* dyn = dynamic; dyn->d_tag != DT_NULL; ++dyn)
+        size_t relsz = 0;
+        size_t relasz = 0;
+        size_t relent = 0;
+        size_t relaent = 0;
+        ElfW(Xword) pltrel = DT_NULL;
+        bool terminated = false;
+        const size_t dynamicCount = dynPhdr->p_memsz / sizeof(ElfW(Dyn));
+        for (size_t i = 0; i < dynamicCount; ++i)
         {
-            switch (dyn->d_tag)
+            const ElfW(Dyn)& dyn = dynamic[i];
+            if (dyn.d_tag == DT_NULL)
             {
-                case DT_SYMTAB: symtab = reinterpret_cast<const ElfW(Sym)*>(normalize(base, dyn->d_un.d_ptr)); break;
-                case DT_STRTAB: strtab = reinterpret_cast<const char*>(normalize(base, dyn->d_un.d_ptr)); break;
-                case DT_JMPREL: jmprel = reinterpret_cast<const ElfW(Rela)*>(normalize(base, dyn->d_un.d_ptr)); break;
-                case DT_PLTRELSZ: pltrelsz = static_cast<size_t>(dyn->d_un.d_val); break;
+                terminated = true;
+                break;
+            }
+            switch (dyn.d_tag)
+            {
+                case DT_SYMTAB: symtab = reinterpret_cast<const ElfW(Sym)*>(normalize(base, dyn.d_un.d_ptr)); break;
+                case DT_STRTAB: strtab = reinterpret_cast<const char*>(normalize(base, dyn.d_un.d_ptr)); break;
+                case DT_STRSZ: strsz = static_cast<size_t>(dyn.d_un.d_val); break;
+                case DT_JMPREL: jmprel = reinterpret_cast<const void*>(normalize(base, dyn.d_un.d_ptr)); break;
+                case DT_PLTRELSZ: pltrelsz = static_cast<size_t>(dyn.d_un.d_val); break;
+                case DT_PLTREL: pltrel = dyn.d_un.d_val; break;
+                case DT_REL: rels = reinterpret_cast<const ElfW(Rel)*>(normalize(base, dyn.d_un.d_ptr)); break;
+                case DT_RELSZ: relsz = static_cast<size_t>(dyn.d_un.d_val); break;
+                case DT_RELENT: relent = static_cast<size_t>(dyn.d_un.d_val); break;
+                case DT_RELA: relas = reinterpret_cast<const ElfW(Rela)*>(normalize(base, dyn.d_un.d_ptr)); break;
+                case DT_RELASZ: relasz = static_cast<size_t>(dyn.d_un.d_val); break;
+                case DT_RELAENT: relaent = static_cast<size_t>(dyn.d_un.d_val); break;
                 default: break;
             }
         }
 
-        if (!symtab || !strtab || !jmprel || pltrelsz == 0)
-            return;
-        if (!ptrIn(symtab, sizeof(ElfW(Sym))) || !ptrIn(strtab, 1) || !ptrIn(jmprel, sizeof(ElfW(Rela))))
+        if (!terminated || !symtab || !strtab || strsz == 0 ||
+            !ptrIn(symtab, sizeof(ElfW(Sym))) || !ptrIn(strtab, strsz))
             return;
 
-        const size_t count = pltrelsz / sizeof(ElfW(Rela));
-        if (count == 0 || count > 65536 || !inRange(reinterpret_cast<uintptr_t>(jmprel), count * sizeof(ElfW(Rela))))
-            return;
+        // dl_iterate_phdr exposes only the process's native ELF class. i386
+        // normally uses REL and x86_64 RELA; DT_PLTREL, not the CPU, selects
+        // the actual PLT entry layout.
+#if defined(__i386__)
+        constexpr unsigned jumpSlotType = R_386_JMP_SLOT;
+        constexpr unsigned globalDataType = R_386_GLOB_DAT;
+#elif defined(__x86_64__) && UINTPTR_MAX == UINT64_MAX
+        constexpr unsigned jumpSlotType = R_X86_64_JUMP_SLOT;
+        constexpr unsigned globalDataType = R_X86_64_GLOB_DAT;
+#else
+#error "Wayland GOT interposition requires i386 or x86_64 ELF"
+#endif
 
         const size_t wanted = std::strlen(scan.symbol);
-        for (size_t i = 0; i < count; ++i)
-        {
-            const ElfW(Rela)& rel = jmprel[i];
-            if (ELF64_R_TYPE(rel.r_info) != R_X86_64_JUMP_SLOT)
-                continue;
+        auto scanRelocations = [&](const auto* relocations, size_t bytes, unsigned slotType) {
+            const size_t entrySize = sizeof(*relocations);
+            const size_t count = bytes / entrySize;
+            if (!relocations || bytes % entrySize != 0 || count == 0 ||
+                count > 65536 || !ptrIn(relocations, bytes))
+                return false;
 
-            const ElfW(Sym)* sym = symtab + ELF64_R_SYM(rel.r_info);
-            if (!ptrIn(sym, sizeof(ElfW(Sym))))
-                continue;
-
-            const char* name = strtab + sym->st_name;
-            if (!ptrIn(name, wanted + 1) || std::memcmp(name, scan.symbol, wanted) != 0 || name[wanted] != '\0')
-                continue;
-
-            const uintptr_t slotAddr = base + static_cast<uintptr_t>(rel.r_offset);
-            if (!ptrIn(reinterpret_cast<const void*>(slotAddr), sizeof(void*)))
-                continue;
-
-            auto* slot = reinterpret_cast<void**>(slotAddr);
-            void* current = *slot;
-
-            // the slot must already point into this same object: an unresolved
-            // lazy stub would re-resolve and drop the patch
-            Dl_info resolved{};
-            if (dladdr(current, &resolved) == 0 ||
-                reinterpret_cast<uintptr_t>(resolved.dli_fbase) != base)
-                continue;
-
-            if (scan.probeOnly)
+            for (size_t i = 0; i < count; ++i)
             {
-                if (scan.foundSlot)
-                    *scan.foundSlot = slot;
-                if (scan.foundReal)
-                    *scan.foundReal = current;
-                scan.stopped = true;
-                return;
+                const auto& rel = relocations[i];
+#if defined(__i386__)
+                const unsigned type = ELF32_R_TYPE(rel.r_info);
+                const size_t symbolIndex = ELF32_R_SYM(rel.r_info);
+#else
+                const unsigned type = ELF64_R_TYPE(rel.r_info);
+                const size_t symbolIndex = ELF64_R_SYM(rel.r_info);
+#endif
+                if (type != slotType)
+                    continue;
+
+                const uintptr_t symtabAddr = reinterpret_cast<uintptr_t>(symtab);
+                if (symbolIndex > (hi - symtabAddr) / sizeof(ElfW(Sym)))
+                    continue;
+                const auto* sym = reinterpret_cast<const ElfW(Sym)*>(symtabAddr + symbolIndex * sizeof(ElfW(Sym)));
+                if (!ptrIn(sym, sizeof(ElfW(Sym))) || sym->st_name >= strsz ||
+                    wanted >= strsz - sym->st_name)
+                    continue;
+
+                const char* name = strtab + sym->st_name;
+                if (std::memcmp(name, scan.symbol, wanted) != 0 || name[wanted] != '\0')
+                    continue;
+
+                if (rel.r_offset > UINTPTR_MAX - base)
+                    continue;
+                const uintptr_t slotAddr = base + static_cast<uintptr_t>(rel.r_offset);
+                if (slotAddr % alignof(void*) != 0 ||
+                    !ptrIn(reinterpret_cast<const void*>(slotAddr), sizeof(void*)))
+                    continue;
+
+                auto* slot = reinterpret_cast<void**>(slotAddr);
+                void* current = *slot;
+
+                // Only gate a resolved entry into this copy of libwayland.
+                // A lazy PLT stub also belongs to this object, so require the
+                // actual symbol address rather than just a matching load base.
+                Dl_info resolved{};
+                if (sym->st_shndx == SHN_UNDEF || sym->st_value > UINTPTR_MAX - base ||
+                    reinterpret_cast<uintptr_t>(current) != base + sym->st_value ||
+                    dladdr(current, &resolved) == 0 ||
+                    reinterpret_cast<uintptr_t>(resolved.dli_fbase) != base)
+                    continue;
+
+                if (scan.probeOnly)
+                {
+                    if (scan.foundSlot)
+                        *scan.foundSlot = slot;
+                    if (scan.foundReal)
+                        *scan.foundReal = current;
+                    scan.stopped = true;
+                    return true;
+                }
+
+                const int index = g_copyCount.load(std::memory_order_relaxed);
+                if (index >= kMaxCopies)
+                    return true;
+
+                const long pageSizeLong = sysconf(_SC_PAGESIZE);
+                const size_t pageSize = pageSizeLong > 0 ? static_cast<size_t>(pageSizeLong) : 4096;
+                const uintptr_t pageAddr = slotAddr & ~static_cast<uintptr_t>(pageSize - 1);
+                if (mprotect(reinterpret_cast<void*>(pageAddr), pageSize, PROT_READ | PROT_WRITE) != 0)
+                    return true;
+
+                // publish the real entry before any thread can reach the patched slot
+                g_copies[index] = {lo, hi, current};
+                g_copyCount.store(index + 1, std::memory_order_release);
+                *slot = scan.replacement;
+
+                restoreProtection(pageAddr, pageSize);
+
+                VKIntox::Logger::info("Wayland interpose: gated the marshal entry in " + std::string(info->dlpi_name));
+                return true;
             }
+            return false;
+        };
 
-            const int index = g_copyCount.load(std::memory_order_relaxed);
-            if (index >= kMaxCopies)
-                return;
-
-            const long pageSizeLong = sysconf(_SC_PAGESIZE);
-            const size_t pageSize = pageSizeLong > 0 ? static_cast<size_t>(pageSizeLong) : 4096;
-            const uintptr_t pageAddr = slotAddr & ~static_cast<uintptr_t>(pageSize - 1);
-            if (mprotect(reinterpret_cast<void*>(pageAddr), pageSize, PROT_READ | PROT_WRITE) != 0)
-                return;
-
-            // publish the real entry before any thread can reach the patched slot
-            g_copies[index] = {lo, hi, current};
-            g_copyCount.store(index + 1, std::memory_order_release);
-            *slot = scan.replacement;
-
-            restoreProtection(pageAddr, pageSize);
-
-            VKIntox::Logger::info("Wayland interpose: gated the marshal entry in " + std::string(info->dlpi_name));
+        if (pltrel == DT_REL &&
+            scanRelocations(static_cast<const ElfW(Rel)*>(jmprel), pltrelsz, jumpSlotType))
             return;
-        }
+        if (pltrel == DT_RELA &&
+            scanRelocations(static_cast<const ElfW(Rela)*>(jmprel), pltrelsz, jumpSlotType))
+            return;
+
+        // -fno-plt builds call through GLOB_DAT GOT entries instead of JUMP_SLOT.
+        if (relent == sizeof(ElfW(Rel)) && scanRelocations(rels, relsz, globalDataType))
+            return;
+        if (relaent == sizeof(ElfW(Rela)))
+            scanRelocations(relas, relasz, globalDataType);
     }
 
     int scanCallback(struct dl_phdr_info* info, size_t, void* data)

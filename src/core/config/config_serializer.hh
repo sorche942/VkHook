@@ -49,9 +49,8 @@ namespace VKIntox
         // portals when the session provides them, instead of the in-overlay
         // fallbacks. Off is for sessions with no portal service.
         bool usePortalIntegration;
-        // Navigation bar: 0 = top, 1 = bottom. Style: 0 = dock, 1 = pill row.
-        int navPosition;
-        int navStyle;
+        // Zero selects automatic framebuffer-based scaling; otherwise 0.75–3.
+        float uiScale;
         std::string toggleKey;
         std::string reloadKey;
         std::string overlayKey;

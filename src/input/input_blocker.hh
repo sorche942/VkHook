@@ -17,28 +17,26 @@ namespace VKIntox
     // Call once at startup with the config value.
     void initInputBlocker(bool enabled);
 
-    // Overlay hitboxes, refreshed every frame. Pointer events inside these are
-    // withheld from the game; everything outside passes through to it.
+    // Overlay hitboxes for noninteractive notifications. An interactive menu
+    // owns pointer input throughout the surface, including outside these rects.
     void setInputRects(const InputRect* rects, int count);
 
     // Global gate: is the overlay on screen at all. Cheap to check.
     void setInputBlocked(bool blocked);
 
-    // The interactive shell is up (toasts alone do not count). The keyboard is
-    // only taken away from the game while this is on: every grab transition
-    // makes Wine drop the game's cursor capture, so the keyboard grab must not
-    // follow a bare pointer crossing.
+    // The interactive shell is up (toasts alone do not count). Its lifetime
+    // owns pointer and keyboard input; Wine relinquishes capture on the initial
+    // keyboard grab, before the overlay attempts its pointer grab.
     void setInputInteractive(bool interactive);
 
-    // The overlay is consuming keys right now (a text field is active or a popup
-    // is open); with the shell up, this is what engages the keyboard grab.
+    // The overlay is consuming keys right now (a text field or popup).
     void setOverlayWantsKeyboard(bool wantsKeyboard);
 
-    // Newest pointer position in surface pixels. Drives the x11 grabs and the
-    // follow-the-pointer keyboard rule.
+    // Newest pointer position in surface pixels. Updates notification hit tests
+    // and reapplies the current input ownership.
     void updatePointerPosition(float x, float y);
 
-    // True when (x, y) is inside an overlay hitbox and blocking is on.
+    // True while a menu owns input, or inside a notification hitbox.
     bool isInputBlockedAt(float x, float y);
 
     // True when the overlay is on screen (regardless of hitbox).

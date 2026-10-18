@@ -1,8 +1,6 @@
-// X11 input blocking, against the layer's real blocker: the pointer grab must
-// follow the cursor, the keyboard grab must only engage when the overlay consumes
-// keys (a grab transition makes Wine drop the game's cursor capture), and held
-// keys and buttons must be handed to the game across each grab, or the game keeps
-// holding whatever was down when the overlay was used.
+// X11 input blocking against the layer's real blocker: notifications capture only
+// their hitbox, while an interactive menu owns pointer and keyboard until close.
+// A held key must be released into the game on entry and restored on exit.
 //
 // It synthesises real input on the developer's display, so it only runs with
 // VKINTOX_X11_INPUT_TEST=1 set; otherwise it reports SKIP (exit 77).
@@ -17,12 +15,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include "input/mouse_input.hh"
 
 typedef void (*InitFn)(bool);
 typedef void (*SetWindowFn)(unsigned long);
 typedef void (*SetRectsFn)(const void*, int);
 typedef void (*SetBoolFn)(bool);
 typedef void (*SetPosFn)(float, float);
+typedef VKIntox::MouseState (*GetMouseFn)();
 
 struct InputRect { float x, y, width, height; };
 
@@ -79,8 +79,9 @@ int main(int argc, char** argv)
     SetBoolFn     setInputInteractive     = (SetBoolFn) dlsym(lib, "_ZN7VKIntox19setInputInteractiveEb");
     SetBoolFn     setOverlayWantsKeyboard = (SetBoolFn) dlsym(lib, "_ZN7VKIntox23setOverlayWantsKeyboardEb");
     SetPosFn      updatePointerPosition   = (SetPosFn) dlsym(lib, "_ZN7VKIntox21updatePointerPositionEff");
+    GetMouseFn getMouseState = (GetMouseFn) dlsym(lib, "_ZN7VKIntox16getMouseStateX11Ev");
     if (!initInputBlocker || !setX11Window || !setInputRects || !setInputBlocked
-        || !setInputInteractive || !setOverlayWantsKeyboard || !updatePointerPosition)
+        || !setInputInteractive || !setOverlayWantsKeyboard || !updatePointerPosition || !getMouseState)
     {
         printf("missing symbols: %s\n", dlerror());
         return 1;
@@ -127,32 +128,76 @@ int main(int argc, char** argv)
     pump(game, "held", &p, &r, &f);
     if (p == 0) { printf("    game never saw the press; aborting\n"); return 1; }
 
-    setInputInteractive(true);
-    setOverlayWantsKeyboard(true);                   // overlay takes the keyboard
+    updatePointerPosition(500.0f, 500.0f);           // outside every overlay hitbox
+    setInputInteractive(true);                    // menu, without text-field focus
     usleep(200000);
     p = r = f = 0;
     pump(game, "grab-engaged", &p, &r, &f);
     printf("    keyboard grab: %s\n", grabStatus(probe, root, 1));
-    int ok2 = r > 0 && strcmp(grabStatus(probe, root, 1), "held by the layer") == 0;
+    int ok2 = r > 0 && strcmp(grabStatus(probe, root, 1), "held by the layer") == 0
+           && strcmp(grabStatus(probe, root, 0), "held by the layer") == 0;
 
-    printf("\n3. releasing the keyboard hands still-held keys back\n");
+    printf("\n3. leaving a text field does not release the open menu's capture\n");
+    setOverlayWantsKeyboard(true);
     setOverlayWantsKeyboard(false);
+    int ok3 = strcmp(grabStatus(probe, root, 1), "held by the layer") == 0
+           && strcmp(grabStatus(probe, root, 0), "held by the layer") == 0;
+
+    printf("\n4. captured raw motion is independent of game cursor warps\n");
+    XTestFakeRelativeMotionEvent(probe, -10000, -10000, 0);
+    XSync(probe, False);
+    usleep(50000);
+    const auto origin = getMouseState();
+    XTestFakeRelativeMotionEvent(probe, 35, 20, 0);
+    XSync(probe, False);
+    usleep(50000);
+    const auto moved = getMouseState();
+    XWarpPointer(game, None, win, 0, 0, 0, 0, 190, 130);
+    XSync(game, False);
+    usleep(50000);
+    const auto warped = getMouseState();
+    int okMotion = moved.x == origin.x + 35 && moved.y == origin.y + 20
+                && warped.x == moved.x && warped.y == moved.y;
+    printf("    origin=%d,%d moved=%d,%d after warp=%d,%d\n",
+           origin.x, origin.y, moved.x, moved.y, warped.x, warped.y);
+
+    printf("\n5. captured buttons release and wheel ticks are consumed once\n");
+    XTestFakeButtonEvent(probe, 1, True, 0);
+    XSync(probe, False);
+    usleep(50000);
+    const auto heldMouse = getMouseState();
+    XTestFakeButtonEvent(probe, 1, False, 0);
+    XTestFakeButtonEvent(probe, 5, True, 0);
+    XTestFakeButtonEvent(probe, 5, False, 0);
+    XSync(probe, False);
+    usleep(50000);
+    const auto releasedMouse = getMouseState();
+    const auto drainedMouse = getMouseState();
+    int okMouse = heldMouse.leftButton && !releasedMouse.leftButton
+               && releasedMouse.scrollDelta == -1.0f && drainedMouse.scrollDelta == 0.0f;
+
+    printf("\n6. closing the menu hands still-held keys back\n");
+    setInputInteractive(false);
+    setInputBlocked(false);
     usleep(200000);
     p = r = f = 0;
     pump(game, "grab-released", &p, &r, &f);
     printf("    keyboard grab: %s\n", grabStatus(probe, root, 1));
-    int ok3 = p > 0 && strcmp(grabStatus(probe, root, 1), "free") == 0;
+    int ok4 = p > 0 && strcmp(grabStatus(probe, root, 1), "free") == 0
+           && strcmp(grabStatus(probe, root, 0), "free") == 0;
 
     // clean up the simulated physical key
     XTestFakeKeyEvent(probe, w, False, 0);
     XSync(probe, False);
     pump(game, "cleanup", &p, &r, &f);
 
-    printf("\nresult: 1=%s 2=%s 3=%s\n", ok1 ? "PASS" : "FAIL", ok2 ? "PASS" : "FAIL", ok3 ? "PASS" : "FAIL");
-    printf("%s\n", (ok1 && ok2 && ok3) ? "ALL PASS" : "FAILURES PRESENT");
+    printf("\nresult: notification=%s entry=%s ownership=%s motion=%s mouse=%s exit=%s\n",
+           ok1 ? "PASS" : "FAIL", ok2 ? "PASS" : "FAIL", ok3 ? "PASS" : "FAIL",
+           okMotion ? "PASS" : "FAIL", okMouse ? "PASS" : "FAIL", ok4 ? "PASS" : "FAIL");
+    printf("%s\n", (ok1 && ok2 && ok3 && okMotion && okMouse && ok4) ? "ALL PASS" : "FAILURES PRESENT");
 
     XDestroyWindow(game, win);
     XCloseDisplay(probe);
     XCloseDisplay(game);
-    return (ok1 && ok2 && ok3) ? 0 : 1;
+    return (ok1 && ok2 && ok3 && okMotion && okMouse && ok4) ? 0 : 1;
 }

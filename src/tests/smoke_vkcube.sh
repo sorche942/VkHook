@@ -164,10 +164,9 @@ INI
 
     printf 'smoke\n' >"$base/configs/shaders/vkcube.last-profile"
 
-    # Optional extra keys, so a run can cover a non-default shape of the overlay
-    # without a second config file: VKINTOX_SMOKE_NAV=$'navPosition = top\nnavStyle = pills'.
-    if [[ -n "${VKINTOX_SMOKE_NAV:-}" ]]; then
-        printf '%s\n' "$VKINTOX_SMOKE_NAV" >>"$base/VKIntox.conf"
+    # Exercise automatic or manual scale without changing the user's config.
+    if [[ -n "${VKINTOX_SMOKE_UI_SCALE:-}" ]]; then
+        printf 'uiScale = %s\n' "$VKINTOX_SMOKE_UI_SCALE" >>"$base/VKIntox.conf"
     fi
 
     # Which path the forced rebuilds below take: 0 = safe (idles the queue),

@@ -42,8 +42,4 @@ namespace VKIntox
 #include "full_screen_triangle.vert.h"
     };
 
-    // Overlay backdrop blur: a single separable Gaussian tap.
-    const std::vector<uint32_t> overlay_blur_frag = {
-#include "overlay_blur.frag.h"
-    };
 } // namespace VKIntox

@@ -806,9 +806,8 @@ namespace VKIntox
         recordDepthResolveSnapshotForCommandBuffer(logicalDevice, commandBuffer, scopeState.depthState, &snapshotTarget);
     }
 
-    // Caller MUST hold globalLock. Acquiring it here would deadlock because
-    // both callers (tryActivatePendingTransferLinkedDepthScope and
-    // VKIntox_CmdClearAttachments) already hold it when invoking us.
+    // Caller MUST hold globalLock while validating and recording against
+    // tracked device/swapchain resources.
     void recordDepthResolveSnapshotForCommandBuffer(LogicalDevice* logicalDevice,
                                                     VkCommandBuffer commandBuffer,
                                                     const DepthState& depthState,
@@ -858,7 +857,7 @@ namespace VKIntox
         recordDepthResolveSnapshot(logicalDevice, target.logicalSwapchain, commandBuffer, target.imageIndex, depthState);
     }
 
-    // Caller MUST hold globalLock (same rationale as above).
+    // Caller MUST hold globalLock while iterating swapchains and recording.
     void recordDepthResolveSnapshotForAllSwapchains(LogicalDevice* logicalDevice,
                                                     VkCommandBuffer commandBuffer,
                                                     const DepthState& depthState)

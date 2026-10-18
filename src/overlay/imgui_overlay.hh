@@ -46,7 +46,7 @@ namespace VKIntox
         bool visible = false;
     };
 
-    // Snackbar shown bottom-centre for layer errors and notices. It is
+    // Notification window shown at the top-right for layer errors and notices. It is
     // non-interactive and auto-dismisses after a few seconds.
     struct ToastNotification
     {
@@ -170,7 +170,7 @@ namespace VKIntox
         void setSelectedEffects(const std::vector<std::string>& effects,
                                 const std::vector<std::string>& disabledEffects = {});
 
-        VkCommandBuffer recordFrame(uint32_t imageIndex, VkImage image, VkImageView imageView, uint32_t width, uint32_t height);
+        VkCommandBuffer recordFrame(uint32_t imageIndex, VkImageView imageView, uint32_t width, uint32_t height);
 
         // Get fence for command buffer synchronization (used by vkintox.cpp submit)
         VkFence getCommandBufferFence(uint32_t imageIndex) const
@@ -185,14 +185,6 @@ namespace VKIntox
         void initVulkanBackend(VkFormat swapchainFormat, uint32_t imageCount);
         void saveToPersistentState();
         void saveCurrentConfig();
-
-        // Backdrop blur. Resources are created once and rebuilt only when the
-        // backing swapchain extent or format changes. Returns false when the
-        // blur cannot run (no Vulkan objects or a failed creation), in which
-        // case the caller falls back to the flat translucent background.
-        bool ensureBlurResources(uint32_t width, uint32_t height);
-        void recordBlur(VkCommandBuffer cmd, uint32_t imageIndex, VkImage sourceImage, uint32_t sourceWidth, uint32_t sourceHeight);
-        void releaseBlurResources(bool deferred = false);
 
         // View rendering methods (implemented in separate files)
         void renderAddEffectsView();
@@ -209,23 +201,14 @@ namespace VKIntox
         // just while the Diagnostics tab is open, so the tab has real history.
         void sampleDiagnostics();
         void renderAboutView();
-        void renderAdvancedView();  // Depth buffer switching (Advanced tab)
-        // Sub-views: pages pushed inside a tab. They slide in over the dock (which
-        // fades out to make room) and carry a breadcrumb back to their parent.
-        void renderDepthBuffersView();   // Reported depth buffers (from Settings)
-        void renderThemeColorsView();    // Theme editor: colors (from Appearance)
-        void renderThemeBlurView();      // Theme editor: blur
-        void renderThemeShapeView();     // Theme editor: shape and metrics
-        void renderNavbarView();         // Appearance: navigation bar shape
+        void renderAdvancedView();  // Depth buffer controls in Settings
+        // Secondary settings pages with a native Back button.
+        void renderDepthBuffersView();
         enum SubView
         {
             SubView_None = 0,
             SubView_DepthBuffers,
             SubView_Diagnostics,
-            SubView_ThemeColors,
-            SubView_ThemeBlur,
-            SubView_ThemeShape,
-            SubView_Navbar,
         };
         int openSubView = SubView_None;
         void gatherDepthInfo();     // Snapshot LogicalDevice depth state under globalLock
@@ -235,8 +218,6 @@ namespace VKIntox
         // Overlay hitboxes for this frame, in surface pixels. published to the
         // input blocker so only pointer events over the overlay are withheld.
         std::vector<InputRect> frameInputRects;
-        // toast cards this frame, in surface pixels; the backdrop blur skips them
-        std::vector<InputRect> toastCardRects;
 
         LogicalDevice* logicalDevice;
         OverlayPersistentState* pPersistentState;
@@ -244,44 +225,10 @@ namespace VKIntox
         VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
         VkRenderPass renderPass = VK_NULL_HANDLE;
         VkCommandPool commandPool = VK_NULL_HANDLE;
-        VkImage titleIconImage = VK_NULL_HANDLE;
-        VkDeviceMemory titleIconMemory = VK_NULL_HANDLE;
-        VkImageView titleIconView = VK_NULL_HANDLE;
-        VkSampler titleIconSampler = VK_NULL_HANDLE;
-        VkDescriptorSet titleIconDescriptor = VK_NULL_HANDLE;
-        // Backdrop blur. One set of resources per swapchain image so a half-res
-        // capture written for image N can never race a blur still reading image
-        // M on the GPU. Shared objects (pipeline, sampler, render pass) live
-        // below and are rebuilt only on a swapchain extent/format change.
-        struct BlurResources
-        {
-            VkImage         image[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};       // [0] final ping-pong target
-            VkDeviceMemory  memory[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
-            VkImageView     view[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
-            VkFramebuffer   framebuffer[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
-            VkDescriptorSet sourceSet[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};   // samples image[i]
-            VkDescriptorSet imguiTexture = VK_NULL_HANDLE;                     // samples image[0]
-        };
-        // Backdrop blur. One set of resources per swapchain image so a half-res
-        // capture written for image N can never race a blur still reading image
-        // N-1.
-        std::vector<BlurResources> blurResources;
-        VkSampler             blurSampler = VK_NULL_HANDLE;
-        VkDescriptorSetLayout blurSetLayout = VK_NULL_HANDLE;
-        VkDescriptorPool      blurPool = VK_NULL_HANDLE;
-        VkRenderPass          blurRenderPass = VK_NULL_HANDLE;
-        VkPipelineLayout      blurPipelineLayout = VK_NULL_HANDLE;
-        VkPipeline            blurPipeline = VK_NULL_HANDLE;
-        uint32_t              blurWidth = 0;   // half-res capture width
-        uint32_t              blurHeight = 0;  // half-res capture height
-        VkFilter              blurFilter = VK_FILTER_LINEAR;  // blit filter, downgraded if unsupported
-        bool                  blurReady = false;
         std::vector<VkCommandBuffer> commandBuffers;
         std::vector<VkFence> commandBufferFences;  // Fences to track command buffer completion
         std::vector<VkFramebuffer> framebuffers;    // Pre-created per swapchain image
         std::vector<VkImageView> framebufferImageViews;  // Track which image views framebuffers were created for
-        VkFormat swapchainFormat = VK_FORMAT_UNDEFINED;
-        uint32_t imageCount = 0;
         uint32_t framebufferWidth = 0;   // Dimensions used to create framebuffers
         uint32_t framebufferHeight = 0;
         OverlayState state;
@@ -292,10 +239,6 @@ namespace VKIntox
         int insertPosition = -1;  // Position to insert effects (-1 = append to end)
         char addEffectsSearch[64] = "";  // Search filter for add effects view
         bool addEffectsFocusSearch = false;  // Focus the search box on the next frame
-        // True while a view slide is running. The add-effects search focus is
-        // deferred until it is false: focusing mid-slide made ImGui scroll the
-        // window to the focused item, which dragged the nav bar along.
-        bool viewTransitionActive = false;
 
         // Bumped when updateState sees different effect sources, so the
         // add-effects view can cache its entry list instead of rebuilding it
@@ -345,19 +288,18 @@ namespace VKIntox
         std::set<std::string> checkedShaders; // Effects already checked for depth (avoids recompiling)
 
         // UI state for settings view
-        bool themeEditorOpen = false;  // Material 3 token editor panel
         int listeningForKey = 0;  // 0=none, 1=toggle, 2=reload, 3=overlay
         bool settingsSaved = false;  // True when settings saved, cleared by vkintox.cpp
         bool shaderPathsChanged = false;  // True when shader manager saved, cleared by vkintox.cpp
 
-        // Toast snackbars (bottom-centre, auto-dismissing). They render even when
+        // Non-interactive top-right notifications. They render even when
         // the main overlay is hidden, so fatal errors stay visible.
         mutable std::mutex toastsMutex;
         std::vector<ToastNotification> toasts;
 
         // UI state for Advanced (depth buffer) view
         DepthInfo depthInfo;  // Refreshed each frame before rendering
-        DeviceInfo deviceInfo;  // Same, for the Diagnostics GPU card
+        DeviceInfo deviceInfo;  // Same, for Diagnostics GPU information
         bool depthPinPendingClear = false;   // Request to clear pinned depth (from UI)
         VkImageView depthPinPendingView = VK_NULL_HANDLE;  // Request to pin a specific view (from UI)
         bool depthPinChanged = false;         // Set when pin/clear was applied (triggers cmd buf reallocation)
@@ -372,20 +314,10 @@ namespace VKIntox
         std::chrono::steady_clock::time_point lastChangeTime;
         bool visible = false;
         bool initialized = false;
-        // Shell appear/disappear. Mirrors the dialog motion exactly: same
-        // 0.28s clock, same rise, same bezier, run backwards on hide.
-        float  shellAlpha = 1.0f;
-        double shellAnimStart = -1000.0;
-        bool   shellAnimTarget = false;
-        bool   shellBaseValid = false;
-        bool   shellForcePos = false;
-        float  shellBaseX = 0.0f;
-        float  shellBaseY = 0.0f;
+        float appliedUiScale = -1.0f;
+        int activeView = 0;
         bool backendInitialized = false;
         bool resetLayoutRequested = false;  // When true, reset window position/size next frame
-        bool titleRightDragging = false;
-        float titleRightDragOffsetX = 0.0f;
-        float titleRightDragOffsetY = 0.0f;
         uint32_t currentWidth = 1920;   // Current swapchain resolution for VRAM estimates
         uint32_t currentHeight = 1080;
         char saveConfigName[64] = "";

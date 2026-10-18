@@ -2,7 +2,6 @@
 #include "settings_manager.hh"
 #include "logger.hh"
 #include "overlay/ui_theme.hh"
-#include "overlay/ui_icons.hh"
 
 #include <algorithm>
 #include <cstdio>
@@ -22,6 +21,7 @@ namespace VKIntox
         };
 
         ImGui::BeginChild("SettingsContent", ImVec2(0, 0), false);
+        const float d = ImGui::GetFontSize() / 16.0f;
 
         // Helper lambda to render a keybind button.
         auto renderKeyBind = [&](const char* label, const char* tooltip,
@@ -32,19 +32,21 @@ namespace VKIntox
             ImGui::TextUnformatted(label);
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("%s", tooltip);
-            ImGui::SameLine(160.0f);
+            ImGui::SameLine(160.0f * d);
 
             bool isListening = (listeningForKey == bindingId);
             const char* buttonText = isListening ? "Press a key..." : currentKey.c_str();
 
             if (isListening)
             {
-                ImGui::PushStyleColor(ImGuiCol_Button, ImGuiM3ColorU32(ImGuiM3Role_TertiaryContainer));
-                ImGui::PushStyleColor(ImGuiCol_Text, ImGuiM3ColorU32(ImGuiM3Role_OnTertiaryContainer));
+                ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
+                ImGui::PushStyleColor(ImGuiCol_Text, UI::OnSurface());
             }
 
-            if (ImGui::Button(buttonText, ImVec2(140, 0)))
+            ImGui::PushID(bindingId);
+            if (ImGui::Button(buttonText, ImVec2(140.0f * d, 0)))
                 listeningForKey = isListening ? 0 : bindingId;
+            ImGui::PopID();
 
             if (isListening)
                 ImGui::PopStyleColor(2);
@@ -58,7 +60,7 @@ namespace VKIntox
         };
 
         // --- Controls ---
-        ImGui::M3CardBegin("set_controls", "Controls", Icon::TuneUtf8);
+        ImGui::SeparatorText("Controls");
         ImGui::Spacing();
         renderKeyBind("Toggle Effects", "Key to enable/disable all effects",
                       settingsManager.getToggleKey(),
@@ -83,11 +85,10 @@ namespace VKIntox
             ImGui::Text("When enabled, keyboard and mouse input is captured by the overlay.");
             ImGui::EndTooltip();
         }
-        ImGui::M3CardEnd();
 
         // --- Behaviour ---
         ImGui::Spacing();
-        ImGui::M3CardBegin("set_behaviour", "Behaviour", Icon::PowerUtf8);
+        ImGui::SeparatorText("Behaviour");
 
         bool enableOnLaunch = settingsManager.getEnableOnLaunch();
         if (ImGui::Checkbox("Enable effects on launch", &enableOnLaunch))
@@ -112,8 +113,8 @@ namespace VKIntox
             ImGui::Indent();
             ImGui::AlignTextToFramePadding();
             ImGui::Text("Delay");
-            ImGui::SameLine(160.0f);
-            ImGui::SetNextItemWidth(160);
+            ImGui::SameLine(160.0f * d);
+            ImGui::SetNextItemWidth(160.0f * d);
             int delayVal = settingsManager.getAutoApplyDelay();
             if (ImGui::SliderInt("##autoApplyDelay", &delayVal, 20, 1000, "%d ms"))
                 settingsManager.setAutoApplyDelay(delayVal);
@@ -130,7 +131,7 @@ namespace VKIntox
         }
         ImGui::Spacing();
         ImGui::AlignTextToFramePadding();
-        ImGui::Text("%s  Max effects", Icon::MemoryUtf8);
+        ImGui::TextUnformatted("Max effects");
         if (ImGui::IsItemHovered())
         {
             ImGui::BeginTooltip();
@@ -138,11 +139,9 @@ namespace VKIntox
             ImGui::TextColored(UI::Warning(), "High values use significant VRAM.");
             ImGui::EndTooltip();
         }
-        ImGui::SameLine(160.0f);
-        ImGui::SetNextItemWidth(120);
+        ImGui::SameLine(160.0f * d);
+        ImGui::SetNextItemWidth(120.0f * d);
         int maxEffectsVal = settingsManager.getMaxEffects();
-        // step 0 hides InputInt's inline +/- buttons: the M3 frame padding makes
-        // them huge, which squeezed the value field down to an unreadable sliver.
         if (ImGui::InputInt("##maxEffects", &maxEffectsVal, 0, 0))
         {
             maxEffectsVal = std::clamp(maxEffectsVal, 1, 200);
@@ -152,140 +151,52 @@ namespace VKIntox
         float bytesPerSlot = 2.0f * currentWidth * currentHeight * 4.0f;
         int estimatedVramMB = static_cast<int>((maxEffectsVal * bytesPerSlot) / (1024.0f * 1024.0f));
         ImGui::SameLine();
-        UI::PushSupport();
         if (maxEffectsVal > 20)
             ImGui::TextColored(UI::Attention(), "~%d MB @ %ux%u", estimatedVramMB, currentWidth, currentHeight);
         else
             ImGui::TextDisabled("~%d MB @ %ux%u", estimatedVramMB, currentWidth, currentHeight);
         ImGui::TextDisabled("Requires restart");
-        UI::PopSupport();
-        ImGui::M3CardEnd();
 
-        // --- Appearance: theme entry points first, then the layout option and
-        // the theme file, each on its own surface ---
         ImGui::Spacing();
-        ImGui::M3CardBegin("set_appearance", "Appearance", Icon::PaletteUtf8);
-
-        const float d = ImGuiM3GetMetrics().density;
-        // the three theme pages, as one connected pill row
+        ImGui::SeparatorText("Appearance");
+        float uiScale = settingsManager.getUiScale();
+        bool automaticScale = uiScale == 0.0f;
+        if (ImGui::Checkbox("Automatic UI scale", &automaticScale))
         {
-            static const char* const themePills[] = { "Colors", "Blur", "Shape and metrics", "Navigation bar" };
-            static const char* const themeGlyphs[] = { Icon::ColorizeUtf8, Icon::BlurOnUtf8, Icon::StraightenUtf8, Icon::GridViewUtf8 };
-            const int pill = UI::PillPageRow(themePills, themeGlyphs, 4);
-            if (pill == 0)
-                openSubView = SubView_ThemeColors;
-            else if (pill == 1)
-                openSubView = SubView_ThemeBlur;
-            else if (pill == 2)
-                openSubView = SubView_ThemeShape;
-            else if (pill == 3)
-                openSubView = SubView_Navbar;
+            settingsManager.setUiScale(automaticScale ? 0.0f : ImGui::GetFontSize() / 18.0f);
+            saveSettings();
+        }
+        if (!automaticScale)
+        {
+            uiScale = settingsManager.getUiScale();
+            ImGui::SetNextItemWidth(240.0f * d);
+            if (ImGui::SliderFloat("UI scale", &uiScale, 0.75f, 3.0f, "%.2fx"))
+                settingsManager.setUiScale(uiScale);
+            if (ImGui::IsItemDeactivatedAfterEdit())
+                saveSettings();
         }
 
         ImGui::Spacing();
         bool separateParams = settingsManager.getSeparateEffectParams();
-        if (ImGui::Checkbox("Separate effect parameters into its own card", &separateParams))
+        if (ImGui::Checkbox("Separate effect parameters into their own section", &separateParams))
         {
             settingsManager.setSeparateEffectParams(separateParams);
             saveSettings();
         }
 
-        // Theme file: always revealed, so a reload is one tap from here
-        ImGui::Spacing();
-        ImGui::M3SectionHeader("Theme file", Icon::SaveUtf8);
-        ImGui::M3ThemeEditorFile();
-        ImGui::M3CardEnd();
 
         // --- Depth buffer: capture, decoding and selection all live here ---
         ImGui::Spacing();
-        ImGui::M3CardBegin("set_depth");
         renderAdvancedView();
-        ImGui::M3CardEnd();
 
         // --- Developer: pages that live a level deeper, plus layout recovery ---
         ImGui::Spacing();
-        ImGui::M3CardBegin("set_dev", "Developer", Icon::CodeUtf8);
-        if (UI::SubViewRow("Open diagnostics", NULL, Icon::MonitorHeartUtf8))
+        ImGui::SeparatorText("Developer");
+        if (ImGui::Button("Open diagnostics"))
             openSubView = SubView_Diagnostics;
-        ImGui::M3CardEnd();
 
         ImGui::EndChild();
     }
 
-    // --- Pushed theme-editor pages -------------------------------------------
-    void ImGuiOverlay::renderThemeColorsView()
-    {
-        if (UI::BreadcrumbBar("Go back", Icon::ChevronLeftUtf8))
-        {
-            openSubView = SubView_None;
-            return;
-        }
-        ImGui::Spacing();
-        ImGui::M3HeroHeader(Icon::ColorizeUtf8, "Colors");
-        ImGui::Spacing();
-        ImGui::M3ThemeEditorColors();
-    }
-
-    void ImGuiOverlay::renderThemeBlurView()
-    {
-        if (UI::BreadcrumbBar("Go back", Icon::ChevronLeftUtf8))
-        {
-            openSubView = SubView_None;
-            return;
-        }
-        ImGui::Spacing();
-        ImGui::M3HeroHeader(Icon::BlurOnUtf8, "Blur");
-        ImGui::Spacing();
-        ImGui::M3ThemeEditorBlur();
-    }
-
-    void ImGuiOverlay::renderNavbarView()
-    {
-        if (UI::BreadcrumbBar("Go back", Icon::ChevronLeftUtf8))
-        {
-            openSubView = SubView_None;
-            return;
-        }
-        ImGui::Spacing();
-        ImGui::M3HeroHeader(Icon::GridViewUtf8, "Navigation bar");
-        ImGui::Spacing();
-
-        ImGui::M3CardBegin("nav_shape", "Layout", Icon::GridViewUtf8);
-        ImGui::TextDisabled("Position");
-        {
-            const char* positions[] = {"Top", "Bottom"};
-            int position = settingsManager.getNavPosition();
-            if (ImGui::M3ConnectedButtonGroup("##nav_position", positions, 2, &position, NULL))
-            {
-                settingsManager.setNavPosition(position);
-                settingsManager.save();
-            }
-        }
-        ImGui::Spacing();
-        ImGui::TextDisabled("Style");
-        {
-            const char* styles[] = {"Dock", "Pill-shaped group of buttons"};
-            int style = settingsManager.getNavStyle();
-            if (ImGui::M3ConnectedButtonGroup("##nav_style", styles, 2, &style, NULL))
-            {
-                settingsManager.setNavStyle(style);
-                settingsManager.save();
-            }
-        }
-        ImGui::M3CardEnd();
-    }
-
-    void ImGuiOverlay::renderThemeShapeView()
-    {
-        if (UI::BreadcrumbBar("Go back", Icon::ChevronLeftUtf8))
-        {
-            openSubView = SubView_None;
-            return;
-        }
-        ImGui::Spacing();
-        ImGui::M3HeroHeader(Icon::StraightenUtf8, "Shape and metrics");
-        ImGui::Spacing();
-        ImGui::M3ThemeEditorShape();
-    }
 
 } // namespace VKIntox

@@ -14,7 +14,6 @@ glsl_shader_src = files(
     'effects/shaders/glsl/depth_resolve_universal_ms.frag.glsl',
     'effects/shaders/glsl/depth_resolve_universal_msaa.frag.glsl',
     'effects/shaders/glsl/full_screen_triangle.vert.glsl',
-    'effects/shaders/glsl/overlay_blur.frag.glsl',
 )
 glsl_compiler = find_program('glslangValidator')
 glsl_generator = generator(glsl_compiler,
@@ -27,7 +26,6 @@ imgui_src = [
     'vendor/imgui/imgui_draw.cc',
     'vendor/imgui/imgui_tables.cc',
     'vendor/imgui/imgui_widgets.cc',
-    'vendor/imgui/imgui_m3.cc',
     'vendor/imgui/backends/imgui_impl_vulkan.cc',
 ]
 
@@ -39,8 +37,6 @@ overlay_src = [
     'overlay/view_diagnostics.cc',
     'overlay/view_about.cc',
     'overlay/view_settings.cc',
-    'overlay/ui_dialog.cc',
-    'overlay/ui_menu.cc',
     'overlay/view_shader_manager.cc',
     'overlay/view_shader_test.cc',
     'overlay/view_main.cc',
@@ -57,6 +53,7 @@ overlay_src = [
 VKIntox_src = [
     'core/vkintox.cc',
     'core/vkintox_depth.cc',
+    'render/native_capture.cc',
     'core/async_writer.cc',
     'render/buffer.cc',
     'render/command_buffer.cc',
@@ -69,6 +66,7 @@ VKIntox_src = [
     'effects/effect.cc',
     'effects/effect_registry.cc',
     'effects/effect_reshade.cc',
+    'effects/reshade_texture_pool.cc',
     'effects/effect_transfer.cc',
     'effects/reshade_parser.cc',
     'render/fake_swapchain.cc',
@@ -229,7 +227,7 @@ vkintox_lib = shared_library('vkintox',
     install : true,
     install_dir : lib_dir)
 
-executable('vkintox-shader-check',
+shader_check = executable('vkintox-shader-check',
     'effects/shader_check.cc',
     'effects/reshade_parser.cc',
     'vendor/reshade/effect_codegen_spirv.cc',
@@ -248,6 +246,16 @@ executable('vkintox-shader-check',
     dependencies : [reshade_dep],
     install : true)
 
+spirv_validator = find_program('spirv-val', native : true, required : false)
+if spirv_validator.found()
+    foreach fixture : ['ScalarTextureFetch', 'OutParameterConversion']
+        test(fixture + ' SPIR-V', find_program('python3', native : true),
+            args : [files('tests/test_shader_spirv.py'), shader_check.full_path(),
+                    spirv_validator.full_path(), fixture + '.fx'],
+            depends : shader_check)
+    endforeach
+endif
+
 config_serializer_tests = executable('vkintox-config-serializer-tests',
     'tests/config_serializer_test.cc',
     'core/config/config_serializer.cc',
@@ -257,19 +265,6 @@ config_serializer_tests = executable('vkintox-config-serializer-tests',
     'core/util.cc',
     include_directories : [core_inc, render_inc, effects_inc, effects_params_inc, vendor_inc, source_inc, imgui_inc])
 test('config serializer', config_serializer_tests)
-
-# The M3 theme is the one part of the UI that cannot be eyeballed in CI: it needs
-# no GPU, but a colour-maths or file-format regression is otherwise invisible.
-# This links the theme plus the ImGui core (no renderer) and exercises it headless.
-m3_theme_tests = executable('vkintox-m3-theme-tests',
-    'tests/m3_theme_test.cc',
-    'vendor/imgui/imgui.cc',
-    'vendor/imgui/imgui_draw.cc',
-    'vendor/imgui/imgui_tables.cc',
-    'vendor/imgui/imgui_widgets.cc',
-    'vendor/imgui/imgui_m3.cc',
-    include_directories : [imgui_inc])
-test('m3 theme', m3_theme_tests)
 
 # The variable-font extension to stb_truetype is pure but invisible to CI: a bad
 # download or a gvar/HVAR regression would only show as wrong-looking text. This
@@ -289,11 +284,9 @@ vk_handle_tests = executable('vkintox-vk-handle-tests',
     include_directories : [core_inc, render_inc, source_inc])
 test('vk handle ordering', vk_handle_tests)
 
-# X11 input blocking: the pointer grab follows the cursor while the keyboard grab
-# only engages when the overlay consumes keys (a grab transition makes Wine drop
-# the game's cursor capture), and held keys/buttons are handed to the game across
-# each grab, or the game keeps holding whatever was down. Drives the layer's real
-# blocker against a stand-in window, so it needs a display and synthesises input:
+# X11 input blocking: notification hitboxes remain non-modal, but an interactive
+# menu owns pointer and keyboard for its whole lifetime. Held keys are handed
+# back on close. Uses the real blocker and synthesises input on a display:
 # opt in with VKINTOX_X11_INPUT_TEST=1.
 libdl_dep = meson.get_compiler('cpp').find_library('dl', required : false)
 x11_input_handoff_tests = executable('vkintox-x11-input-handoff-tests',
@@ -311,6 +304,21 @@ depth_copy_state_tests = executable('vkintox-depth-copy-state-tests',
     dependencies : [threads_dep],
     include_directories : [render_inc, source_inc])
 test('depth copy state', depth_copy_state_tests)
+
+# Link the production recorder and fake only Vulkan dispatch. Section GC keeps
+# unrelated command-buffer allocation/effect code out of the headless executable.
+depth_snapshot_scope_tests = executable('vkintox-depth-snapshot-scope-tests',
+    'render/depth_snapshot_scope_test.cc',
+    'render/command_buffer.cc',
+    'render/format.cc',
+    'render/image_view.cc',
+    'core/logger.cc',
+    cpp_args : ['-ffunction-sections', '-fdata-sections'],
+    link_args : ['-Wl,--gc-sections'],
+    dependencies : [threads_dep],
+    include_directories : [core_inc, render_inc, effects_inc, source_inc])
+test('depth snapshot scope', depth_snapshot_scope_tests,
+    env : ['VKINTOX_LOG_LEVEL=none'])
 
 # The compile cache is what stops a chain reload from re-parsing every ReShade
 # effect. Its keying and bound are the contract, and a missing lock would only
@@ -341,6 +349,32 @@ compile_cache_tests = executable('vkintox-compile-cache-tests',
     dependencies : [threads_dep],
     include_directories : [effects_inc, source_inc])
 test('compile cache', compile_cache_tests)
+
+reshade_texture_pool_tests = executable('vkintox-reshade-texture-pool-tests',
+    'effects/reshade_texture_pool_test.cc',
+    'effects/reshade_texture_pool.cc',
+    'render/format.cc',
+    'render/vk_handle.cc',
+    'core/logger.cc',
+    include_directories : [core_inc, render_inc, effects_inc, source_inc])
+test('reshade texture pool', reshade_texture_pool_tests)
+
+# Temporal ReShade shaders may declare framecount as float, int or uint.
+reshade_uniform_tests = executable('vkintox-reshade-uniform-tests',
+    'effects/reshade_uniforms_test.cc',
+    'effects/reshade_uniforms.cc',
+    'core/logger.cc',
+    cpp_args : ['-ffunction-sections', '-fdata-sections'],
+    link_args : ['-Wl,--gc-sections'],
+    include_directories : [core_inc, effects_inc, vendor_inc, source_inc])
+test('reshade uniform sources', reshade_uniform_tests)
+
+native_capture_tests = executable('vkintox-native-capture-tests',
+    'tests/test_native_capture.cc',
+    'render/native_capture.cc',
+    'core/logger.cc',
+    include_directories : [core_inc, render_inc, source_inc])
+test('DDDA native capture', native_capture_tests)
 
 # AsyncWriter is what keeps profile/settings writes off the present thread. Its
 # FIFO order and idle barrier are the contract, and its thread lifetime is the

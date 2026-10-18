@@ -17,6 +17,7 @@
 #include "effect_config.hh"
 #include "effect_registry.hh"
 #include "reshade_uniforms.hh"
+#include "reshade_texture_pool.hh"
 
 #include "logical_device.hh"
 
@@ -35,12 +36,14 @@ namespace VKIntox
                       std::vector<VkImage> inputImages,
                       std::vector<VkImage> outputImages,
                       EffectRegistry*      effectRegistry,
+                      ReshadeTexturePool& texturePool,
                       std::string          effectName,
                       std::string          effectPath = "",  // Optional: explicit path to .fx file
                       std::vector<PreprocessorDefinition> customDefs = {});  // Custom preprocessor definitions
         void virtual applyEffect(uint32_t imageIndex, VkCommandBuffer commandBuffer) override;
         void virtual updateEffect() override;
         void virtual useDepthImage(uint32_t imageIndex, VkImageView depthImageView, VkImageLayout depthImageLayout) override;
+        void useNativeMaterial(uint32_t imageIndex, VkImageView imageView, VkImageLayout imageLayout, bool valid) override;
         std::vector<std::unique_ptr<EffectParam>> getParameters() const override;
         int getOutputWrites() const { return outputWrites; }
         virtual ~ReshadeEffect();
@@ -77,6 +80,8 @@ namespace VKIntox
         std::unordered_map<std::string, VkFormat>   textureFormatsSRGB;
         std::unordered_map<std::string, uint32_t>   textureMipLevels;
         std::unordered_map<std::string, VkExtent3D> textureExtents;
+        // Own shared resources independently of the build-local lookup pool.
+        std::vector<std::shared_ptr<ReshadeTexture>> sharedTextures;
 
         std::vector<VkDescriptorSet> inputDescriptorSets;
         std::vector<VkDescriptorSet> outputDescriptorSets;
@@ -126,14 +131,18 @@ namespace VKIntox
         std::vector<bool>        outputImageInitialized;
         std::vector<VkImageView> backBufferImageViewsUNORM;
         std::vector<VkImageView> backBufferImageViewsSRGB;
-        VkBuffer                 stagingBuffer;
-        VkDeviceMemory           stagingBufferMemory;
+        // Effects without uniforms never allocate this buffer.
+        VkBuffer                 stagingBuffer = VK_NULL_HANDLE;
+        VkDeviceMemory           stagingBufferMemory = VK_NULL_HANDLE;
         uint32_t                 bufferSize;
         void*                    stagingBufferMapped = nullptr;  // Persistent map (HOST_COHERENT)
         VkDescriptorSet          bufferDescriptorSet;
         bool                     disableComputePipelineOptimization = false;
 
         std::vector<std::shared_ptr<ReshadeUniform>> uniforms;
+        std::vector<uint32_t> nativeMaterialSamplerBindings;
+        std::vector<uint32_t> nativeMaterialAvailabilityOffsets;
+        bool nativeMaterialAvailable = false;
         // registry params resolved at build time; valid only while the registry
         // generation is unchanged, since a reparse frees the old param vector
         std::unordered_map<std::string, EffectParam*> uiParamCache;

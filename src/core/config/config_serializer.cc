@@ -23,6 +23,7 @@
 #include <climits>
 #include <cerrno>
 #include <cctype>
+#include <cmath>
 
 namespace VKIntox
 {
@@ -261,10 +262,22 @@ namespace VKIntox
                 settings.overlayBlockInput = (value == "true" || value == "1");
             else if (key == "usePortalIntegration")
                 settings.usePortalIntegration = (value == "true" || value == "1");
-            else if (key == "navPosition")
-                settings.navPosition = (value == "top") ? 0 : 1;
-            else if (key == "navStyle")
-                settings.navStyle = (value == "pills") ? 1 : 0;
+            else if (key == "uiScale")
+            {
+                try
+                {
+                    size_t consumed = 0;
+                    const float scale = std::stof(value, &consumed);
+                    if (consumed != value.size() || !std::isfinite(scale) || scale < 0.0f)
+                        Logger::err("invalid uiScale value: " + value);
+                    else
+                        settings.uiScale = scale == 0.0f ? 0.0f : std::clamp(scale, 0.75f, 3.0f);
+                }
+                catch (...)
+                {
+                    Logger::err("invalid uiScale value: " + value);
+                }
+            }
             else if (key == "toggleKey")
                 settings.toggleKey = value;
             else if (key == "reloadKey")
@@ -369,9 +382,9 @@ namespace VKIntox
 
         file << "overlayBlockInput = " << (settings.overlayBlockInput ? "true" : "false") << "\n";
         file << "usePortalIntegration = " << (settings.usePortalIntegration ? "true" : "false") << "\n";
-        file << "# navPosition: bottom (default) or top; navStyle: dock (default) or pills\n";
-        file << "navPosition = " << (settings.navPosition == 0 ? "top" : "bottom") << "\n";
-        file << "navStyle = " << (settings.navStyle == 1 ? "pills" : "dock") << "\n";
+        file << "# uiScale: 0 = automatic; manual range 0.75 to 3.0\n";
+        file << "uiScale = " << (std::isfinite(settings.uiScale) && settings.uiScale > 0.0f
+            ? std::clamp(settings.uiScale, 0.75f, 3.0f) : 0.0f) << "\n";
         file << "maxEffects = " << clampedMaxEffects << "\n";
         file << "autoApply = " << (settings.autoApply ? "true" : "false") << "\n";
         file << "autoApplyDelay = " << settings.autoApplyDelay << "\n";

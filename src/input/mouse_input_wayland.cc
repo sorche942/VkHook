@@ -24,9 +24,13 @@ namespace VKIntox
     static bool middleButton = false;
     static float scrollAccumulator = 0.0f;
 
-    // Per-frame flag: true when axis_discrete or axis_value120 fired for this
-    // pointer frame, so we skip the continuous axis event to avoid double-counting.
-    static bool discreteScrollReceived = false;
+    // Protocol events within a frame can arrive in any order. Commit exactly
+    // one representation at frame end: value120, discrete, or continuous.
+    static float continuousScroll = 0.0f;
+    static float discreteScroll = 0.0f;
+    static float highResolutionScroll = 0.0f;
+    static bool hasDiscreteScroll = false;
+    static bool hasHighResolutionScroll = false;
 
     // Stuck-button safety net. Button state is authoritative from
     // wl_pointer.button: the compositor delivers the release even when the
@@ -109,26 +113,24 @@ namespace VKIntox
         }
     }
 
-    static void pointerAxis(void* /*data*/, wl_pointer* /*pointer*/,
+    static void pointerAxis(void* /*data*/, wl_pointer* pointer,
                             uint32_t /*time*/, uint32_t axis, wl_fixed_t value)
     {
-        // Only use continuous axis as fallback when discrete events are not sent.
-        // When both fire for the same pointer frame, discrete/value120 takes priority.
-        if (axis != 0)
+        if (axis != WL_POINTER_AXIS_VERTICAL_SCROLL)
             return;
-        if (discreteScrollReceived)
-            return;
-
-        // Negative value = scroll up, positive = scroll down
-        // Normalize: typical step is 10.0 fixed-point
-        float scroll = wl_fixed_to_double(value);
-        scrollAccumulator -= scroll / 10.0f;
+        const float scroll = -static_cast<float>(wl_fixed_to_double(value)) / 10.0f;
+        if (wl_proxy_get_version(reinterpret_cast<wl_proxy*>(pointer)) < WL_POINTER_FRAME_SINCE_VERSION)
+            scrollAccumulator += scroll;
+        else
+            continuousScroll += scroll;
     }
 
     static void pointerFrame(void* /*data*/, wl_pointer* /*pointer*/)
     {
-        // Reset per-frame discrete flag at the end of each pointer frame
-        discreteScrollReceived = false;
+        scrollAccumulator += hasHighResolutionScroll ? highResolutionScroll
+                           : hasDiscreteScroll ? discreteScroll : continuousScroll;
+        continuousScroll = discreteScroll = highResolutionScroll = 0.0f;
+        hasDiscreteScroll = hasHighResolutionScroll = false;
     }
 
     static void pointerAxisSource(void* /*data*/, wl_pointer* /*pointer*/, uint32_t /*source*/)
@@ -147,8 +149,8 @@ namespace VKIntox
         if (axis != 0)
             return;
 
-        discreteScrollReceived = true;
-        scrollAccumulator -= (float)discrete; // Wayland: positive = scroll down, ImGui: positive = scroll up
+        hasDiscreteScroll = true;
+        discreteScroll -= static_cast<float>(discrete);
     }
 
     static void pointerAxisValue120(void* /*data*/, wl_pointer* /*pointer*/,
@@ -159,8 +161,8 @@ namespace VKIntox
         if (axis != 0)
             return;
 
-        discreteScrollReceived = true;
-        scrollAccumulator -= (float)value120 / 120.0f;
+        hasHighResolutionScroll = true;
+        highResolutionScroll -= static_cast<float>(value120) / 120.0f;
     }
 
     static const wl_pointer_listener pointerListener = {

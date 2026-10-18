@@ -78,23 +78,20 @@ enable per-session with `ENABLE_VKINTOX=1 your_game_command`.
 
 **overlay**
 
--   **material 3 ui:** the overlay is a from-scratch material 3 implementation that patches the vendored dear imgui directly. real m3 widgets (filled/tonal/outlined buttons, switches, sliders, chips, progress, cards), an animated press morph, elevation, and slide-and-fade transitions between views. the shell itself rises into place on open and sinks back down on close with the same bezier as the dialogs, its shadow, title bar, and blurred backdrop fading in step.
--   **navigation:** the top nav is one connected button group. the selected segment swaps to the secondary-container colour and its accent pill widens as it slides between tabs.
--   **menus:** one shared module backs every dropdown and context menu: wider panels, centred labels, a thin scrollbar that hides when the list fits, width-based label truncation, and an accent on the selected row. the shader INI dropdown bullets the active preset.
--   **theme editor:** pick a seed colour, variant (expressive, tonal-spot, vibrant, neutral, monochrome, fidelity, content), contrast and light/dark; edit every colour role; tune density and corner scale; and browse a live widget gallery. changes write to `theme.colors` and hot-reload. **matugen is supported with hot reloading!**
--   **backdrop blur:** the frame behind the overlay is captured, downsampled, and blurred with a separable gaussian on ping-pong targets before the ui is drawn over it. the theme editor exposes the blur toggle, background opacity, size, and pass count (1–10, default 7). the foreground stays sharp, and nothing is recorded while the blur is off or the background is opaque.
--   **window:** resizable and movable, anchored to the game framebuffer, with right-click title drag, a close button, and an about tab that reports the version compiled into the library. the title bar fades with the shell animation.
+-   **dear imgui:** standard dark style, default font, native tabs, buttons, sliders, menus, dialogs, and scrollbars. no Material theme patches, animated cards, or backdrop blur.
+-   **readability:** automatic framebuffer-based scaling, with a persistent manual scale under Settings → Appearance.
+-   **window:** move it by its title bar and resize with its edges or corner grip. the about tab reports the version compiled into the library.
 
 **effects**
 
 -   **reshade fx compat:** runtime compilation of `.fx` shaders to spir-v, cached per shader and extent.
 -   **depth resolve:** auto-detects or manually selects the correct depth buffer to fix z-fighting in ao and dof. depth capture is on by default, so depth effects work on a game's first launch without a restart, and per-game defaults seed themselves; sober starts with inverted depth, everything else does not.
--   **effect list:** card-based and scrolls independently of the view, with the preset actions right-aligned on the effects row.
--   **add effects:** a dedicated view with a back breadcrumb, package tabs (all / vkintox / every installed pack), ranked search, recents, keyboard navigation, and a per-effect duplicate stepper (`-` count `+`) that stops at the max-effects limit.
+-   **effect list:** native checkboxes, drag/drop ordering, and either inline parameters or a separate tabbed parameter section.
+-   **add effects:** a searchable table with a package selector, queued additions/removals, and per-effect duplicate controls that respect the max-effects limit.
 -   **shader presets:** create (inherits the active preset), rename, delete behind a confirm, and import a reshade `.ini` through the desktop portal, with an in-overlay browser as the fallback.
 -   **shader manager:** compile-test every discovered shader, grey the test out once the installed set is unchanged, and flag which shaders need a depth buffer.
 -   **built-in shaders:** a from-scratch morphological msaa shader (search steps, edge threshold, blend strength, three refinement passes) and an exponential height fog, each shipping in its own `vkintox` package.
--   **per-app profiles:** one config per detected game, shown by name and a joystick icon.
+-   **per-app profiles:** one config per detected game.
 
 **diagnostics**
 
@@ -107,7 +104,7 @@ enable per-session with `ENABLE_VKINTOX=1 your_game_command`.
 **setup**
 
 -   **one installer** for sober, flatpak and native targets, with an interactive version picker and an uninstall that leaves your config alone.
--   **assets:** seeds the full google sans + material symbols set and their licences, installs effect packages under `reshade/` grouped by package, and drops the built-in vkintox shaders beside them.
+-   **assets:** installs effect packages under `reshade/` grouped by package and drops the built-in vkintox shaders beside them. the overlay needs no external fonts.
 
 **under the hood**
 

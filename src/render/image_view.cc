@@ -7,14 +7,18 @@ namespace VKIntox
                                               const std::vector<VkImage>& images,
                                               VkImageViewType      viewType,
                                               VkImageAspectFlags   aspectMask,
-                                              uint32_t             mipLevels)
+                                              uint32_t             mipLevels,
+                                              VkImageUsageFlags    viewUsage)
     {
         std::vector<VkImageView> imageViews(images.size());
 
         VkImageViewCreateInfo imageViewCreateInfo;
+        VkImageViewUsageCreateInfo usageInfo = {};
+        usageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO;
+        usageInfo.usage = viewUsage;
 
         imageViewCreateInfo.sType        = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-        imageViewCreateInfo.pNext        = nullptr;
+        imageViewCreateInfo.pNext        = viewUsage ? &usageInfo : nullptr;
         imageViewCreateInfo.flags        = 0;
         imageViewCreateInfo.image        = VK_NULL_HANDLE;
         imageViewCreateInfo.viewType     = viewType;

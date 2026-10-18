@@ -3,15 +3,13 @@
 #include "vkintox_internal.hh"
 #include "logger.hh"
 #include "overlay/ui_theme.hh"
-#include "overlay/ui_icons.hh"
-#include "overlay/ui_menu.hh"
 
 #include <algorithm>
+#include <cstdio>
 #include <sstream>
 #include <atomic>
 
 #include "vendor/imgui/imgui.h"
-#include "vendor/imgui/imgui_internal.h"
 
 namespace VKIntox
 {
@@ -227,7 +225,7 @@ namespace VKIntox
             {
                 logicalDevice->pinnedDepthImageView = depthPinPendingView;
                 Logger::info("depth manual pin set to view 0x" +
-                    std::to_string(reinterpret_cast<uintptr_t>(depthPinPendingView)));
+                    std::to_string((uint64_t)depthPinPendingView));
                 depthPinChanged = true;
                 // Force deferred realloc so descriptor sets + MSAA framebuffers
                 // get rebuilt for the new depth source view.
@@ -287,160 +285,34 @@ namespace VKIntox
             bool        unpin = false;
         };
 
-        // One reported buffer drawn as an expressive list row: index disc, size on
-        // the document face, format / samples / draws beneath, a status pill and a
-        // pin action on the trailing edge. Clicking the row pins it too, so the
-        // whole surface is a target.
         DepthRowAction drawDepthBufferRow(int index, const DepthCandidateInfo& c,
-                                          bool isActive, bool isPinned, float rowH, float rowGap, bool first)
+                                          bool isActive, bool isPinned)
         {
             DepthRowAction action;
-            const ImGuiM3Metrics& m = ImGuiM3GetMetrics();
-            const float d = m.density;
             ImGui::PushID(index);
-            if (!first)
-                ImGui::Dummy(ImVec2(0.0f, rowGap));
-
-            const float rowW = ImMax(ImGui::GetContentRegionAvail().x, 1.0f);
-            ImGui::PushStyleColor(ImGuiCol_Header, 0);
-            ImGui::PushStyleColor(ImGuiCol_HeaderHovered, 0);
-            ImGui::PushStyleColor(ImGuiCol_HeaderActive, 0);
-            const ImGuiSelectableFlags rowFlags = (ImGuiSelectableFlags)(
-                (int)ImGuiSelectableFlags_AllowOverlap | (int)ImGuiSelectableFlags_NoPadWithHalfSpacing);
-            const bool rowPressed = ImGui::Selectable("##depth_row", false, rowFlags, ImVec2(rowW, rowH));
-            ImGui::PopStyleColor(3);
-            const bool hovered = ImGui::IsItemHovered();
-            const ImVec2 mn = ImGui::GetItemRectMin();
-            const ImVec2 mx = ImGui::GetItemRectMax();
-            const ImRect rowRect(mn, mx);
-
-            ImDrawList* dl = ImGui::GetWindowDrawList();
-            ImFont* brand = ImGuiM3FontBold();
-            ImFont* bodyBold = ImGuiM3FontBodyBold();
-
-            const float radius = ImGuiM3Radius(ImGuiM3Shape_Medium);
-            const ImGuiM3ShapeRounding round{ radius, radius, radius, radius };
-            if (isActive)
-                ImGuiM3PathRoundedRect(dl, rowRect, round, ImGuiM3ColorU32(ImGuiM3Role_SecondaryContainer));
-            else if (isPinned)
-                ImGuiM3PathRoundedRect(dl, rowRect, round, ImGuiM3ColorU32(ImGuiM3Role_PrimaryContainer));
-            else
-            {
-                ImGuiM3PathRoundedRect(dl, rowRect, round, ImGuiM3ColorU32(ImGuiM3Role_SurfaceContainer));
-                if (hovered)
-                    ImGuiM3DrawStateLayer(dl, rowRect, round, ImGuiM3Role_OnSurface, ImGuiM3State_Hovered);
-            }
-
-            const ImU32 titleCol = isActive ? ImGuiM3ColorU32(ImGuiM3Role_OnSecondaryContainer)
-                                            : ImGuiM3ColorU32(ImGuiM3Role_OnSurface);
-            const ImU32 supportCol = isActive ? ImGuiM3ColorU32(ImGuiM3Role_OnSecondaryContainer)
-                                              : ImGuiM3ColorU32(ImGuiM3Role_OnSurfaceVariant);
-
-            // leading index disc
-            const float disc = 26.0f * d;
-            const ImVec2 discCenter(mn.x + 14.0f * d + disc * 0.5f, mn.y + rowH * 0.5f);
-            dl->AddCircleFilled(discCenter, disc * 0.5f,
-                                isActive ? ImGuiM3ColorU32(ImGuiM3Role_Primary)
-                                         : ImGuiM3ColorU32(ImGuiM3Role_SurfaceContainerHighest), 24);
-            const std::string indexText = std::to_string(index);
-            const float indexPx = 11.0f * d;
-            ImGui::PushFont(bodyBold, indexPx);
-            const ImVec2 indexSize = ImGui::CalcTextSize(indexText.c_str());
-            ImGui::PopFont();
-            dl->AddText(bodyBold, indexPx,
-                        ImVec2(discCenter.x - indexSize.x * 0.5f, discCenter.y - indexSize.y * 0.5f),
-                        isActive ? ImGuiM3ColorU32(ImGuiM3Role_OnPrimary)
-                                 : ImGuiM3ColorU32(ImGuiM3Role_OnSurfaceVariant),
-                        indexText.c_str());
-
-            const std::string sizeText = std::to_string(c.extent.width) + "x" + std::to_string(c.extent.height);
-            std::string detail = depthFormatName(c.format);
-            detail += "  \xC2\xB7  MSAA ";
-            detail += sampleName(c.samples);
-            detail += "  \xC2\xB7  ";
-            detail += std::to_string(c.drawCount) + " draws";
-            if (c.transient)
-                detail += "  \xC2\xB7  transient";
-            if (c.hasPresentableSnapshotTarget)
-                detail += "  \xC2\xB7  swapchain";
-
-            const float titlePx = 14.0f * d;
-            const float detailPx = 11.0f * d;
-            const float textX = mn.x + 14.0f * d + disc + 12.0f * d;
-            ImGui::PushFont(brand, titlePx);
-            const ImVec2 titleSize = ImGui::CalcTextSize(sizeText.c_str());
-            ImGui::PopFont();
-            ImGui::PushFont(bodyBold, detailPx);
-            const ImVec2 detailSize = ImGui::CalcTextSize(detail.c_str());
-            ImGui::PopFont();
-            const float textBlockH = titleSize.y + detailSize.y + 1.0f * d;
-            const float textY = mn.y + (rowH - textBlockH) * 0.5f;
-            dl->AddText(brand, titlePx, ImVec2(textX, textY), titleCol, sizeText.c_str());
-            dl->AddText(bodyBold, detailPx, ImVec2(textX, textY + titleSize.y + 1.0f * d), supportCol, detail.c_str());
-
-            // status chip: right beside the resolution, so the eye reads
-            // "1920x1080 PINNED" as one fact rather than scanning to the action
-            if (isActive || isPinned)
-            {
-                const char* badge = isPinned ? "PINNED" : "ACTIVE";
-                const float badgePx = 9.0f * d;
-                ImGui::PushFont(bodyBold, badgePx);
-                const ImVec2 badgeText = ImGui::CalcTextSize(badge);
-                ImGui::PopFont();
-                const float badgeH = 15.0f * d;
-                const float badgeR = badgeH * 0.5f;
-                const ImVec2 badgeMin(textX + titleSize.x + 8.0f * d,
-                                      textY + (titleSize.y - badgeH) * 0.5f);
-                const ImVec2 badgeMax(badgeMin.x + badgeText.x + 12.0f * d, badgeMin.y + badgeH);
-                ImGuiM3PathRoundedRect(dl, ImRect(badgeMin, badgeMax),
-                                       ImGuiM3ShapeRounding{ badgeR, badgeR, badgeR, badgeR },
-                                       ImGuiM3ColorU32(isPinned ? ImGuiM3Role_Primary
-                                                                : ImGuiM3Role_PrimaryContainer));
-                dl->AddText(bodyBold, badgePx,
-                            ImVec2(badgeMin.x + 6.0f * d, badgeMin.y + (badgeH - badgeText.y) * 0.5f),
-                            ImGuiM3ColorU32(isPinned ? ImGuiM3Role_OnPrimary
-                                                     : ImGuiM3Role_OnPrimaryContainer),
-                            badge);
-            }
-
-            // trailing pin action
-            const float btnH = 32.0f * d;
-            const float btnW = 70.0f * d;
-            const float btnY = mn.y + (rowH - btnH) * 0.5f;
-            const float rightX = mx.x - 10.0f * d;
-
-            ImGui::SetCursorScreenPos(ImVec2(rightX - btnW, btnY));
-            if (ImGui::M3Button(isPinned ? "Unpin" : "Pin",
-                                isPinned ? ImGuiM3Button_Text : ImGuiM3Button_Tonal,
-                                ImVec2(btnW, btnH)))
+            char label[128];
+            snprintf(label, sizeof(label), "%d: %ux%u%s%s", index, c.extent.width, c.extent.height,
+                     isActive ? " [active]" : "", isPinned ? " [pinned]" : "");
+            if (ImGui::Selectable(label, isPinned))
             {
                 if (isPinned)
                     action.unpin = true;
                 else
                     action.pin = c.imageView;
             }
-            ImGui::SetCursorScreenPos(ImVec2(mn.x, mx.y));
-            ImGui::Dummy(ImVec2(0.0f, 0.0f));
-
-            if (rowPressed)
-            {
-                if (isPinned)
-                    action.unpin = true;
-                else
-                    action.pin = c.imageView;
-            }
-
-            if (hovered)
+            if (ImGui::IsItemHovered())
             {
                 ImGui::BeginTooltip();
-                ImGui::Text("View:      0x%llx", reinterpret_cast<unsigned long long>(c.imageView));
-                ImGui::Text("Layout:    %s", layoutName(c.observedLayout));
-                ImGui::Text("Draws:     %u", c.drawCount);
-                ImGui::Text("Transient: %s", c.transient ? "yes" : "no");
-                ImGui::TextColored(UI::Success(), "Click a row to pin it.");
+                ImGui::Text("View: 0x%llx", reinterpret_cast<unsigned long long>(c.imageView));
+                ImGui::Text("Layout: %s", layoutName(c.observedLayout));
+                ImGui::TextUnformatted("Click to pin or unpin this buffer.");
                 ImGui::EndTooltip();
             }
-
+            ImGui::TextDisabled("%s | MSAA %s | %u draws%s%s", depthFormatName(c.format),
+                                sampleName(c.samples), c.drawCount,
+                                c.transient ? " | transient" : "",
+                                c.hasPresentableSnapshotTarget ? " | swapchain" : "");
+            ImGui::Separator();
             ImGui::PopID();
             return action;
         }
@@ -448,20 +320,12 @@ namespace VKIntox
 
     void ImGuiOverlay::renderAdvancedView()
     {
-        const ImGuiM3Metrics& m = ImGuiM3GetMetrics();
-        const float d = m.density;
-
-        // --- Hero: the icon+label pairing, master capture switch on the row ---
-        //
-        // the switch only records intent: the hooks arm at device creation, so a
-        // live flip would re-arm them mid-frame. the boot value is captured on the
-        // first draw, and anything else is waiting on a restart.
+        const float d = ImGui::GetFontSize() / 16.0f;
+        ImGui::SeparatorText("Depth buffer");
+        // Capture hooks are armed at startup, so this setting requires a restart.
         static const bool s_depthCaptureAtStartup = settingsManager.getDepthCapture();
         bool depthCapture = settingsManager.getDepthCapture();
-        if (ImGui::M3HeroSwitch(Icon::LayersUtf8, "Depth buffer", "##depth_capture", &depthCapture,
-                                "Capture the depth buffer for depth-based effects.\n"
-                                "Saved now, applied on the next launch: detection arms at startup.",
-                                1.15f))
+        if (ImGui::Checkbox("Capture depth buffer (requires restart)", &depthCapture))
         {
             settingsManager.setDepthCapture(depthCapture);
             markSettingsDirty();
@@ -471,29 +335,10 @@ namespace VKIntox
                 ? "Depth buffer capture on. Restart to apply."
                 : "Depth buffer capture off. Restart to apply.");
         }
-        // status describer: smaller, dimmed, body bold, tucked under the label
-        {
-            UI::PushSupport();
-            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 72.0f * d);
-            ImGui::TextDisabled("%s", describeActiveDepth(depthInfo).c_str());
-            UI::PopSupport();
-        }
+        ImGui::TextDisabled("%s", describeActiveDepth(depthInfo).c_str());
         if (depthCapture != s_depthCaptureAtStartup)
         {
-            // under the switch it belongs to
-            const float notePx = ImGuiM3GetTypeStyle(ImGuiM3Type_BodySmall).size * d;
-            ImFont* noteFont = ImGuiM3FontBodyBold();
-            ImGui::PushFont(noteFont, notePx);
-            const ImVec2 noteSize = ImGui::CalcTextSize("Requires restart");
-            ImGui::PopFont();
-            const float noteX = ImGui::GetWindowWidth() - noteSize.x -
-                                ImGui::GetCurrentWindowRead()->WindowPadding.x;
-            ImGui::SetCursorPosX(noteX);
-            ImGui::BeginDisabled();
-            ImGui::PushFont(noteFont, notePx);
-            ImGui::TextUnformatted("Requires restart");
-            ImGui::PopFont();
-            ImGui::EndDisabled();
+            ImGui::TextDisabled("Requires restart");
         }
 
         ImGui::Spacing();
@@ -505,8 +350,7 @@ namespace VKIntox
                 "Manual pin starts from the buffer matching the window size; pick another from the list."
             };
             int mode = depthInfo.depthIsPinned ? 1 : 0;
-            int hovered_segment = -1;
-            if (ImGui::M3ConnectedButtonGroup("##depth_mode", modes, 2, &mode, NULL, false, &hovered_segment))
+            if (ImGui::Combo("Selection mode", &mode, modes, 2))
             {
                 if (mode == 0)
                 {
@@ -524,15 +368,14 @@ namespace VKIntox
                     Logger::info("manual pin requested but no depth buffers are tracked yet");
                 }
             }
-            if (hovered_segment >= 0)
-                ImGui::SetTooltip("%s", hints[hovered_segment]);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", hints[mode]);
         }
 
         ImGui::Spacing();
         // --- Reported buffers live on their own page, pushed from here ---
         {
-            const std::string trailing = std::to_string(depthInfo.candidates.size());
-            if (UI::SubViewRow("Reported depth buffers", trailing.c_str(), Icon::GridViewUtf8))
+            if (ImGui::Button("Reported depth buffers"))
                 openSubView = SubView_DepthBuffers;
         }
 
@@ -550,20 +393,19 @@ namespace VKIntox
             };
             ImGui::AlignTextToFramePadding();
             ImGui::TextUnformatted("Encoding");
-            ImGui::SameLine(150.0f);
-            ImGui::SetNextItemWidth(-FLT_MIN);
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(240.0f * d);
             ImGui::PushID("##depth_encoding");
             int current = settingsManager.getDepthSourceChannel();
             int index = (current == kChannels[1]) ? 1 : 0;
-            int hovered_segment = -1;
-            if (ImGui::M3ConnectedButtonGroup("##depth_channel", labels, 2, &index, NULL, false, &hovered_segment))
+            if (ImGui::Combo("##depth_channel", &index, labels, 2))
             {
                 settingsManager.setDepthSourceChannel(kChannels[index]);
                 depthTransformPending = true;
                 markSettingsDirty();
             }
-            if (hovered_segment >= 0)
-                ImGui::SetTooltip("%s", hints[hovered_segment]);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", hints[index]);
             ImGui::PopID();
         }
 
@@ -618,25 +460,23 @@ namespace VKIntox
             };
             ImGui::AlignTextToFramePadding();
             ImGui::TextUnformatted("Rebuild");
-            ImGui::SameLine(150.0f);
-            ImGui::SetNextItemWidth(-FLT_MIN);
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(240.0f * d);
             ImGui::PushID("##depth_rebuild");
             int index = (settingsManager.getDepthRebuildMode() == 0) ? 0 : 1;
-            int hovered_segment = -1;
-            if (ImGui::M3ConnectedButtonGroup("##depth_rebuild_mode", labels, 2, &index, NULL, false, &hovered_segment))
+            if (ImGui::Combo("##depth_rebuild_mode", &index, labels, 2))
             {
                 settingsManager.setDepthRebuildMode(index);
                 markSettingsDirty();
             }
-            if (hovered_segment >= 0)
-                ImGui::SetTooltip("%s", hints[hovered_segment]);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", hints[index]);
             ImGui::PopID();
         }
 
         // --- Footer ---
         ImGui::Spacing();
-        const std::string redetectLabel = std::string(Icon::RefreshUtf8) + "  Refresh depth buffers";
-        if (ImGui::M3Button(redetectLabel.c_str(), ImGuiM3Button_Tonal))
+        if (ImGui::Button("Refresh depth buffers"))
         {
             std::lock_guard<std::mutex> l(globalLock);
             logicalDevice->activeDepthState    = DepthState{};
@@ -655,17 +495,15 @@ namespace VKIntox
     // --- Pushed page: every tracked depth buffer -------------------------------
     void ImGuiOverlay::renderDepthBuffersView()
     {
-        const ImGuiM3Metrics& m = ImGuiM3GetMetrics();
-        const float d = m.density;
-
-        if (UI::BreadcrumbBar("Go back", Icon::ChevronLeftUtf8))
+        if (ImGui::Button("Back to settings"))
         {
             openSubView = SubView_None;
             return;
         }
 
         ImGui::Spacing();
-        ImGui::M3HeroHeader(Icon::LayersUtf8, "Reported depth buffers", describeActiveDepth(depthInfo).c_str());
+        ImGui::SeparatorText("Reported depth buffers");
+        ImGui::TextDisabled("%s", describeActiveDepth(depthInfo).c_str());
         ImGui::Spacing();
 
         // mode control, so the page stands on its own
@@ -676,8 +514,7 @@ namespace VKIntox
                 "Manual pin starts from the buffer matching the window size; pick another from the list."
             };
             int mode = depthInfo.depthIsPinned ? 1 : 0;
-            int hovered_segment = -1;
-            if (ImGui::M3ConnectedButtonGroup("##depth_page_mode", modes, 2, &mode, NULL, false, &hovered_segment))
+            if (ImGui::Combo("Selection mode", &mode, modes, 2))
             {
                 if (mode == 0)
                 {
@@ -689,8 +526,8 @@ namespace VKIntox
                     depthPinPendingView = defaultPinCandidateForSwapchain(depthInfo);
                 }
             }
-            if (hovered_segment >= 0)
-                ImGui::SetTooltip("%s", hints[hovered_segment]);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", hints[mode]);
         }
 
         ImGui::Spacing();
@@ -701,16 +538,13 @@ namespace VKIntox
             return;
         }
 
-        const float rowH = 52.0f * d;
-        const float rowGap = 6.0f * d;
         ImGui::BeginChild("##depth_page_list", ImVec2(0, 0), false);
         for (size_t i = 0; i < depthInfo.candidates.size(); ++i)
         {
             const DepthCandidateInfo& c = depthInfo.candidates[i];
             const bool isActive = (c.imageView == depthInfo.active.imageView);
             const bool isPinned = depthInfo.depthIsPinned && (c.imageView == depthInfo.pinnedView);
-            const DepthRowAction action = drawDepthBufferRow(static_cast<int>(i), c, isActive, isPinned,
-                                                             rowH, rowGap, i == 0);
+            const DepthRowAction action = drawDepthBufferRow(static_cast<int>(i), c, isActive, isPinned);
             if (action.pin != VK_NULL_HANDLE)
                 depthPinPendingView = action.pin;
             else if (action.unpin)

@@ -16,10 +16,13 @@ namespace VKIntox
 
     void writeCommandBuffers(LogicalDevice*                                 logicalDevice,
                              LogicalSwapchain*                              logicalSwapchain,
-                             std::vector<std::shared_ptr<VKIntox::Effect>> effects,
-                             std::vector<VkCommandBuffer>                   commandBuffers,
-                             const DepthState&                              depthState);
+                             const std::vector<std::shared_ptr<VKIntox::Effect>>& effects,
+                             const std::vector<VkCommandBuffer>&             commandBuffers,
+                             const DepthState&                              depthState,
+                             uint32_t                                       imageIndex = UINT32_MAX);
 
+    // Caller holds globalLock. Only record outside application render scopes;
+    // layer-owned command buffers have no tracked application scope.
     void recordDepthResolveSnapshot(LogicalDevice*            logicalDevice,
                                     LogicalSwapchain*         logicalSwapchain,
                                     VkCommandBuffer           commandBuffer,

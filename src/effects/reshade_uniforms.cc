@@ -126,10 +126,16 @@ namespace VKIntox
         }
         offset = uniformInfo.offset;
         size   = uniformInfo.size;
+        floatingPoint = uniformInfo.type.is_floating_point();
     }
     void FrameCountUniform::update(void* mapedBuffer)
     {
-        std::memcpy((uint8_t*) mapedBuffer + offset, &(count), sizeof(int32_t));
+        if (floatingPoint) {
+            const float value = static_cast<float>(count);
+            std::memcpy(static_cast<uint8_t*>(mapedBuffer) + offset, &value, sizeof(value));
+        } else {
+            std::memcpy(static_cast<uint8_t*>(mapedBuffer) + offset, &count, sizeof(count));
+        }
         count++;
     }
     FrameCountUniform::~FrameCountUniform()

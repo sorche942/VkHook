@@ -24,6 +24,10 @@ namespace VKIntox
         void virtual useDepthImage(uint32_t /* imageIndex */,
                                    VkImageView /* depthImageView */,
                                    VkImageLayout /* depthImageLayout */ = VK_IMAGE_LAYOUT_UNDEFINED){};
+        virtual void useNativeMaterial(uint32_t /* imageIndex */,
+                                       VkImageView /* imageView */,
+                                       VkImageLayout /* imageLayout */,
+                                       bool /* valid */) {}
         virtual std::vector<std::unique_ptr<EffectParam>> getParameters() const { return {}; }
         virtual ~Effect() = default;
 

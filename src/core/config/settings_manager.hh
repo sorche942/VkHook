@@ -4,6 +4,7 @@
 #include <string>
 #include <algorithm>
 #include <mutex>
+#include <cmath>
 
 #include "config_serializer.hh"
 #include "default_config.hh"
@@ -66,16 +67,10 @@ namespace VKIntox
             std::lock_guard<std::mutex> lock(mutex);
             return settings.usePortalIntegration;
         }
-        // 0 = top, 1 = bottom, matching the order the settings page shows them in
-        int getNavPosition() const
+        float getUiScale() const
         {
             std::lock_guard<std::mutex> lock(mutex);
-            return std::clamp(settings.navPosition, 0, 1);
-        }
-        int getNavStyle() const
-        {
-            std::lock_guard<std::mutex> lock(mutex);
-            return std::clamp(settings.navStyle, 0, 1);
+            return settings.uiScale;
         }
         bool getEnableOnLaunch() const
         {
@@ -184,15 +179,10 @@ namespace VKIntox
             std::lock_guard<std::mutex> lock(mutex);
             settings.usePortalIntegration = value;
         }
-        void setNavPosition(int value)
+        void setUiScale(float value)
         {
             std::lock_guard<std::mutex> lock(mutex);
-            settings.navPosition = std::clamp(value, 0, 1);
-        }
-        void setNavStyle(int value)
-        {
-            std::lock_guard<std::mutex> lock(mutex);
-            settings.navStyle = std::clamp(value, 0, 1);
+            settings.uiScale = std::isfinite(value) && value > 0.0f ? std::clamp(value, 0.75f, 3.0f) : 0.0f;
         }
         void setEnableOnLaunch(bool value)
         {

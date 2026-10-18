@@ -53,29 +53,27 @@ namespace VKIntox
             && wantsKeyboard.load(std::memory_order_acquire);
     }
 
-    // X11: the pointer grab follows the cursor, the keyboard grab follows the
-    // overlay actually consuming keys. Both make the server emit
-    // NotifyGrab/NotifyUngrab focus events on the game window, and Wine reads
-    // those as a window-manager grab and drops the game's cursor capture, so a
-    // mere pointer crossing must never engage the keyboard grab. The grab
-    // helpers hand held keys and buttons across each transition.
+    // An interactive menu owns the entire input session, not just its hitboxes.
+    // Taking the keyboard first asks Wine to relinquish its pointer grab; the
+    // pointer acquisition can then retry until that asynchronous handoff lands.
     static void applyX11Blocking()
     {
         const bool enabled = blockingEnabled.load(std::memory_order_acquire);
-        const bool pointerGrab = enabled && pointerOverOverlay();
-        const bool keyboardGrab = enabled && overlayConsumingKeys();
+        const bool menu = blocked.load(std::memory_order_acquire)
+                       && interactive.load(std::memory_order_acquire);
+        const bool pointerGrab = enabled && (menu || pointerOverOverlay());
+        const bool keyboardGrab = enabled && menu;
 
-        x11SetGrabState(pointerGrab);
-        x11SetKeyboardGrabState(keyboardGrab);
+        x11SetGrabStates(pointerGrab, keyboardGrab);
     }
 
-    // Wayland withholds on the game's own event stream, which costs it nothing
-    // (no grabs, no focus churn), so there the keyboard is withheld for the
-    // pointer crossing as well as while the overlay consumes keys.
+    // Wayland withholds the game's own event stream without a server-side grab.
+    // Menu ownership lasts until close; notification-only keys follow hitboxes.
     static void applyWaylandBlocking()
     {
         const bool enabled = blockingEnabled.load(std::memory_order_acquire);
-        const bool withhold = enabled && (pointerOverOverlay() || overlayConsumingKeys());
+        const bool withhold = enabled && blocked.load(std::memory_order_acquire)
+            && (interactive.load(std::memory_order_acquire) || pointerOverOverlay() || overlayConsumingKeys());
 
         if (withhold != keyboardWithheld)
         {
@@ -123,7 +121,9 @@ namespace VKIntox
 
     bool isInputBlockedAt(float x, float y)
     {
-        return blocked.load(std::memory_order_acquire) && pointInRects(x, y);
+        return blockingEnabled.load(std::memory_order_acquire)
+            && blocked.load(std::memory_order_acquire)
+            && (interactive.load(std::memory_order_acquire) || pointInRects(x, y));
     }
 
     bool isInputBlocked()
@@ -169,13 +169,13 @@ namespace VKIntox
 
         if (isX11())
         {
-            Logger::debug(std::string("Input blocking ") + (enabled ? "enabled (X11: hitbox grab)" : "disabled"));
+            Logger::debug(std::string("Input blocking ") + (enabled ? "enabled (X11: menu ownership)" : "disabled"));
             return;
         }
 
         if (isWayland())
         {
-            Logger::debug(std::string("Input blocking ") + (enabled ? "enabled (Wayland: hitbox)" : "disabled"));
+            Logger::debug(std::string("Input blocking ") + (enabled ? "enabled (Wayland: menu ownership)" : "disabled"));
             return;
         }
 

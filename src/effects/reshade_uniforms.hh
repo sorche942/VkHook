@@ -48,7 +48,8 @@ namespace VKIntox
         virtual ~FrameCountUniform();
 
     private:
-        int32_t count = 0;
+        uint32_t count = 0;
+        bool floatingPoint = false;
     };
 
     class DateUniform : public ReshadeUniform
