@@ -1,0 +1,65 @@
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+// Feature arithmetic and noise sequence from OpenDLSS-NR (MIT).
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(std430, binding = 0) readonly buffer Source { uint pixels[]; };
+layout(std430, binding = 1) readonly buffer Parameters {
+    uint width, height, fullWidth, fullHeight;
+    uint bgra, seed;
+    float intensity, localTone, localStructure, skinStructure;
+} p;
+layout(std430, binding = 7) writeonly buffer Features { float features[]; };
+float hashUniform(uint value) {
+    uint mixed = value;
+    mixed = (mixed >> ((mixed >> 28u) + 4u)) ^ mixed;
+    mixed *= 0x108ef2d9u;
+    uint integer = ((mixed >> 30u) ^ (mixed >> 8u)) + 1u;
+    return float(integer) * uintBitsToFloat(0x33800000u);
+}
+vec3 gaussian3(uint x, uint y, uint seed) {
+    uint base = (x * 0x8da6b343u) ^ (seed * 0x9e3779b9u) ^ (y * 0xd8163841u) ^ 0x243f6a88u;
+    base = (base >> ((base >> 28u) + 4u)) ^ base;
+    base *= 0x108ef2d9u;
+    base = (base >> 22u) ^ base;
+    float u0 = hashUniform(base * 0x2c9277b5u + 0xac564b05u);
+    float u1 = hashUniform(base * 0xfa6dc5f9u + 0x4712a88eu);
+    float u2 = hashUniform(base * 0xcaa5b80du + 0x21dd796bu);
+    float u3 = hashUniform(base * 0x83232c31u + 0x3463e0acu);
+    float radius0 = sqrt(log2(u0) * uintBitsToFloat(0x3f317218u) * -2.0);
+    float radius1 = sqrt(log2(u2) * uintBitsToFloat(0x3f317218u) * -2.0);
+    float angle0 = u1 * uintBitsToFloat(0x40c90fdbu);
+    float angle1 = u3 * uintBitsToFloat(0x40c90fdbu);
+    return vec3(roundF16(radius0 * cos(angle0)), roundF16(radius0 * sin(angle0)), roundF16(radius1 * cos(angle1)));
+}
+uint mirror(uint x, uint size) {
+    if (size == 1u) return 0u;
+    uint period = 2u * (size - 1u);
+    uint t = x % period;
+    return t < size ? t : period - t;
+}
+void main() {
+    uvec2 id = gl_GlobalInvocationID.xy;
+    if (id.x >= p.fullWidth || id.y >= p.fullHeight) return;
+    vec4 rgba = unpackUnorm4x8(pixels[mirror(id.y, p.height) * p.width + mirror(id.x, p.width)]);
+    if (p.bgra != 0u) rgba = rgba.bgra;
+    vec3 centred;
+    for (uint c = 0u; c < 3u; ++c)
+        centred[c] = roundF16(roundF16(roundF16(rgba[c]) - 0.5) * 0.125);
+    vec3 noise = gaussian3(id.x, id.y, p.seed);
+    uint base = (id.y * p.fullWidth + id.x) * 16u;
+    for (uint c = 0u; c < 3u; ++c) {
+        features[base + c] = noise[c];
+        features[base + 4u + c] = centred[c];
+        // No engine motion vectors: first-frame input, never fabricated history.
+        features[base + 7u + c] = centred[c];
+    }
+    features[base + 3u] = 1.0;
+    features[base + 10u] = 0.0;
+    features[base + 11u] = roundF16(p.localTone);
+    features[base + 12u] = 1.0;
+    features[base + 13u] = roundF16(p.skinStructure < 0.0 ? p.localStructure : p.skinStructure);
+    features[base + 14u] = roundF16(p.localStructure);
+    features[base + 15u] = 0.0;
+}

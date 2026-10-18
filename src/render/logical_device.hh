@@ -87,6 +87,10 @@ namespace VKIntox
         // instead of making the driver recompile them on every chain reload.
         VkPipelineCache          pipelineCache = VK_NULL_HANDLE;
         std::shared_ptr<NativeCapture> nativeCapture;
+        PFN_vkGetInstanceProcAddr downstreamGIPA = nullptr;
+        PFN_vkGetDeviceProcAddr downstreamGDPA = nullptr;
+        bool dlss5Supported = false;
+        std::string dlss5UnavailableReason;
         bool                     supportsMutableFormat;
         bool                     isNvidiaGpu;
         // Real identity of the device the game is actually running on. The

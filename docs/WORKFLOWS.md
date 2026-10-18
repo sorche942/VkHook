@@ -94,6 +94,114 @@ the documentation updates. The old submodule object stores remain in `.git/modul
 for recovery, but their active local configuration and `.gitmodules` were removed.
 
 
+## DLSS5 neural rendering
+
+`DLSS5` is a native effect, not a ReShade `.fx` shader. VKIntox vendors the
+OpenDLSS-NR Vulkan/PTX implementation in `src/vendor/opendlss_nr`, including its
+license and provenance notice. It borrows the application's device through
+per-device downstream dispatch; it does not create a second Vulkan device.
+
+### Requirements and build
+
+- NVIDIA hardware/driver exposing `VK_NV_cuda_kernel_launch`,
+  `VK_KHR_cooperative_matrix`, `VK_NV_cooperative_matrix2`,
+  `VK_EXT_shader_float8`, `VK_KHR_shader_clock`, `VK_NV_shader_sm_builtins`,
+  and `VK_KHR_pipeline_executable_properties`, with the required feature bits.
+  Vulkan 1.3 and a graphics queue supporting compute are required.
+- Build with Vulkan headers containing `VkPhysicalDeviceShaderFloat8FeaturesEXT`,
+  a matching `vk.xml`, and glslangValidator 16.6 or newer.
+- Meson's `-Ddlss5=auto` enables the backend when the build prerequisites exist.
+  Use `-Ddlss5=enabled` to require it, or `-Ddlss5=disabled` for other builds.
+  Override the registry with `-Ddlss5_vulkan_registry=/path/to/vk.xml`.
+- Both native and i686 builds compile the backend. The regular Meson install
+  includes SPIR-V/PTX assets under `share/vkintox/dlss5`; `install-local.sh`
+  stages them beside each architecture's library instead.
+  NVIDIA driver 615.78.08 exposes CUDA kernel launch to x86-64 applications but
+  not i686 applications on this workstation: i686 inference is unavailable.
+  The i686 layer reports the missing extension and keeps rendering without
+  DLSS5; that fallback was exercised through clean shutdown.
+
+### Extract the model
+
+Weights are proprietary, are not bundled, and are never downloaded by VKIntox.
+Supply your own `nvngx_dlssnr_2026_10_16.zip` or its DLL:
+
+```bash
+python3 scripts/extract-dlss5-weights.py \
+  /path/to/nvngx_dlssnr_2026_10_16.zip \
+  "${XDG_CONFIG_HOME:-$HOME/.config}/VKIntox/models/dlss5"
+```
+
+The output directory must not exist. The extractor validates the known DLL
+310.9.16.0 and `WEIGHTS_HT` resource hashes, checks every tensor's shape and
+storage, then publishes `manifest.json` and 11 stage files atomically. It extracts
+153 tensors / 71 blocks / 147,683,778 packed bytes; the smaller `CC_SMALL` resource
+is not this graph. The runtime verifies each stage's hash before uploading.
+Other DLL versions are rejected rather than guessed.
+
+### Enable
+
+Select **DLSS5** in Add Effects, or add it to the active config:
+
+```ini
+enableOnLaunch = true
+depthCapture = on
+effects = DLSS5
+DLSS5 = DLSS5
+DLSS5.intensity = 1
+DLSS5.localTone = 1
+DLSS5.localStructure = 1
+DLSS5.skinStructure = -1
+```
+
+The existing parameter UI exposes these controls. Intensity ranges from 0
+(byte-exact passthrough) to 1; local tone and structure range from 0 to 1, and
+skin structure from -1 to 1. Parameters update without rebuilding the network.
+Keep the normal `depthCapture = on` setting: the layer's existing depth-transition
+submission gate is also used for native effects.
+
+The default model directory is shown in the extraction command. Override it
+with `dlss5ModelPath` in the active config or `VKINTOX_DLSS5_MODEL`.
+Uninstalled builds also need the compiled asset directories:
+
+```bash
+VKINTOX_DLSS5_MODEL="$PWD/build-gcc/dlss5-model" \
+VKINTOX_DLSS5_SHADER_DIR="$PWD/build-gcc/src/vendor/opendlss_nr" \
+VKINTOX_DLSS5_PTX_DIR="$PWD/build-gcc/src/vendor/opendlss_nr" \
+ENABLE_VKINTOX=1 your-application
+```
+
+Equivalent config keys are `dlss5ShaderPath` and `dlss5PtxPath`; explicit config
+values override environment defaults. Installed builds discover adjacent assets first,
+then their configured installation paths. Restart the application after changing
+model or kernel paths. Missing assets or unsupported hardware/formats produce
+an effect error and preserve the ordinary transfer path.
+
+### Scope and verification
+
+This is **same-resolution neural rendering**, not super-resolution or frame
+generation. Only RGBA8/BGRA8 UNORM/SRGB swapchains in the SRGB_NONLINEAR color
+space are accepted; HDR is rejected. Alpha is preserved.
+
+VKIntox has no engine motion-vector/reprojection inputs. The input bridge
+therefore uses OpenDLSS-NR's no-history contract: current-frame centered color
+in both current and history lanes, deterministic noise, and the model's
+automatic mask. It does not pretend zero motion vectors are temporal history.
+HUD and text are processed as part of the final image; visual quality and
+temporal stability are not guaranteed.
+
+The supplied model is newer than OpenDLSS-NR's documented 310.8.0 model.
+Its tensor shapes match, but numerical/visual parity with NVIDIA's DLL has
+not been established. On an RTX 5070 Ti, the real 71-block PTX graph produced
+finite output in an X11 `vkcube` run. GPU compositing matched an independent
+CPU reconstruction exactly; alpha was unchanged, and intensity zero preserved
+all 307,200 pixels byte-for-byte at 640×480.
+
+The conditional Meson test `DLSS5 device feature preservation` covers application
+feature preservation, promoted feature merging, duplicate loader nodes, input
+chain immutability, and unsupported-device rejection. GPU inference requires
+the hardware above and locally extracted weights; lavapipe CI cannot prove it.
+
 ## user-local native installation
 
 Install existing 64-bit and 32-bit builds without root or changes to `/usr`:

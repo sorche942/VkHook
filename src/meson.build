@@ -21,6 +21,40 @@ glsl_generator = generator(glsl_compiler,
     arguments: ['-V', '-x', '@INPUT@', '-o', '@OUTPUT@'])
 shader_include = glsl_generator.process(glsl_shader_src)
 
+dlss5_assets = []
+dlss5_sources = []
+dlss5_dependencies = []
+dlss5_args = []
+dlss5_fs = import('fs')
+dlss5_requested = get_option('dlss5')
+dlss5_available = false
+if not dlss5_requested.disabled()
+    dlss5_headers = cpp.has_type('VkPhysicalDeviceShaderFloat8FeaturesEXT',
+        prefix : '#include <vulkan/vulkan.h>')
+    dlss5_compiler_version = run_command(glsl_compiler, '--version', check : true).stdout()
+    dlss5_glslang = dlss5_compiler_version.split('\n')[0].split(':')[-1].strip().version_compare('>=16.6.0')
+    dlss5_available = dlss5_headers and dlss5_glslang and dlss5_fs.exists(get_option('dlss5_vulkan_registry'))
+    if dlss5_requested.enabled() and not dlss5_available
+        error('DLSS5 needs float8 Vulkan headers, their vk.xml registry, and glslang >= 16.6')
+    endif
+endif
+if dlss5_available
+    subdir('vendor/opendlss_nr')
+    dlss5_paths = configuration_data()
+    dlss5_paths.set_quoted('DLSS5_SHADER_DIR', opendlss_nr_install_shader_dir)
+    dlss5_paths.set_quoted('DLSS5_PTX_DIR', opendlss_nr_install_ptx_dir)
+    configure_file(output : 'dlss5_paths.hh', configuration : dlss5_paths)
+    dlss5_chain = custom_target('dlss5 device feature chain',
+        input : get_option('dlss5_vulkan_registry'),
+        output : 'dlss5_device_chain.inc',
+        command : [opendlss_nr_python, files('../scripts/generate-dlss5-device-chain.py'), '@INPUT@', '@OUTPUT@'])
+    dlss5_sources += [files('effects/effect_dlss5.cc', 'render/dlss5_device.cc'), dlss5_chain]
+    dlss5_dependencies += opendlss_nr_dep
+    dlss5_args += '-DVKINTOX_DLSS5=1'
+    dlss5_assets += opendlss_nr_assets
+endif
+summary('DLSS5 PTX backend', dlss5_available)
+
 imgui_src = [
     'vendor/imgui/imgui.cc',
     'vendor/imgui/imgui_draw.cc',
@@ -207,15 +241,16 @@ shader_asset_inc = include_directories('effects/shaders')
 # present on the desktop and inside Flatpak runtimes. Optional: without it the
 # shader manager falls back to the in-overlay file browser.
 gio_dep = dependency('gio-2.0', required: false)
-vkintox_deps = [x11_dep, xi_dep, xtst_dep, wayland_client_dep, xkbcommon_dep, reshade_dep]
-vkintox_cpp_args = ['-DIMGUI_IMPL_VULKAN_NO_PROTOTYPES']
+vkintox_deps = [x11_dep, xi_dep, xtst_dep, wayland_client_dep, xkbcommon_dep, reshade_dep] + dlss5_dependencies
+vkintox_cpp_args = ['-DIMGUI_IMPL_VULKAN_NO_PROTOTYPES'] + dlss5_args
 if gio_dep.found()
     vkintox_deps += gio_dep
     vkintox_cpp_args += '-DVKINTOX_HAVE_GIO=1'
 endif
 
 vkintox_lib = shared_library('vkintox',
-    VKIntox_src, overlay_src, imgui_src, shader_include,
+    VKIntox_src, overlay_src, imgui_src, shader_include, dlss5_sources,
+    link_depends : dlss5_assets,
     link_with: [keyboard_input_x11_lib, mouse_input_lib, input_blocker_lib,
                 x11_display_lib, mouse_input_x11_lib,
                 wayland_input_common_lib, keyboard_input_wayland_lib, mouse_input_wayland_lib,
@@ -304,6 +339,16 @@ depth_copy_state_tests = executable('vkintox-depth-copy-state-tests',
     dependencies : [threads_dep],
     include_directories : [render_inc, source_inc])
 test('depth copy state', depth_copy_state_tests)
+
+if dlss5_available
+    dlss5_device_tests = executable('vkintox-dlss5-device-tests',
+        'tests/dlss5_device_test.cc',
+        'render/dlss5_device.cc',
+        dlss5_chain,
+        dependencies : [opendlss_nr_dep],
+        include_directories : [core_inc, render_inc, source_inc])
+    test('DLSS5 device feature preservation', dlss5_device_tests)
+endif
 
 # Link the production recorder and fake only Vulkan dispatch. Section GC keeps
 # unrelated command-buffer allocation/effect code out of the headless executable.

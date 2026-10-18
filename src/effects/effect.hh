@@ -18,6 +18,8 @@ namespace VKIntox
     public:
         void virtual applyEffect(uint32_t imageIndex, VkCommandBuffer commandBuffer) = 0;
         void virtual updateEffect(){};
+        // Called only after this swapchain image's previous submission completed.
+        virtual void updateFrame(uint32_t /* imageIndex */) { updateEffect(); }
         // Parameter names are omitted on the unused default hooks: subclasses that
         // do consume depth override these, and leaving the names off keeps the
         // base declaration free of unused-parameter noise.

@@ -89,6 +89,7 @@ enable per-session with `ENABLE_VKINTOX=1 your_game_command`.
 **effects**
 
 -   **reshade fx compat:** runtime compilation of `.fx` shaders to spir-v, cached per shader and extent.
+-   **DLSS5 neural rendering:** optional native OpenDLSS-NR PTX backend with adjustable intensity and structure/tone controls. Requires a compatible NVIDIA GPU, recent driver, and locally extracted model weights. Same-resolution SDR processing, without temporal reprojection; [setup and limitations](WORKFLOWS.md#dlss5-neural-rendering).
 -   **depth resolve:** auto-detects or manually selects the correct depth buffer to fix z-fighting in ao and dof. depth capture is on by default, so depth effects work on a game's first launch without a restart, and per-game defaults seed themselves; sober starts with inverted depth, everything else does not.
 -   **effect list:** native checkboxes, drag/drop ordering, and either inline parameters or a separate tabbed parameter section.
 -   **add effects:** a searchable table with a package selector, queued additions/removals, and per-effect duplicate controls that respect the max-effects limit.

@@ -1,0 +1,36 @@
+#version 460
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(std430, binding = 0) readonly buffer Source { uint pixels[]; };
+layout(std430, binding = 1) readonly buffer Parameters {
+    uint width, height, fullWidth, fullHeight;
+    uint bgra, seed;
+    float intensity, localTone, localStructure, skinStructure;
+} p;
+layout(std430, binding = 2) readonly buffer Head { vec4 head[]; };
+layout(std430, binding = 3) readonly buffer Features { float features[]; };
+layout(std430, binding = 7) writeonly buffer Output { uint result[]; };
+float truncateHalf(float v) {
+    uint bits = packHalf2x16(vec2(v, 0.0)) & 0xffffu;
+    if (unpackHalf2x16(bits).x > v) --bits;
+    return unpackHalf2x16(bits).x;
+}
+void main() {
+    uvec2 id = gl_GlobalInvocationID.xy;
+    if (id.x >= p.width || id.y >= p.height) return;
+    uint pixel = id.y * p.width + id.x;
+    uint packed = pixels[pixel];
+    if (p.intensity == 0.0) { result[pixel] = packed; return; }
+    uint padded = id.y * p.fullWidth + id.x;
+    vec4 proxy = unpackUnorm4x8(packed);
+    if (p.bgra != 0u) proxy = proxy.bgra;
+    vec3 neural;
+    for (uint c = 0u; c < 3u; ++c) {
+        // OpenDLSS no-history publication: fma(head/32, centred)*8+0.5,
+        // clamped and truncated (not rounded) onto the half grid.
+        float inner = fma(head[padded][c], 0.03125, features[padded * 16u + 4u + c]);
+        neural[c] = truncateHalf(clamp(inner * 8.0 + 0.5, 0.0, 1.0));
+    }
+    vec4 outputColor = vec4(mix(proxy.rgb, neural, p.intensity), proxy.a);
+    if (p.bgra != 0u) outputColor = outputColor.bgra;
+    result[pixel] = (packUnorm4x8(outputColor) & 0x00ffffffu) | (packed & 0xff000000u);
+}

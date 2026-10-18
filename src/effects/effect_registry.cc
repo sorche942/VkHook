@@ -9,6 +9,7 @@
 #include "reshade_parser.hh"
 #include "config_serializer.hh"
 #include "logger.hh"
+#include "dlss5_config.hh"
 
 namespace VKIntox
 {
@@ -115,6 +116,8 @@ namespace VKIntox
         // Try to find effect file path
         std::string findEffectPath(const std::string& name, Config* config)
         {
+            if (isDlss5Effect(name, config))
+                return "DLSS5";
             // If caller already provides a path (absolute or relative), use it directly.
             std::string directPath = tryResolveDirectEffectPath(name);
             if (!directPath.empty())
@@ -228,7 +231,13 @@ namespace VKIntox
                     Logger::err("EffectRegistry: could not find effect file for: " + name);
                 continue;
             }
-            initReshadeEffect(name, effectPath);
+            if (isDlss5Effect(name, config))
+            {
+                effects.push_back(dlss5EffectConfig(name, config));
+                paramGeneration.fetch_add(1, std::memory_order_release);
+            }
+            else
+                initReshadeEffect(name, effectPath);
 
             // Set enabled state based on disabledEffects list
             if (!effects.empty() && disabledSet.count(name))
@@ -512,6 +521,16 @@ namespace VKIntox
     {
         // If effectType not provided, assume instanceName is the effect type
         std::string type = effectType.empty() ? instanceName : effectType;
+        if (isDlss5Effect(type, rootConfig))
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (!findEffect(instanceName))
+            {
+                effects.push_back(dlss5EffectConfig(instanceName, rootConfig));
+                paramGeneration.fetch_add(1, std::memory_order_release);
+            }
+            return;
+        }
 
         // Do path lookup outside mutex (filesystem I/O can be slow)
         const bool legacy = isLegacyBuiltInName(type) || isLegacyBuiltInName(instanceName);

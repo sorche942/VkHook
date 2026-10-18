@@ -65,6 +65,11 @@
 #include "effects/effect_transfer.hh"
 #include "imgui_overlay.hh"
 #include "effects/effect_registry.hh"
+#include "effects/dlss5_config.hh"
+#ifdef VKINTOX_DLSS5
+#include "effects/effect_dlss5.hh"
+#include "render/dlss5_device.hh"
+#endif
 
 // Vulkan platform surface interception signatures used in this translation unit.
 // Keep these after project headers to avoid X11 macro collisions in shared headers.
@@ -1229,6 +1234,12 @@ namespace VKIntox
         // Scan all collected directories for .fx files
         scanDirsForFx({allScanDirs.begin(), allScanDirs.end()});
 
+        if (knownEffects.insert("DLSS5").second)
+        {
+            defaultConfigEffects.push_back("DLSS5");
+            effectPaths["DLSS5"] = "Native OpenDLSS-NR / PTX (SDR, no motion-vector history)";
+        }
+
         // Sort discovered effects alphabetically
         std::sort(defaultConfigEffects.begin(), defaultConfigEffects.end());
 
@@ -1314,6 +1325,28 @@ namespace VKIntox
             {
                 Logger::debug("effect " + std::string(effectFailed ? "failed" : "disabled") + ", using pass-through: " + effectStrings[i]);
                 logicalSwapchain->effects.push_back(std::make_shared<TransferEffect>(logicalDevice, logicalSwapchain->format, logicalSwapchain->imageExtent, firstImages, secondImages, config));
+                continue;
+            }
+
+            if (isDlss5Effect(effectStrings[i], config))
+            {
+                try
+                {
+#ifdef VKINTOX_DLSS5
+                    logicalSwapchain->effects.push_back(std::make_shared<Dlss5Effect>(
+                        logicalDevice, logicalSwapchain->format, logicalSwapchain->swapchainCreateInfo.imageColorSpace,
+                        logicalSwapchain->imageExtent, firstImages, secondImages, &effectRegistry, config, effectStrings[i]));
+#else
+                    throw std::runtime_error("DLSS5 backend not built; configure Meson with -Ddlss5=enabled and its build dependencies");
+#endif
+                }
+                catch (const std::exception& e)
+                {
+                    Logger::err("Failed to create DLSS5 effect: " + std::string(e.what()));
+                    effectRegistry.setEffectError(effectStrings[i], e.what());
+                    logicalSwapchain->effects.push_back(std::make_shared<TransferEffect>(
+                        logicalDevice, logicalSwapchain->format, logicalSwapchain->imageExtent, firstImages, secondImages, config));
+                }
                 continue;
             }
 
@@ -1599,6 +1632,13 @@ namespace VKIntox
             appInfo.apiVersion         = VK_API_VERSION_1_1;
         }
 
+#ifdef VKINTOX_DLSS5
+        auto enumerateVersion = reinterpret_cast<PFN_vkEnumerateInstanceVersion>(gpa(VK_NULL_HANDLE, "vkEnumerateInstanceVersion"));
+        uint32_t loaderVersion = VK_API_VERSION_1_0;
+        if (enumerateVersion && enumerateVersion(&loaderVersion) == VK_SUCCESS && loaderVersion >= VK_API_VERSION_1_3)
+            appInfo.apiVersion = std::max(appInfo.apiVersion, VK_API_VERSION_1_3);
+#endif
+
         modifiedCreateInfo.pApplicationInfo = &appInfo;
         VkResult ret                        = createFunc(&modifiedCreateInfo, pAllocator, pInstance);
 
@@ -1850,6 +1890,16 @@ namespace VKIntox
 
         modifiedCreateInfo.pNext = extendedDevicePNext;
 
+        bool dlss5Supported = false;
+        std::string dlss5UnavailableReason = "DLSS5 backend not built";
+#ifdef VKINTOX_DLSS5
+        Dlss5DeviceFeatures dlss5Features;
+        dlss5Supported = dlss5Features.prepare(physicalDevice, instanceVersionMap[GetKey(physicalDevice)],
+            instanceDispatchMap[GetKey(physicalDevice)].GetPhysicalDeviceFeatures2, deviceProps,
+            extensionProperties, modifiedCreateInfo, enabledExtensionNames);
+        dlss5UnavailableReason = dlss5Features.error();
+#endif
+
         VkResult ret = createFunc(physicalDevice, &modifiedCreateInfo, pAllocator, pDevice);
 
         if (ret != VK_SUCCESS)
@@ -1869,6 +1919,10 @@ namespace VKIntox
         logicalDevice->supportsNvDiagnosticCheckpoints = enableNvCheckpoints;
         logicalDevice->supportsNvDiagnosticsConfig = enableNvDiagnosticsConfig;
         logicalDevice->supportsDeviceFaultExt = enableDeviceFault && enableDeviceFaultFeature;
+        logicalDevice->downstreamGIPA = gipa;
+        logicalDevice->downstreamGDPA = gdpa;
+        logicalDevice->dlss5Supported = dlss5Supported;
+        logicalDevice->dlss5UnavailableReason = dlss5UnavailableReason;
 
         fillDispatchTableDevice(*pDevice, gdpa, &logicalDevice->vkd);
 
@@ -1962,6 +2016,11 @@ namespace VKIntox
             if (queueInfo.queueFamilyIndex < queueProperties.size()
                 && (queueProperties[queueInfo.queueFamilyIndex].queueFlags & VK_QUEUE_GRAPHICS_BIT))
             {
+                if (!(queueProperties[queueInfo.queueFamilyIndex].queueFlags & VK_QUEUE_COMPUTE_BIT))
+                {
+                    logicalDevice->dlss5Supported = false;
+                    logicalDevice->dlss5UnavailableReason = "DLSS5 needs a graphics queue with compute support";
+                }
                 logicalDevice->vkd.GetDeviceQueue(logicalDevice->device, queueInfo.queueFamilyIndex, 0, &logicalDevice->queue);
 
                 VkCommandPoolCreateInfo commandPoolCreateInfo;
@@ -3671,7 +3730,7 @@ namespace VKIntox
                 try
                 {
                     for (auto& effect : logicalSwapchain->effects)
-                        effect->updateEffect();
+                        effect->updateFrame(index);
                     if (nativeCaptureEnabled())
                     {
                         // Updating ordinary descriptor bindings invalidates the

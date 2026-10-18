@@ -45,7 +45,7 @@ case "${1:-}" in
         command -v readelf >/dev/null || die 'readelf is required to identify ELF architectures'
         shift
         [[ $# -gt 0 ]] || set -- build
-        declare -A SOURCE_LIBRARIES=() SOURCE_MANIFESTS=() SOURCE_RUNTIME_DIRS=()
+        declare -A SOURCE_LIBRARIES=() SOURCE_MANIFESTS=() SOURCE_RUNTIME_DIRS=() SOURCE_BUILD_DIRS=()
         for BUILD_DIR in "$@"; do
             [[ "$BUILD_DIR" = /* ]] || BUILD_DIR="$REPO_ROOT/$BUILD_DIR"
             SOURCE_LIBRARY="$BUILD_DIR/src/libvkintox.so"
@@ -57,6 +57,7 @@ case "${1:-}" in
             SOURCE_LIBRARIES[$ARCH]="$SOURCE_LIBRARY"
             SOURCE_MANIFESTS[$ARCH]="$SOURCE_MANIFEST"
             SOURCE_RUNTIME_DIRS[$ARCH]="$BUILD_DIR/runtime-libs"
+            SOURCE_BUILD_DIRS[$ARCH]="$BUILD_DIR"
         done
 
         # Preserve the old installation even when only the other architecture is
@@ -123,6 +124,20 @@ case "${1:-}" in
             if [[ "$HAS_RUNTIME" = true ]]; then
                 patchelf --set-rpath "$LIB_DIR/$ARCH/runtime-libs" "$STAGING/$ARCH/libvkintox.so"
             fi
+            BUILD_DIR="${SOURCE_BUILD_DIRS[$ARCH]:-}"
+            if [[ -n "$BUILD_DIR" && -f "$BUILD_DIR/meson-info/intro-installed.json" ]]; then
+                jq -r 'to_entries[] | select(.value | contains("/vkintox/dlss5/")) |
+                    [.key, (.value | split("/vkintox/dlss5/")[1])] | @tsv' \
+                    "$BUILD_DIR/meson-info/intro-installed.json" > "$STAGING/$ARCH/assets.tsv"
+                while IFS=$'\t' read -r SOURCE_ASSET RELATIVE_ASSET; do
+                    [[ -n "$SOURCE_ASSET" ]] || continue
+                    [[ -f "$SOURCE_ASSET" ]] || die "build the DLSS5 kernels first: $SOURCE_ASSET"
+                    install -Dm644 "$SOURCE_ASSET" "$STAGING/$ARCH/dlss5/$RELATIVE_ASSET"
+                done < "$STAGING/$ARCH/assets.tsv"
+                if [[ -d "$STAGING/$ARCH/dlss5" ]]; then
+                    install -m644 "$REPO_ROOT/src/vendor/opendlss_nr/LICENSE" "$REPO_ROOT/src/vendor/opendlss_nr/NOTICE" "$STAGING/$ARCH/dlss5/"
+                fi
+            fi
         done
 
         for ARCH in "${ARCHITECTURES[@]}"; do
@@ -136,6 +151,16 @@ case "${1:-}" in
             done
             # Replace inodes rather than overwrite a running app's mappings.
             mv -f -- "$STAGING/$ARCH/libvkintox.so" "$LIB_DIR/$ARCH/libvkintox.so"
+            if [[ -d "$STAGING/$ARCH/dlss5" ]]; then
+                mkdir -p "$LIB_DIR/$ARCH/dlss5/shaders" "$LIB_DIR/$ARCH/dlss5/ptx"
+                for KIND in shaders ptx; do
+                    for ASSET in "$STAGING/$ARCH/dlss5/$KIND/"*; do
+                        [[ -f "$ASSET" ]] || continue
+                        mv -f -- "$ASSET" "$LIB_DIR/$ARCH/dlss5/$KIND/"
+                    done
+                done
+                mv -f -- "$STAGING/$ARCH/dlss5/LICENSE" "$STAGING/$ARCH/dlss5/NOTICE" "$LIB_DIR/$ARCH/dlss5/"
+            fi
             mv -f -- "$STAGING/VKIntox.$ARCH.json" "$LAYER_DIR/VKIntox.$ARCH.json"
             RUNTIME_DIR="${SOURCE_RUNTIME_DIRS[$ARCH]:-}"
             for NAME in "${RUNTIME_LIBRARIES[@]}"; do
@@ -160,6 +185,14 @@ case "${1:-}" in
             for NAME in "${RUNTIME_LIBRARIES[@]}"; do
                 rm -f -- "$LIB_DIR/$ARCH/runtime-libs/$NAME"
             done
+            if [[ -d "$LIB_DIR/$ARCH/dlss5" ]]; then
+                rm -f -- "$LIB_DIR/$ARCH/dlss5/shaders/"*.spv "$LIB_DIR/$ARCH/dlss5/ptx/"*.ptx \
+                    "$LIB_DIR/$ARCH/dlss5/LICENSE" "$LIB_DIR/$ARCH/dlss5/NOTICE"
+                for KIND in shaders ptx; do
+                    [[ ! -d "$LIB_DIR/$ARCH/dlss5/$KIND" ]] || rmdir --ignore-fail-on-non-empty -- "$LIB_DIR/$ARCH/dlss5/$KIND"
+                done
+                rmdir --ignore-fail-on-non-empty -- "$LIB_DIR/$ARCH/dlss5"
+            fi
             if [[ -d "$LIB_DIR/$ARCH/runtime-libs" ]]; then
                 rmdir --ignore-fail-on-non-empty -- "$LIB_DIR/$ARCH/runtime-libs"
             fi

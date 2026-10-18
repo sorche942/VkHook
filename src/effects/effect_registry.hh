@@ -70,9 +70,9 @@ namespace VKIntox
         // config and preset references to these are dropped.
         static bool isLegacyBuiltInName(const std::string& name);
 
-        // Resolve an effect name, stem or filename to an installed .fx path using
-        // the same search directories the registry uses. Static because preset
-        // import resolves effects before initialize() sets the root config.
+        // Resolve an effect to its installed .fx path, or "DLSS5" for the native
+        // neural renderer. Static because preset import resolves effects before
+        // initialize() sets the root config.
         static std::string resolveEffectPath(const std::string& name, Config* config);
 
         // Add an effect if not already present (for dynamically added effects).

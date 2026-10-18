@@ -12,7 +12,8 @@ namespace VKIntox
 {
     enum class EffectType
     {
-        ReShade   // .fx files
+        ReShade,   // .fx files
+        DLSS5
     };
 
     // Preprocessor definition extracted from ReShade shader
