@@ -64,6 +64,10 @@ cd VKIntox
 ./setup sober          # or: ./setup flatpak com.app.id | ./setup system
 ```
 
+Dear ImGui and the ReShade compiler are included as Git subtrees; a normal clone
+contains their patched sources. Vendor maintenance is documented in
+[workflows](docs/WORKFLOWS.md#vendor-subtrees).
+
 enable per-session with `ENABLE_VKINTOX=1 your_game_command`.
 
 ### keybinds
