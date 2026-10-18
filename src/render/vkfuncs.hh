@@ -109,6 +109,13 @@
     FORVKFUNC(CmdSetCheckpointNV) \
     FORVKFUNC(QueuePresentKHR) \
     FORVKFUNC(QueueSubmit) \
+    FORVKFUNC(QueueSubmit2) \
+    FORVKFUNC(QueueSubmit2KHR) \
+    FORVKFUNC(QueueBindSparse) \
+    FORVKFUNC(QueueBeginDebugUtilsLabelEXT) \
+    FORVKFUNC(QueueEndDebugUtilsLabelEXT) \
+    FORVKFUNC(QueueInsertDebugUtilsLabelEXT) \
+    FORVKFUNC(DeviceWaitIdle) \
     FORVKFUNC(QueueWaitIdle) \
     FORVKFUNC(ResetCommandPool) \
     FORVKFUNC(ResetFences) \

@@ -397,7 +397,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL Native_QueueSubmit(VkQueue queue, uint32_t
 }
 #define NATIVE_SUBMIT2(Name) \
 static VKAPI_ATTR VkResult VKAPI_CALL Native_##Name(VkQueue queue, uint32_t count, const VkSubmitInfo2* infos, VkFence fence) { \
-    auto result = nativeDriver<PFN_vk##Name>(queue, "vk" #Name)(queue, count, infos, fence); \
+    auto result = VKIntox_##Name(queue, count, infos, fence); \
     if (result == VK_SUCCESS) nativeTrack(queue, [&](auto& state, auto*) { \
         for (uint32_t i = 0; i < count; ++i) for (uint32_t j = 0; j < infos[i].commandBufferInfoCount; ++j) state.submitted(queue, infos[i].pCommandBufferInfos[j].commandBuffer); }); \
     return result; }

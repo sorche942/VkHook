@@ -1,14 +1,17 @@
 #version 460
+#extension GL_GOOGLE_include_directive : require
+#include "dlss5_common.glsl"
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(std430, binding = 0) readonly buffer Source { uint pixels[]; };
-layout(std430, binding = 1) readonly buffer Parameters {
-    uint width, height, fullWidth, fullHeight;
-    uint bgra, seed;
-    float intensity, localTone, localStructure, skinStructure;
-} p;
 layout(std430, binding = 2) readonly buffer Head { vec4 head[]; };
 layout(std430, binding = 3) readonly buffer Features { float features[]; };
+layout(std430, binding = 4) readonly buffer Reprojection {
+    uint accepted, candidates, pad1, pad2;
+    vec4 samples[];
+} reprojection;
+layout(std430, binding = 5) writeonly buffer HistoryOutput { vec4 historyOutput[]; };
 layout(std430, binding = 7) writeonly buffer Output { uint result[]; };
+#include "dlss5_debug.glsl"
 float truncateHalf(float v) {
     uint bits = packHalf2x16(vec2(v, 0.0)) & 0xffffu;
     if (unpackHalf2x16(bits).x > v) --bits;
@@ -19,18 +22,39 @@ void main() {
     if (id.x >= p.width || id.y >= p.height) return;
     uint pixel = id.y * p.width + id.x;
     uint packed = pixels[pixel];
-    if (p.intensity == 0.0) { result[pixel] = packed; return; }
     uint padded = id.y * p.fullWidth + id.x;
     vec4 proxy = unpackUnorm4x8(packed);
     if (p.bgra != 0u) proxy = proxy.bgra;
     vec3 neural;
     for (uint c = 0u; c < 3u; ++c) {
-        // OpenDLSS no-history publication: fma(head/32, centred)*8+0.5,
-        // clamped and truncated (not rounded) onto the half grid.
+        // Preserve the original no-history feature arithmetic.
         float inner = fma(head[padded][c], 0.03125, features[padded * 16u + 4u + c]);
-        neural[c] = truncateHalf(clamp(inner * 8.0 + 0.5, 0.0, 1.0));
+        neural[c] = clamp(inner * 8.0 + 0.5, 0.0, 1.0);
     }
-    vec4 outputColor = vec4(mix(proxy.rgb, neural, p.intensity), proxy.a);
+    bool frameAccepted = false;
+    vec4 previous = vec4(0.0);
+    float weight = 0.0;
+    if (dlss5TemporalEnabled()) {
+        frameAccepted = dlss5FrameAccepted(reprojection.accepted, reprojection.candidates);
+        if (frameAccepted) {
+            previous = reprojection.samples[pixel];
+            float headW = head[padded].w;
+            if (dlss5SampleAccepted(previous) && !isnan(headW) && !isinf(headW)) {
+                // OpenDLSS-NR's sigmoid, gated by measured reprojection confidence.
+                weight = 1.0 / (1.0 + exp2(headW * uintBitsToFloat(0xbfb8aa3bu)));
+                weight *= clamp(p.historyStrength, 0.0, 1.0) * previous.a;
+                neural = fma(vec3(weight), previous.rgb - neural, neural);
+            }
+        }
+    }
+    for (uint c = 0u; c < 3u; ++c)
+        neural[c] = truncateHalf(clamp(neural[c], 0.0, 1.0));
+    // Feedback is the neural result, never the intensity-blended display output.
+    if (p.temporal != 0u) historyOutput[pixel] = vec4(neural, 1.0);
+    if (p.debugView == 0u && p.intensity == 0.0) { result[pixel] = packed; return; }
+    vec3 displayColor = p.debugView == 0u ? mix(proxy.rgb, neural, p.intensity)
+        : dlss5DebugColor(id, frameAccepted, previous, weight);
+    vec4 outputColor = vec4(displayColor, proxy.a);
     if (p.bgra != 0u) outputColor = outputColor.bgra;
     result[pixel] = (packUnorm4x8(outputColor) & 0x00ffffffu) | (packed & 0xff000000u);
 }

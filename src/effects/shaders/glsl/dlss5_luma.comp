@@ -1,0 +1,34 @@
+#version 450
+
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0, std430) readonly buffer Source { uint pixels[]; } source;
+layout(set = 0, binding = 1, std430) readonly buffer Parameters
+{
+    uint width;
+    uint height;
+    uint bgra;
+    uint pad;
+} params;
+layout(set = 0, binding = 7, std430) writeonly buffer Luminance { uint words[]; } luma;
+
+void main()
+{
+    uint word = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * 64u;
+    uint count = params.width * params.height;
+    if (word >= (count + 3u) / 4u) return;
+    uint packed = 0u;
+    for (uint lane = 0u; lane < 4u; ++lane)
+    {
+        uint index = word * 4u + lane;
+        if (index >= count) break;
+        uint pixel = source.pixels[index];
+        uint red = (pixel >> (params.bgra != 0u ? 16u : 0u)) & 255u;
+        uint green = (pixel >> 8u) & 255u;
+        uint blue = (pixel >> (params.bgra != 0u ? 0u : 16u)) & 255u;
+        // Rec.709 luma on the original nonlinear SDR bytes. Integer weights
+        // sum to 256, preserving black/white and avoiding cross-word races.
+        uint y = (54u * red + 183u * green + 19u * blue + 128u) >> 8u;
+        packed |= y << (lane * 8u);
+    }
+    luma.words[word] = packed;
+}

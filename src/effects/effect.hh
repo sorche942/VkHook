@@ -19,7 +19,12 @@ namespace VKIntox
         void virtual applyEffect(uint32_t imageIndex, VkCommandBuffer commandBuffer) = 0;
         void virtual updateEffect(){};
         // Called only after this swapchain image's previous submission completed.
-        virtual void updateFrame(uint32_t /* imageIndex */) { updateEffect(); }
+        // True requests fence-safe re-recording of this image's primary commands.
+        virtual bool updateFrame(uint32_t /* imageIndex */) { updateEffect(); return false; }
+        // Called under the submission lock, after the depth-generation gate.
+        // May submit auxiliary GPU work and replace this submission's waits.
+        virtual VkResult prepareSubmission(uint32_t /* imageIndex */, uint64_t /* frameSerial */,
+                                           VkSubmitInfo& /* submission */) noexcept { return VK_SUCCESS; }
         // Parameter names are omitted on the unused default hooks: subclasses that
         // do consume depth override these, and leaving the names off keeps the
         // base declaration free of unused-parameter noise.

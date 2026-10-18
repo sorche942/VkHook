@@ -91,6 +91,13 @@ namespace VKIntox
         PFN_vkGetDeviceProcAddr downstreamGDPA = nullptr;
         bool dlss5Supported = false;
         std::string dlss5UnavailableReason;
+        VkQueue dlss5OpticalFlowQueue = VK_NULL_HANDLE;
+        uint32_t dlss5OpticalFlowQueueFamily = VK_QUEUE_FAMILY_IGNORED;
+        // Lock before globalLock when both are needed. Application queue waits
+        // must never hold globalLock: their GPU waits can need another submitter.
+        std::mutex dlss5OpticalFlowQueueMutex;
+        // Incremented even when effects/presents bypass; gaps invalidate history.
+        uint64_t presentSerial = 0;
         bool                     supportsMutableFormat;
         bool                     isNvidiaGpu;
         // Real identity of the device the game is actually running on. The

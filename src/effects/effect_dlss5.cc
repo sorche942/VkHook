@@ -6,10 +6,13 @@
 #include "logger.hh"
 #include "dlss5_paths.hh"
 #include "nr_graph.h"
+#include "dlss5_optical_flow.hh"
+#include "dlss5_parameters.hh"
 #include "reference.h"
 #include <algorithm>
 #include <dlfcn.h>
 #include <cmath>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -60,17 +63,16 @@ namespace VKIntox
         std::unique_ptr<nr::Kernels> kernels;
         std::unique_ptr<nr::Graph> graph;
         nr::Activation* features = nullptr;
+        std::unique_ptr<Dlss5OpticalFlow> flow;
         vk::Buffer packedInput{}, packedOutput{};
-        struct Parameters
-        {
-            uint32_t width, height, fullWidth, fullHeight;
-            uint32_t bgra, seed;
-            float intensity, localTone, localStructure, skinStructure;
-        } parameters{};
-        static_assert(sizeof(Parameters) == 40);
+        vk::Buffer previousInput{}, history{}, reprojection{};
+        Dlss5Parameters parameters{}, submittedParameters{};
+        uint64_t lastFrameSerial = 0;
+        std::chrono::steady_clock::time_point lastSubmission{};
+        std::vector<uint8_t> recordedTemporal;
         std::vector<vk::Buffer> parameterBuffers;
-        std::vector<VkDescriptorSet> preprocessSets, compositeSets;
-        vk::Pipeline preprocess{}, composite{};
+        std::vector<VkDescriptorSet> preprocessSets, compositeSets, reprojectSets;
+        vk::Pipeline preprocess{}, composite{}, reproject{};
         VkCommandPool commandPool = VK_NULL_HANDLE;
         VkCommandBuffer network = VK_NULL_HANDLE;
 
@@ -81,6 +83,10 @@ namespace VKIntox
             if (!context) return;
             context->destroyPipeline(preprocess);
             context->destroyPipeline(composite);
+            context->destroyPipeline(reproject);
+            context->destroyBuffer(previousInput);
+            context->destroyBuffer(history);
+            context->destroyBuffer(reprojection);
             for (auto& buffer : parameterBuffers) context->destroyBuffer(buffer);
             context->destroyBuffer(packedInput);
             context->destroyBuffer(packedOutput);
@@ -89,7 +95,8 @@ namespace VKIntox
 
     Dlss5Effect::Dlss5Effect(LogicalDevice* device, VkFormat format, VkColorSpaceKHR colorSpace,
                              VkExtent2D extent, const std::vector<VkImage>& input,
-                             const std::vector<VkImage>& output, EffectRegistry* registry,
+                             const std::vector<VkImage>& output, const std::vector<VkImage>& motionSources,
+                             EffectRegistry* registry,
                              Config* config, const std::string& name)
         : state(std::make_unique<State>())
     {
@@ -117,6 +124,13 @@ namespace VKIntox
         s.output = output;
         s.context = std::make_unique<vk::Context>(device->instance, device->physicalDevice, device->device,
             device->queueFamilyIndex, 0, device->downstreamGIPA, device->downstreamGDPA);
+        if (device->dlss5OpticalFlowQueue)
+        {
+            s.flow = std::make_unique<Dlss5OpticalFlow>(*s.context, device->dlss5OpticalFlowQueueFamily,
+                device->dlss5OpticalFlowQueue, extent, format, motionSources, shaderPath,
+                device->downstreamGIPA, device->downstreamGDPA);
+        }
+        else Logger::warn("DLSS5 temporal unavailable: no enabled NVIDIA optical-flow feature/usable queue; using no history");
         s.model = std::make_unique<nr::Model>(*s.context, modelPath);
         s.kernels = std::make_unique<nr::Kernels>(*s.context, shaderPath, ptxPath);
         // A foreign renderer may overlap long graphics workloads with this pass.
@@ -129,8 +143,20 @@ namespace VKIntox
         const VkDeviceSize pixelBytes = VkDeviceSize(extent.width) * extent.height * sizeof(uint32_t);
         s.packedInput = s.context->createBuffer(pixelBytes, false, "DLSS5 packed input");
         s.packedOutput = s.context->createBuffer(pixelBytes, false, "DLSS5 packed output");
-        s.parameters = {extent.width, extent.height, geometry.fullWidth, geometry.fullHeight, bgra ? 1u : 0u, 0u,
-                        1.0f, 1.0f, 1.0f, -1.0f};
+        s.parameters.width = extent.width;
+        s.parameters.height = extent.height;
+        s.parameters.fullWidth = geometry.fullWidth;
+        s.parameters.fullHeight = geometry.fullHeight;
+        s.parameters.bgra = bgra ? 1u : 0u;
+        if (s.flow)
+        {
+            s.parameters.flowWidth = s.flow->flowWidth();
+            s.parameters.flowHeight = s.flow->flowHeight();
+            s.previousInput = s.context->createBuffer(pixelBytes, false, "DLSS5 previous input");
+            s.history = s.context->createBuffer(pixelBytes * 4, false, "DLSS5 neural history");
+            s.reprojection = s.context->createBuffer(16 + pixelBytes * 4, false, "DLSS5 reprojected history");
+            s.reproject = s.context->createComputePipeline(s.context->loadShaderModule(shaderPath + "/dlss5_reproject.spv"), {}, "DLSS5 reprojection");
+        }
 
         // Record the expensive graph once. Swapchain command buffers reuse this
         // secondary; depth descriptor rebuilds never allocate another network.
@@ -156,27 +182,44 @@ namespace VKIntox
         s.parameterBuffers.resize(input.size());
         s.preprocessSets.resize(input.size());
         s.compositeSets.resize(input.size());
+        s.reprojectSets.resize(input.size());
+        s.recordedTemporal.resize(input.size(), 2);
         for (uint32_t index = 0; index < input.size(); ++index)
         {
-            s.parameterBuffers[index] = s.context->createBuffer(sizeof(State::Parameters), true, "DLSS5 parameters");
+            s.parameterBuffers[index] = s.context->createBuffer(sizeof(Dlss5Parameters), true, "DLSS5 parameters");
             const vk::Buffer* bindings[vk::kGenericBindings]{};
             bindings[0] = &s.packedInput;
             bindings[1] = &s.parameterBuffers[index];
+            bindings[2] = s.flow ? &s.reprojection : nullptr;
             bindings[7] = &s.features->buffer;
             s.preprocessSets[index] = s.context->allocateSet(bindings);
             bindings[2] = &s.graph->head().buffer;
             bindings[3] = &s.features->buffer;
+            bindings[4] = s.flow ? &s.reprojection : nullptr;
+            bindings[5] = s.flow ? &s.history : nullptr;
+            bindings[6] = s.flow ? &s.flow->forward() : nullptr;
             bindings[7] = &s.packedOutput;
             s.compositeSets[index] = s.context->allocateSet(bindings);
+            if (s.flow)
+            {
+                bindings[2] = &s.previousInput;
+                bindings[3] = &s.history;
+                bindings[4] = &s.flow->forward();
+                bindings[5] = &s.flow->backward();
+                bindings[6] = &s.flow->cost();
+                bindings[7] = &s.reprojection;
+                s.reprojectSets[index] = s.context->allocateSet(bindings);
+            }
             updateFrame(index);
         }
         Logger::info("DLSS5: loaded " + std::to_string(s.model->blockCount()) + " blocks, PTX neural rendering at "
-                     + std::to_string(extent.width) + "x" + std::to_string(extent.height) + " (SDR, no temporal history)");
+                     + std::to_string(extent.width) + "x" + std::to_string(extent.height)
+                     + (s.flow ? " (SDR, bidirectional NVIDIA hardware optical flow)" : " (SDR, no temporal history)"));
     }
 
     Dlss5Effect::~Dlss5Effect() = default;
 
-    void Dlss5Effect::updateFrame(uint32_t imageIndex)
+    bool Dlss5Effect::updateFrame(uint32_t imageIndex)
     {
         auto& s = *state;
         auto value = [&](const char* name, float fallback, float minimum, float maximum) {
@@ -189,7 +232,43 @@ namespace VKIntox
         s.parameters.localTone = value("localTone", 1, 0, 1);
         s.parameters.localStructure = value("localStructure", 1, 0, 1);
         s.parameters.skinStructure = value("skinStructure", -1, -1, 1);
+        const auto temporal = s.registry->getParameter(s.name, "temporal");
+        s.parameters.temporal = s.flow && (!temporal || (*temporal)->getType() != ParamType::Bool
+            || static_cast<const BoolParam*>(*temporal)->value);
+        s.parameters.historyStrength = value("historyStrength", 1, 0, 1);
+        const auto debug = s.registry->getParameter(s.name, "debugView");
+        s.parameters.debugView = debug && (*debug)->getType() == ParamType::Int
+            ? static_cast<uint32_t>(std::clamp(static_cast<const IntParam*>(*debug)->value, 0, 4)) : 0u;
         std::memcpy(s.parameterBuffers.at(imageIndex).mapped, &s.parameters, sizeof(s.parameters));
+        return s.recordedTemporal.at(imageIndex) != s.parameters.temporal;
+    }
+
+    VkResult Dlss5Effect::prepareSubmission(uint32_t imageIndex, uint64_t frameSerial,
+                                            VkSubmitInfo& submission) noexcept
+    {
+        auto& s = *state;
+        const auto now = std::chrono::steady_clock::now();
+        const bool sameControls = std::memcmp(&s.parameters, &s.submittedParameters, 40) == 0
+            && s.parameters.temporal == s.submittedParameters.temporal
+            && s.parameters.historyStrength == s.submittedParameters.historyStrength;
+        s.parameters.historyValid = s.parameters.temporal && s.lastFrameSerial != 0
+            && frameSerial == s.lastFrameSerial + 1 && sameControls
+            && now - s.lastSubmission < std::chrono::milliseconds(250);
+        std::memcpy(s.parameterBuffers[imageIndex].mapped, &s.parameters, sizeof(s.parameters));
+        if (!s.parameters.temporal)
+        {
+            s.lastFrameSerial = 0;
+            return VK_SUCCESS;
+        }
+        const VkResult result = s.flow->prepare(imageIndex, submission);
+        if (result == VK_SUCCESS)
+        {
+            s.lastFrameSerial = frameSerial;
+            s.lastSubmission = now;
+            s.submittedParameters = s.parameters;
+        }
+        else s.lastFrameSerial = 0;
+        return result;
     }
 
     void Dlss5Effect::applyEffect(uint32_t imageIndex, VkCommandBuffer commands)
@@ -199,6 +278,8 @@ namespace VKIntox
         // Scratch is shared across frames, but all effect submissions use this
         // device's single queue. Serialize before any frame overwrites it.
         memoryBarrier(s.device, commands);
+        s.recordedTemporal.at(imageIndex) = static_cast<uint8_t>(s.parameters.temporal);
+        if (s.parameters.temporal) s.flow->recordResults(commands);
         VkImageMemoryBarrier barriers[2]{};
         for (auto& barrier : barriers)
         {
@@ -223,6 +304,16 @@ namespace VKIntox
         copy.imageExtent = {s.extent.width, s.extent.height, 1};
         vk.CmdCopyImageToBuffer(commands, barriers[0].image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s.packedInput.buffer, 1, &copy);
         memoryBarrier(s.device, commands);
+        if (s.parameters.temporal)
+        {
+            s.context->dispatch().vkCmdFillBuffer(commands, s.reprojection.buffer, 0, 16, 0);
+            memoryBarrier(s.device, commands);
+            vk.CmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_COMPUTE, s.reproject.pipeline);
+            vk.CmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_COMPUTE, s.context->pipelineLayout(), 0, 1,
+                &s.reprojectSets[imageIndex], 0, nullptr);
+            vk.CmdDispatch(commands, (s.extent.width + 7) / 8, (s.extent.height + 7) / 8, 1);
+            memoryBarrier(s.device, commands);
+        }
         vk.CmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_COMPUTE, s.preprocess.pipeline);
         vk.CmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_COMPUTE, s.context->pipelineLayout(), 0, 1,
             &s.preprocessSets[imageIndex], 0, nullptr);
@@ -236,6 +327,11 @@ namespace VKIntox
         vk.CmdDispatch(commands, (s.extent.width + 7) / 8, (s.extent.height + 7) / 8, 1);
         memoryBarrier(s.device, commands);
         vk.CmdCopyBufferToImage(commands, s.packedOutput.buffer, barriers[1].image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+        if (s.parameters.temporal)
+        {
+            VkBufferCopy previousCopy{0, 0, s.packedInput.size};
+            s.context->dispatch().vkCmdCopyBuffer(commands, s.packedInput.buffer, s.previousInput.buffer, 1, &previousCopy);
+        }
         for (auto& barrier : barriers)
         {
             barrier.srcAccessMask = barrier.dstAccessMask;

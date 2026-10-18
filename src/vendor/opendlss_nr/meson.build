@@ -26,13 +26,14 @@ foreach shader : ['fused_block32', 'gemm_f16', 'gemm_fp8', 'gemm_mlp', 'gemm_red
     )
 endforeach
 
-foreach shader : ['dlss5_preprocess', 'dlss5_composite']
+foreach shader : ['dlss5_preprocess', 'dlss5_composite', 'dlss5_reproject', 'dlss5_luma']
     opendlss_nr_assets += custom_target(shader,
         input : '../../effects/shaders/glsl' / (shader + '.comp'),
         output : shader + '.spv',
         command : [opendlss_nr_glslang, '-V', '--target-env', 'vulkan1.3',
             '-I' + (meson.current_source_dir() / 'shaders'), '@INPUT@', '-o', '@OUTPUT@'],
-        depend_files : opendlss_nr_shader_includes,
+        depend_files : opendlss_nr_shader_includes + files(
+            '../../effects/shaders/glsl/dlss5_common.glsl', '../../effects/shaders/glsl/dlss5_debug.glsl'),
         build_by_default : true, install : true, install_dir : opendlss_nr_install_shader_dir)
 endforeach
 

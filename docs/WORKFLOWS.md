@@ -120,6 +120,15 @@ per-device downstream dispatch; it does not create a second Vulkan device.
   not i686 applications on this workstation: i686 inference is unavailable.
   The i686 layer reports the missing extension and keeps rendering without
   DLSS5; that fallback was exercised through clean shutdown.
+- Temporal history additionally requires `VK_NV_optical_flow`, its feature bit,
+  supported image formats/grid size, and a usable optical-flow queue.
+  VKIntox prefers an unused family. If Proton/vkd3d already reserves the separate
+  optical engine, VKIntox shares its ordinary queue zero without changing the
+  application's queue-create infos. Layer submissions and application queue
+  submits, waits, and debug labels use a shared host mutex; GPU work still uses
+  semaphore dependencies. Protected or mixed graphics/compute queues are not
+  borrowed. Without a usable queue/feature, DLSS5 logs the reason and runs without
+  history; an enabled Temporal checkbox expresses a preference, not availability.
 
 ### Extract the model
 
@@ -152,11 +161,16 @@ DLSS5.intensity = 1
 DLSS5.localTone = 1
 DLSS5.localStructure = 1
 DLSS5.skinStructure = -1
+DLSS5.temporal = true
+DLSS5.historyStrength = 1
 ```
 
 The existing parameter UI exposes these controls. Intensity ranges from 0
 (byte-exact passthrough) to 1; local tone and structure range from 0 to 1, and
-skin structure from -1 to 1. Parameters update without rebuilding the network.
+skin structure from -1 to 1. Temporal enables hardware optical-flow history;
+history strength ranges from 0 (no reuse) to 1 (full confidence-weighted reuse).
+Both default to enabled/full strength. Parameters update without rebuilding
+the network; toggling temporal re-records the affected command buffers.
 Keep the normal `depthCapture = on` setting: the layer's existing depth-transition
 submission gate is also used for native effects.
 
@@ -177,18 +191,58 @@ then their configured installation paths. Restart the application after changing
 model or kernel paths. Missing assets or unsupported hardware/formats produce
 an effect error and preserve the ordinary transfer path.
 
+### Inspect optical flow and temporal reuse
+
+In DLSS5's parameters, select **Debug view**, or set `DLSS5.debugView` in
+the active config (default `0`). No separate ReShade effect is needed: the
+debug shader reads the live optical-flow and reprojection buffers.
+
+| Value | View | Interpretation |
+| --- | --- | --- |
+| 0 | Off | Normal neural rendering. |
+| 1 | Optical flow | Raw current-to-previous displacement. Hue encodes direction: right red, down yellow-green, left cyan, up violet. Brightness encodes magnitude: zero is black, eight pixels is half brightness. |
+| 2 | History confidence | Green intensity is accepted-history confidence; black means no accepted history. Includes the frame-wide rejection gate. |
+| 3 | Reprojected history | The previous neural image warped into the current frame; rejected pixels are black. |
+| 4 | Temporal blend weight | Grayscale actual blend weight: neural sigmoid × history strength × confidence. Black means no explicit history blend; white means full history weight. |
+
+The eight-pixel top strip reports **magenta** for temporal off/unavailable,
+**amber** for first/reset frames, **red** for frame rejection/no reuse, and
+**green** for an accepted frame. Off/unavailable and reset frames also show
+a matching checkerboard, not stale vectors. Raw flow may be meaningless on
+textureless surfaces; compare it with confidence rather than assuming every
+colored vector is used.
+
+Debug views override display intensity, preserve alpha, and never enter neural
+feedback. Switching views does not reset history or rebuild the network. The
+blend-weight view measures the explicit temporal composite, not the influence
+of history conditioning inside the model. Keep DLSS5 last in the effect chain
+while inspecting these views so later effects do not alter the diagnostic colors.
+
 ### Scope and verification
 
 This is **same-resolution neural rendering**, not super-resolution or frame
 generation. Only RGBA8/BGRA8 UNORM/SRGB swapchains in the SRGB_NONLINEAR color
 space are accepted; HDR is rejected. Alpha is preserved.
 
-VKIntox has no engine motion-vector/reprojection inputs. The input bridge
-therefore uses OpenDLSS-NR's no-history contract: current-frame centered color
-in both current and history lanes, deterministic noise, and the model's
-automatic mask. It does not pretend zero motion vectors are temporal history.
-HUD and text are processed as part of the final image; visual quality and
-temporal stability are not guaranteed.
+VKIntox has no engine motion-vector/reprojection inputs. Instead, the temporal
+path estimates current-to-previous and previous-to-current motion from the raw
+game image using NVIDIA hardware optical flow. It reprojects the previous neural
+result with bounded Catmull-Rom filtering, rejecting out-of-bounds pixels,
+unreliable flow, inconsistent bidirectional motion, and photometric mismatches.
+A frame-wide consistency check rejects scene cuts without discarding a valid
+moving object merely because its background is textureless. The model's blend
+head, per-pixel confidence, and history strength control reuse.
+
+History resets on effect recreation/resize, parameter changes, skipped effect
+frames, and submission gaps of 250 ms or more. First/reset frames and rejected
+pixels use OpenDLSS-NR's current-color no-history proxy. Disabling temporal
+bypasses optical flow, reprojection, and history reads/writes entirely.
+The normal path uses GPU semaphore/barrier synchronization, not CPU waits or
+readback, but adds two optical-flow passes plus conversion/reprojection work.
+
+Estimated flow is not engine velocity: disocclusions, transparency, lighting
+changes, HUD, and text remain imperfect inputs. HUD and text are processed as
+part of the final image; visual quality and temporal stability are not guaranteed.
 
 The supplied model is newer than OpenDLSS-NR's documented 310.8.0 model.
 Its tensor shapes match, but numerical/visual parity with NVIDIA's DLL has
@@ -199,8 +253,29 @@ all 307,200 pixels byte-for-byte at 640×480.
 
 The conditional Meson test `DLSS5 device feature preservation` covers application
 feature preservation, promoted feature merging, duplicate loader nodes, input
-chain immutability, and unsupported-device rejection. GPU inference requires
-the hardware above and locally extracted weights; lavapipe CI cannot prove it.
+chain immutability, optional optical-flow negotiation, private/shared optical-queue
+selection (including protected/mixed-queue rejection), and unsupported-device
+rejection. The opt-in hardware test runs real optical flow and bridge shaders
+without proprietary weights:
+
+```bash
+VKINTOX_TEST_DLSS5_GPU=1 meson test -C build-gcc \
+  'DLSS5 optical-flow temporal GPU' --print-errorlogs
+```
+
+On the RTX 5070 Ti, it recovered an 8×4-pixel translation, rejected disocclusion
+and scene-cut history, retained moving-object history on a textureless background,
+and checked temporal bypass, reset, alpha, zero intensity, and odd dimensions.
+A full-model `vkcube` smoke also confirmed that the PTX graph consumes reprojected
+history and that live temporal off/on toggles bypass and restore reuse.
+Control's DX12 startup through Steam/CachyOS Proton was also exercised at
+3840×2160: the layer shared the application's optical queue (family 5, queue 0
+on this driver), displayed live motion vectors, and showed accepted history
+with a green debug-status strip. A magenta checkerboard with Temporal enabled
+means the runtime path is unavailable, not that the image has no motion;
+check the `DLSS5 optical flow`/`DLSS5 temporal unavailable` startup messages.
+GPU inference requires the hardware above and locally extracted weights;
+lavapipe CI cannot prove it. These checks do not establish NVIDIA DLL parity.
 
 ## user-local native installation
 

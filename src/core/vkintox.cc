@@ -1237,7 +1237,7 @@ namespace VKIntox
         if (knownEffects.insert("DLSS5").second)
         {
             defaultConfigEffects.push_back("DLSS5");
-            effectPaths["DLSS5"] = "Native OpenDLSS-NR / PTX (SDR, no motion-vector history)";
+            effectPaths["DLSS5"] = "Native OpenDLSS-NR / PTX (SDR, NVIDIA optical-flow history)";
         }
 
         // Sort discovered effects alphabetically
@@ -1333,9 +1333,12 @@ namespace VKIntox
                 try
                 {
 #ifdef VKINTOX_DLSS5
+                    const std::vector<VkImage> motionSources(logicalSwapchain->fakeImages.begin(),
+                        logicalSwapchain->fakeImages.begin() + logicalSwapchain->imageCount);
                     logicalSwapchain->effects.push_back(std::make_shared<Dlss5Effect>(
                         logicalDevice, logicalSwapchain->format, logicalSwapchain->swapchainCreateInfo.imageColorSpace,
-                        logicalSwapchain->imageExtent, firstImages, secondImages, &effectRegistry, config, effectStrings[i]));
+                        logicalSwapchain->imageExtent, firstImages, secondImages, motionSources,
+                        &effectRegistry, config, effectStrings[i]));
 #else
                     throw std::runtime_error("DLSS5 backend not built; configure Meson with -Ddlss5=enabled and its build dependencies");
 #endif
@@ -1768,6 +1771,10 @@ namespace VKIntox
         instanceDispatchMap[GetKey(physicalDevice)].GetPhysicalDeviceProperties(physicalDevice, &deviceProps);
 
         VkDeviceCreateInfo       modifiedCreateInfo = *pCreateInfo;
+        uint32_t queueFamilyCount = 0;
+        instanceDispatchMap[GetKey(physicalDevice)].GetPhysicalDeviceQueueFamilyProperties(physicalDevice, &queueFamilyCount, nullptr);
+        std::vector<VkQueueFamilyProperties> queueProperties(queueFamilyCount);
+        instanceDispatchMap[GetKey(physicalDevice)].GetPhysicalDeviceQueueFamilyProperties(physicalDevice, &queueFamilyCount, queueProperties.data());
         std::vector<const char*> enabledExtensionNames;
         if (modifiedCreateInfo.enabledExtensionCount)
         {
@@ -1892,12 +1899,42 @@ namespace VKIntox
 
         bool dlss5Supported = false;
         std::string dlss5UnavailableReason = "DLSS5 backend not built";
+        uint32_t opticalFlowFamily = VK_QUEUE_FAMILY_IGNORED;
 #ifdef VKINTOX_DLSS5
         Dlss5DeviceFeatures dlss5Features;
+        const auto opticalQueue = selectDlss5OpticalQueue(queueProperties, *pCreateInfo);
+        opticalFlowFamily = opticalQueue.family;
         dlss5Supported = dlss5Features.prepare(physicalDevice, instanceVersionMap[GetKey(physicalDevice)],
             instanceDispatchMap[GetKey(physicalDevice)].GetPhysicalDeviceFeatures2, deviceProps,
-            extensionProperties, modifiedCreateInfo, enabledExtensionNames);
+            extensionProperties, modifiedCreateInfo, enabledExtensionNames,
+            opticalFlowFamily != VK_QUEUE_FAMILY_IGNORED);
         dlss5UnavailableReason = dlss5Features.error();
+        std::vector<VkDeviceQueueCreateInfo> queueInfos;
+        const float opticalFlowPriority = 1.0f;
+        if (dlss5Supported && dlss5Features.opticalFlowEnabled())
+        {
+            if (!opticalQueue.shared)
+            {
+                queueInfos.assign(pCreateInfo->pQueueCreateInfos, pCreateInfo->pQueueCreateInfos + pCreateInfo->queueCreateInfoCount);
+                VkDeviceQueueCreateInfo flowQueue{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
+                flowQueue.queueFamilyIndex = opticalFlowFamily;
+                flowQueue.queueCount = 1;
+                flowQueue.pQueuePriorities = &opticalFlowPriority;
+                queueInfos.push_back(flowQueue);
+                modifiedCreateInfo.queueCreateInfoCount = static_cast<uint32_t>(queueInfos.size());
+                modifiedCreateInfo.pQueueCreateInfos = queueInfos.data();
+            }
+            Logger::info("DLSS5 optical flow: " + std::string(opticalQueue.shared ? "sharing application" : "reserving private")
+                + " queue family " + std::to_string(opticalFlowFamily) + ", queue 0");
+        }
+        else
+        {
+            opticalFlowFamily = VK_QUEUE_FAMILY_IGNORED;
+            if (dlss5Supported)
+                Logger::warn(opticalQueue.family == VK_QUEUE_FAMILY_IGNORED
+                    ? "DLSS5 temporal unavailable: no usable separate optical-flow queue (protected/mixed queues cannot be shared)"
+                    : "DLSS5 temporal unavailable: VK_NV_optical_flow extension or opticalFlow feature not supported");
+        }
 #endif
 
         VkResult ret = createFunc(physicalDevice, &modifiedCreateInfo, pAllocator, pDevice);
@@ -1925,6 +1962,12 @@ namespace VKIntox
         logicalDevice->dlss5UnavailableReason = dlss5UnavailableReason;
 
         fillDispatchTableDevice(*pDevice, gdpa, &logicalDevice->vkd);
+        if (opticalFlowFamily != VK_QUEUE_FAMILY_IGNORED)
+        {
+            logicalDevice->dlss5OpticalFlowQueueFamily = opticalFlowFamily;
+            logicalDevice->vkd.GetDeviceQueue(*pDevice, opticalFlowFamily, 0, &logicalDevice->dlss5OpticalFlowQueue);
+            initializeDispatchTable(logicalDevice->dlss5OpticalFlowQueue, *pDevice);
+        }
 
         // Query supported depth resolve modes once (VK_KHR_depth_resolve_mode,
         // core since 1.2). Drives the MSAA depth resolve path selection and the
@@ -2003,13 +2046,6 @@ namespace VKIntox
                 + ", device fault=" + (logicalDevice->supportsDeviceFaultExt ? "on" : "off") + ")");
         }
 
-        uint32_t count;
-
-        logicalDevice->vki.GetPhysicalDeviceQueueFamilyProperties(logicalDevice->physicalDevice, &count, nullptr);
-
-        std::vector<VkQueueFamilyProperties> queueProperties(count);
-
-        logicalDevice->vki.GetPhysicalDeviceQueueFamilyProperties(logicalDevice->physicalDevice, &count, queueProperties.data());
         for (uint32_t i = 0; i < pCreateInfo->queueCreateInfoCount; i++)
         {
             auto& queueInfo = pCreateInfo->pQueueCreateInfos[i];
@@ -2665,6 +2701,12 @@ namespace VKIntox
             if (devIt != deviceMap.end())
                 logicalDevice = devIt->second.get();
         }
+        if (logicalDevice && queue == logicalDevice->dlss5OpticalFlowQueue)
+        {
+            // Optical submissions are not graphics/depth producers.
+            std::lock_guard queueLock(logicalDevice->dlss5OpticalFlowQueueMutex);
+            return logicalDevice->vkd.QueueSubmit(queue, submitCount, pSubmits, fence);
+        }
 
         if (logicalDevice && submitCount > 0 && pSubmits)
         {
@@ -3023,8 +3065,68 @@ namespace VKIntox
         return submitResult;
     }
 
+    template<typename Handle>
+    static std::shared_ptr<LogicalDevice> queueCallDevice(Handle handle)
+    {
+        scoped_lock lock(globalLock);
+        auto found = deviceMap.find(GetKey(handle));
+        return found == deviceMap.end() ? nullptr : found->second;
+    }
+
+    // These calls also touch VkQueue host state. In particular, waiting while
+    // holding globalLock would block another thread from submitting its signals.
+#define OPTICAL_QUEUE_CALL(Result, Name, Parameters, Arguments, Failure) \
+    VKAPI_ATTR Result VKAPI_CALL VKIntox_##Name Parameters { \
+        auto device = queueCallDevice(queue); \
+        if (!device) return Failure; \
+        std::unique_lock lock(device->dlss5OpticalFlowQueueMutex, std::defer_lock); \
+        if (queue == device->dlss5OpticalFlowQueue) lock.lock(); \
+        return device->vkd.Name Arguments; \
+    }
+    OPTICAL_QUEUE_CALL(VkResult, QueueSubmit2,
+        (VkQueue queue, uint32_t count, const VkSubmitInfo2* infos, VkFence fence),
+        (queue, count, infos, fence), VK_ERROR_DEVICE_LOST)
+    OPTICAL_QUEUE_CALL(VkResult, QueueSubmit2KHR,
+        (VkQueue queue, uint32_t count, const VkSubmitInfo2* infos, VkFence fence),
+        (queue, count, infos, fence), VK_ERROR_DEVICE_LOST)
+    OPTICAL_QUEUE_CALL(VkResult, QueueBindSparse,
+        (VkQueue queue, uint32_t count, const VkBindSparseInfo* infos, VkFence fence),
+        (queue, count, infos, fence), VK_ERROR_DEVICE_LOST)
+    OPTICAL_QUEUE_CALL(VkResult, QueueWaitIdle, (VkQueue queue), (queue), VK_ERROR_DEVICE_LOST)
+    OPTICAL_QUEUE_CALL(void, QueueBeginDebugUtilsLabelEXT,
+        (VkQueue queue, const VkDebugUtilsLabelEXT* label), (queue, label), )
+    OPTICAL_QUEUE_CALL(void, QueueInsertDebugUtilsLabelEXT,
+        (VkQueue queue, const VkDebugUtilsLabelEXT* label), (queue, label), )
+    OPTICAL_QUEUE_CALL(void, QueueEndDebugUtilsLabelEXT, (VkQueue queue), (queue), )
+#undef OPTICAL_QUEUE_CALL
+
+    VKAPI_ATTR VkResult VKAPI_CALL VKIntox_DeviceWaitIdle(VkDevice handle)
+    {
+        auto device = queueCallDevice(handle);
+        if (!device) return VK_ERROR_DEVICE_LOST;
+        std::unique_lock lock(device->dlss5OpticalFlowQueueMutex, std::defer_lock);
+        if (device->dlss5OpticalFlowQueue) lock.lock();
+        return device->vkd.DeviceWaitIdle(handle);
+    }
+
+    static PFN_vkVoidFunction opticalQueueIntercept(const char* name)
+    {
+#define OPTICAL_QUEUE_PROC(Name) if (!std::strcmp(name, "vk" #Name)) return reinterpret_cast<PFN_vkVoidFunction>(&VKIntox_##Name)
+        OPTICAL_QUEUE_PROC(QueueSubmit2);
+        OPTICAL_QUEUE_PROC(QueueSubmit2KHR);
+        OPTICAL_QUEUE_PROC(QueueBindSparse);
+        OPTICAL_QUEUE_PROC(QueueWaitIdle);
+        OPTICAL_QUEUE_PROC(DeviceWaitIdle);
+        OPTICAL_QUEUE_PROC(QueueBeginDebugUtilsLabelEXT);
+        OPTICAL_QUEUE_PROC(QueueEndDebugUtilsLabelEXT);
+        OPTICAL_QUEUE_PROC(QueueInsertDebugUtilsLabelEXT);
+#undef OPTICAL_QUEUE_PROC
+        return nullptr;
+    }
+
     VKAPI_ATTR VkResult VKAPI_CALL VKIntox_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPresentInfo)
     {
+        uint64_t frameSerial = 0;
         // Consume even on early soft-disable/resize/passthrough returns. Menus
         // and a later re-enable must not resurrect an older native submission.
         std::shared_ptr<NativeSnapshot> nativeFrame;
@@ -3052,6 +3154,7 @@ namespace VKIntox
                 if (devIt == deviceMap.end() || !devIt->second)
                     return VK_ERROR_DEVICE_LOST;
                 passThroughDevice = devIt->second;
+                frameSerial = ++passThroughDevice->presentSerial;
                 softDisabled = passThroughDevice->softDisabled.load(std::memory_order_acquire);
                 bool deviceLost = false;
                 {
@@ -3062,6 +3165,12 @@ namespace VKIntox
                     hasToasts = false;
                 if (softDisabled && passThroughDevice->imguiOverlay && !deviceLost)
                     hasToasts = passThroughDevice->imguiOverlay->hasPendingToasts();
+            }
+            if (queue == passThroughDevice->dlss5OpticalFlowQueue)
+            {
+                // An optical-only queue is not a graphics presentation path.
+                std::lock_guard queueLock(passThroughDevice->dlss5OpticalFlowQueueMutex);
+                return passThroughDevice->vkd.QueuePresentKHR(queue, pPresentInfo);
             }
 
             if (softDisabled)
@@ -3729,9 +3838,10 @@ namespace VKIntox
             {
                 try
                 {
+                    bool frameCommandsChanged = false;
                     for (auto& effect : logicalSwapchain->effects)
-                        effect->updateFrame(index);
-                    if (nativeCaptureEnabled())
+                        frameCommandsChanged |= effect->updateFrame(index);
+                    if (nativeCaptureEnabled() || frameCommandsChanged)
                     {
                         // Updating ordinary descriptor bindings invalidates the
                         // executable CB. Re-record only this fence-safe image.
@@ -3774,6 +3884,8 @@ namespace VKIntox
 
             VkResult vr = VK_SUCCESS;
             {
+                std::unique_lock opticalLock(logicalDevice->dlss5OpticalFlowQueueMutex, std::defer_lock);
+                if (logicalDevice->dlss5OpticalFlowQueue) opticalLock.lock();
                 // serialized with the destroy hooks and the drain: between this
                 // check and the submit the render thread must not be able to
                 // retire the generation these buffers reference
@@ -3786,6 +3898,28 @@ namespace VKIntox
                 {
                     bypassDepthForPresent = true;
                     break;
+                }
+
+                if (presentEffectSnapshot)
+                {
+                    for (auto& effect : logicalSwapchain->effects)
+                    {
+                        vr = effect->prepareSubmission(index, frameSerial, submitInfo);
+                        if (vr != VK_SUCCESS) break;
+                    }
+                    // Auxiliary submissions may already have consumed the app's
+                    // waits. Never attempt an unsynchronized passthrough on failure.
+                    if (vr != VK_SUCCESS)
+                    {
+                        // No final fence was submitted for partially queued work.
+                        if (logicalDevice->dlss5OpticalFlowQueue && vr != VK_ERROR_DEVICE_LOST)
+                        {
+                            logicalDevice->vkd.QueueWaitIdle(logicalDevice->queue);
+                            logicalDevice->vkd.QueueWaitIdle(logicalDevice->dlss5OpticalFlowQueue);
+                        }
+                        reportDeviceLostDiagnostics(logicalDevice, logicalDevice->queue, "effect auxiliary submit", vr);
+                        return vr;
+                    }
                 }
 
                 // Signal this image's fence so we can safely update its
@@ -3819,6 +3953,13 @@ namespace VKIntox
                 vr = logicalDevice->vkd.QueueSubmit(logicalDevice->queue, 1, &submitInfo, effectFence);
                 if (vr == VK_SUCCESS && index < logicalSwapchain->effectSubmitFenceUsed.size())
                     logicalSwapchain->effectSubmitFenceUsed[index] = true;
+                if (vr != VK_SUCCESS && vr != VK_ERROR_DEVICE_LOST && logicalDevice->dlss5OpticalFlowQueue)
+                {
+                    // The OF prepass may have succeeded while this fenced final
+                    // submission failed; retire its work before any teardown.
+                    logicalDevice->vkd.QueueWaitIdle(logicalDevice->queue);
+                    logicalDevice->vkd.QueueWaitIdle(logicalDevice->dlss5OpticalFlowQueue);
+                }
             }
             if (vr != VK_SUCCESS)
             {
@@ -5756,6 +5897,17 @@ extern "C"
     VK_SHADE_EXPORT PFN_vkVoidFunction VKAPI_CALL VKIntox_GetDeviceProcAddr(VkDevice device, const char* pName)
     {
         VKIntox::initConfigs();
+        if (auto optical = VKIntox::opticalQueueIntercept(pName))
+        {
+            if (!device) return nullptr;
+            auto native = VKIntox::nativeIntercept(pName);
+            VKIntox::scoped_lock lock(VKIntox::globalLock);
+            auto found = VKIntox::deviceMap.find(VKIntox::GetKey(device));
+            // Preserve null for unsupported/disabled extension entry points.
+            if (found == VKIntox::deviceMap.end()
+                || !found->second->vkd.GetDeviceProcAddr(device, pName)) return nullptr;
+            return native ? native : optical;
+        }
         if (auto native = VKIntox::nativeIntercept(pName))
             return native;
 
@@ -5781,6 +5933,16 @@ extern "C"
     VK_SHADE_EXPORT PFN_vkVoidFunction VKAPI_CALL VKIntox_GetInstanceProcAddr(VkInstance instance, const char* pName)
     {
         VKIntox::initConfigs();
+        if (auto optical = VKIntox::opticalQueueIntercept(pName))
+        {
+            if (!instance) return nullptr;
+            auto native = VKIntox::nativeIntercept(pName);
+            VKIntox::scoped_lock lock(VKIntox::globalLock);
+            auto found = VKIntox::instanceDispatchMap.find(VKIntox::GetKey(instance));
+            if (found == VKIntox::instanceDispatchMap.end()
+                || !found->second.GetInstanceProcAddr(instance, pName)) return nullptr;
+            return native ? native : optical;
+        }
         if (auto native = VKIntox::nativeIntercept(pName))
             return native;
 

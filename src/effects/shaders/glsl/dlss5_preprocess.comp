@@ -2,14 +2,14 @@
 #extension GL_EXT_shader_explicit_arithmetic_types : require
 #extension GL_GOOGLE_include_directive : require
 #include "common.glsl"
+#include "dlss5_common.glsl"
 // Feature arithmetic and noise sequence from OpenDLSS-NR (MIT).
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(std430, binding = 0) readonly buffer Source { uint pixels[]; };
-layout(std430, binding = 1) readonly buffer Parameters {
-    uint width, height, fullWidth, fullHeight;
-    uint bgra, seed;
-    float intensity, localTone, localStructure, skinStructure;
-} p;
+layout(std430, binding = 2) readonly buffer Reprojection {
+    uint accepted, candidates, pad1, pad2;
+    vec4 samples[];
+} reprojection;
 layout(std430, binding = 7) writeonly buffer Features { float features[]; };
 float hashUniform(uint value) {
     uint mixed = value;
@@ -48,12 +48,23 @@ void main() {
     for (uint c = 0u; c < 3u; ++c)
         centred[c] = roundF16(roundF16(roundF16(rgba[c]) - 0.5) * 0.125);
     vec3 noise = gaussian3(id.x, id.y, p.seed);
+    vec3 history = centred;
+    // Explicit guards keep first/reset frames away from uninitialized history.
+    if (dlss5TemporalEnabled()) {
+        if (dlss5FrameAccepted(reprojection.accepted, reprojection.candidates)) {
+            uint pixel = mirror(id.y, p.height) * p.width + mirror(id.x, p.width);
+            vec4 previous = reprojection.samples[pixel];
+            if (dlss5SampleAccepted(previous)) {
+                for (uint c = 0u; c < 3u; ++c)
+                    history[c] = roundF16(roundF16(roundF16(previous[c]) - 0.5) * 0.125);
+            }
+        }
+    }
     uint base = (id.y * p.fullWidth + id.x) * 16u;
     for (uint c = 0u; c < 3u; ++c) {
         features[base + c] = noise[c];
         features[base + 4u + c] = centred[c];
-        // No engine motion vectors: first-frame input, never fabricated history.
-        features[base + 7u + c] = centred[c];
+        features[base + 7u + c] = history[c];
     }
     features[base + 3u] = 1.0;
     features[base + 10u] = 0.0;

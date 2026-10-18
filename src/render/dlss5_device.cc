@@ -36,9 +36,36 @@ namespace VKIntox
         }
     }
 
+    Dlss5OpticalQueue selectDlss5OpticalQueue(const std::vector<VkQueueFamilyProperties>& families,
+                                             const VkDeviceCreateInfo& application)
+    {
+        Dlss5OpticalQueue shared;
+        for (uint32_t family = 0; family < families.size(); ++family)
+        {
+            if (!(families[family].queueFlags & VK_QUEUE_OPTICAL_FLOW_BIT_NV) || !families[family].queueCount)
+                continue;
+            bool requested = false, ordinaryQueue = false;
+            for (uint32_t i = 0; i < application.queueCreateInfoCount; ++i)
+            {
+                const auto& queue = application.pQueueCreateInfos[i];
+                if (queue.queueFamilyIndex != family) continue;
+                requested = true;
+                ordinaryQueue |= queue.flags == 0 && queue.queueCount != 0;
+            }
+            if (!requested) return {family, false};
+            // The graphics prepass must not wait on an optical submission queued
+            // behind that same graphics work. Only share a separate optical engine.
+            if (ordinaryQueue && !(families[family].queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT))
+                && shared.family == VK_QUEUE_FAMILY_IGNORED)
+                shared = {family, true};
+        }
+        return shared;
+    }
+
     struct Dlss5DeviceFeatures::State
     {
         vk::DeviceRequirements required;
+        VkPhysicalDeviceOpticalFlowFeaturesNV opticalFlow{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPTICAL_FLOW_FEATURES_NV};
         std::vector<std::unique_ptr<std::byte[]>> copies;
         std::string error;
     };
@@ -46,12 +73,14 @@ namespace VKIntox
     Dlss5DeviceFeatures::Dlss5DeviceFeatures() : state(std::make_unique<State>()) {}
     Dlss5DeviceFeatures::~Dlss5DeviceFeatures() = default;
     const std::string& Dlss5DeviceFeatures::error() const { return state->error; }
+    bool Dlss5DeviceFeatures::opticalFlowEnabled() const { return state->opticalFlow.opticalFlow == VK_TRUE; }
 
     bool Dlss5DeviceFeatures::prepare(VkPhysicalDevice physical, uint32_t instanceVersion,
                                      PFN_vkGetPhysicalDeviceFeatures2 queryFeatures,
                                      const VkPhysicalDeviceProperties& properties,
                                      const std::vector<VkExtensionProperties>& available,
-                                     VkDeviceCreateInfo& info, std::vector<const char*>& extensions)
+                                     VkDeviceCreateInfo& info, std::vector<const char*>& extensions,
+                                     bool requestOpticalFlow)
     {
         auto refuse = [&](std::string reason) { state->error = std::move(reason); return false; };
         if (properties.vendorID != 0x10de)
@@ -76,6 +105,25 @@ namespace VKIntox
             const auto [begin, end] = deviceFeatureRange(need->sType);
             if (!end || !supportsBits(have, need, begin, end))
                 return refuse("DLSS5 device feature unavailable (sType=" + std::to_string(need->sType) + ")");
+        }
+
+        // Optical flow is optional: an unavailable motion engine must not prevent
+        // ordinary, history-free neural rendering or alter application features.
+        if (requestOpticalFlow && std::any_of(available.begin(), available.end(), [](const auto& ext) {
+                return std::strcmp(ext.extensionName, VK_NV_OPTICAL_FLOW_EXTENSION_NAME) == 0;
+            }))
+        {
+            VkPhysicalDeviceOpticalFlowFeaturesNV flow{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPTICAL_FLOW_FEATURES_NV};
+            VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+            query.pNext = &flow;
+            queryFeatures(physical, &query);
+            if (flow.opticalFlow)
+            {
+                state->opticalFlow.opticalFlow = VK_TRUE;
+                state->opticalFlow.pNext = req.features.pNext;
+                req.features.pNext = &state->opticalFlow;
+                req.extensions.push_back(VK_NV_OPTICAL_FLOW_EXTENSION_NAME);
+            }
         }
 
         if (info.pEnabledFeatures)

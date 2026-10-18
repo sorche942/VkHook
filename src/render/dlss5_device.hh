@@ -6,6 +6,16 @@
 
 namespace VKIntox
 {
+    struct Dlss5OpticalQueue
+    {
+        uint32_t family = VK_QUEUE_FAMILY_IGNORED;
+        bool shared = false;
+    };
+    // Prefer a private family. Proton may already reserve the dedicated optical
+    // family; its ordinary queue zero can be shared with host synchronization.
+    Dlss5OpticalQueue selectDlss5OpticalQueue(const std::vector<VkQueueFamilyProperties>& families,
+                                             const VkDeviceCreateInfo& application);
+
     // Owns a copied pNext chain through the downstream vkCreateDevice call.
     // Failure leaves the application's create info and extensions unchanged.
     class Dlss5DeviceFeatures
@@ -17,8 +27,10 @@ namespace VKIntox
                      PFN_vkGetPhysicalDeviceFeatures2 queryFeatures,
                      const VkPhysicalDeviceProperties& properties,
                      const std::vector<VkExtensionProperties>& available,
-                     VkDeviceCreateInfo& info, std::vector<const char*>& extensions);
+                     VkDeviceCreateInfo& info, std::vector<const char*>& extensions,
+                     bool requestOpticalFlow);
         const std::string& error() const;
+        bool opticalFlowEnabled() const;
     private:
         struct State;
         std::unique_ptr<State> state;

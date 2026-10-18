@@ -48,7 +48,7 @@ if dlss5_available
         input : get_option('dlss5_vulkan_registry'),
         output : 'dlss5_device_chain.inc',
         command : [opendlss_nr_python, files('../scripts/generate-dlss5-device-chain.py'), '@INPUT@', '@OUTPUT@'])
-    dlss5_sources += [files('effects/effect_dlss5.cc', 'render/dlss5_device.cc'), dlss5_chain]
+    dlss5_sources += [files('effects/effect_dlss5.cc', 'render/dlss5_device.cc', 'render/dlss5_optical_flow.cc'), dlss5_chain]
     dlss5_dependencies += opendlss_nr_dep
     dlss5_args += '-DVKINTOX_DLSS5=1'
     dlss5_assets += opendlss_nr_assets
@@ -348,6 +348,16 @@ if dlss5_available
         dependencies : [opendlss_nr_dep],
         include_directories : [core_inc, render_inc, source_inc])
     test('DLSS5 device feature preservation', dlss5_device_tests)
+    dlss5_temporal_gpu = executable('vkintox-dlss5-temporal-gpu-smoke',
+        'tests/dlss5_temporal_gpu_smoke.cc',
+        'render/dlss5_device.cc',
+        'render/dlss5_optical_flow.cc',
+        dlss5_chain,
+        dependencies : [opendlss_nr_dep, libdl_dep],
+        include_directories : [core_inc, render_inc, effects_inc, source_inc],
+        link_depends : dlss5_assets)
+    test('DLSS5 optical-flow temporal GPU', dlss5_temporal_gpu,
+        args : [opendlss_nr_build_shader_dir], timeout : 120)
 endif
 
 # Link the production recorder and fake only Vulkan dispatch. Section GC keeps

@@ -1,0 +1,197 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "dlss5_common.glsl"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(std430, binding = 0) readonly buffer Source { uint pixels[]; } current;
+layout(std430, binding = 2) readonly buffer PreviousSource { uint pixels[]; } previous;
+layout(std430, binding = 3) readonly buffer PreviousHistory { vec4 pixels[]; } history;
+layout(std430, binding = 4) readonly buffer ForwardFlow { uint vectors[]; } forwardFlow;
+layout(std430, binding = 5) readonly buffer BackwardFlow { uint vectors[]; } backwardFlow;
+layout(std430, binding = 6) readonly buffer FlowCost { uint words[]; } flowCost;
+// Host clears the 16-byte header before dispatch, then barriers the entire buffer
+// before preprocess/composite. History is tightly packed over the valid extent.
+layout(std430, binding = 7) buffer Reprojection {
+    uint accepted, candidates, pad1, pad2;
+    vec4 samples[];
+} reprojection;
+shared uvec2 groupCounts[64];
+
+vec3 unpackColor(uint value) {
+    vec4 rgba = unpackUnorm4x8(value);
+    return p.bgra != 0u ? rgba.bgr : rgba.rgb;
+}
+
+// NVIDIA R16G16_SFIXED5_NV: signed S10.5 displacement in source pixels,
+// not normalized UVs and not the 4x4 output-grid units.
+vec2 unpackFlow(uint value) {
+    int x = int(value << 16u) >> 16;
+    int y = int(value) >> 16;
+    return vec2(x, y) * (1.0 / 32.0);
+}
+
+uint flowIndex(ivec2 position) {
+    return uint(position.y) * p.flowWidth + uint(position.x);
+}
+
+float costAt(uint index) {
+    return float((flowCost.words[index / 4u] >> ((index % 4u) * 8u)) & 255u);
+}
+
+vec2 sampleFlow(vec2 pixel, bool reverse, out float cost) {
+    // Hardware grid4 cells are centred at pixel-space (2, 2), (6, 2), ... .
+    vec2 grid = clamp((pixel + 0.5) * 0.25 - 0.5,
+                      vec2(0.0), vec2(p.flowWidth - 1u, p.flowHeight - 1u));
+    ivec2 low = ivec2(floor(grid));
+    ivec2 high = min(low + 1, ivec2(p.flowWidth, p.flowHeight) - 1);
+    vec2 f = fract(grid);
+    uint a = flowIndex(low);
+    uint b = flowIndex(ivec2(high.x, low.y));
+    uint c = flowIndex(ivec2(low.x, high.y));
+    uint d = flowIndex(high);
+    vec2 va, vb, vc, vd;
+    cost = 0.0;
+    if (reverse) {
+        va = unpackFlow(backwardFlow.vectors[a]);
+        vb = unpackFlow(backwardFlow.vectors[b]);
+        vc = unpackFlow(backwardFlow.vectors[c]);
+        vd = unpackFlow(backwardFlow.vectors[d]);
+    } else {
+        va = unpackFlow(forwardFlow.vectors[a]);
+        vb = unpackFlow(forwardFlow.vectors[b]);
+        vc = unpackFlow(forwardFlow.vectors[c]);
+        vd = unpackFlow(forwardFlow.vectors[d]);
+        // Reject a footprint touching unreliable flow rather than averaging its cost away.
+        cost = max(max(costAt(a), costAt(b)), max(costAt(c), costAt(d)));
+    }
+    return mix(mix(va, vb, f.x), mix(vc, vd, f.x), f.y);
+}
+
+vec3 previousColor(vec2 position) {
+    ivec2 low = ivec2(floor(position));
+    ivec2 high = min(low + 1, ivec2(p.width, p.height) - 1);
+    vec2 f = fract(position);
+    vec3 a = unpackColor(previous.pixels[uint(low.y) * p.width + uint(low.x)]);
+    vec3 b = unpackColor(previous.pixels[uint(low.y) * p.width + uint(high.x)]);
+    vec3 c = unpackColor(previous.pixels[uint(high.y) * p.width + uint(low.x)]);
+    vec3 d = unpackColor(previous.pixels[uint(high.y) * p.width + uint(high.x)]);
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+
+vec3 boundedHistory(ivec2 position, inout bool valid) {
+    vec3 value = history.pixels[uint(position.y) * p.width + uint(position.x)].rgb;
+    if (!dlss5Finite(value)) {
+        valid = false;
+        return vec3(0.0);
+    }
+    return clamp(value, vec3(0.0), vec3(1.0));
+}
+
+vec3 bilinearHistory(vec2 position, inout bool valid) {
+    // Positions use texel centres at 0.5, as in textureLod with clamp-to-edge.
+    vec2 pixel = clamp(position - 0.5, vec2(0.0), vec2(p.width - 1u, p.height - 1u));
+    ivec2 low = ivec2(floor(pixel));
+    ivec2 high = min(low + 1, ivec2(p.width, p.height) - 1);
+    vec2 f = fract(pixel);
+    vec3 a = boundedHistory(low, valid);
+    vec3 b = boundedHistory(ivec2(high.x, low.y), valid);
+    vec3 c = boundedHistory(ivec2(low.x, high.y), valid);
+    vec3 d = boundedHistory(high, valid);
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+
+// Five-tap Catmull-Rom from OpenDLSS-NR demo/shaders/nr_common.glsl (MIT).
+// The four axis taps and centre use bilinear-weight folding; unlike repeatedly
+// feeding back bilinear history, this preserves moving detail. Bound every tap
+// and the reconstruction so negative cubic lobes cannot amplify color overshoot.
+vec3 reconstructHistory(vec2 pixel, inout bool valid) {
+    vec2 extent = vec2(p.width, p.height);
+    vec2 position = pixel + 0.5;
+    vec2 base = floor(position - 0.5) + 0.5;
+    vec2 f = clamp(position - base, vec2(0.0), vec2(1.0));
+    vec2 square = f * f;
+    vec2 cube = f * square;
+    vec2 w0 = fma(f + cube, vec2(-0.5), square);
+    vec2 w1 = (cube * 1.5 - square * 2.5) + 1.0;
+    vec2 w3 = (cube - square) * 0.5;
+    vec2 w2 = ((1.0 - w0) - w1) - w3;
+    vec2 middle = w1 + w2;
+    vec2 low = clamp(base - 1.0, vec2(0.5), extent - 0.5);
+    vec2 center = clamp(base + w2 / middle, vec2(0.5), extent - 0.5);
+    vec2 high = clamp(base + 2.0, vec2(0.5), extent - 0.5);
+    vec3 left = bilinearHistory(vec2(low.x, center.y), valid);
+    vec3 top = bilinearHistory(vec2(center.x, low.y), valid);
+    vec3 mid = bilinearHistory(center, valid);
+    vec3 bottom = bilinearHistory(vec2(center.x, high.y), valid);
+    vec3 right = bilinearHistory(vec2(high.x, center.y), valid);
+    float a = w0.x * middle.y;
+    float b = w0.y * middle.x;
+    float c = middle.x * middle.y;
+    float d = w3.y * middle.x;
+    float e = w3.x * middle.y;
+    vec3 value = fma(left, vec3(a), top * b);
+    value = fma(mid, vec3(c), value);
+    value = fma(bottom, vec3(d), value);
+    value = fma(right, vec3(e), value);
+    value *= 1.0 / (e + (d + (c + (a + b))));
+    valid = valid && dlss5Finite(value);
+    return clamp(value, vec3(0.0), vec3(1.0));
+}
+
+vec4 reproject(uvec2 id, out bool candidate) {
+    candidate = false;
+    // No flow, previous input or previous history access on first/reset frames.
+    if (!dlss5TemporalEnabled() || p.flowWidth == 0u || p.flowHeight == 0u)
+        return vec4(0.0);
+    vec2 pixel = vec2(id);
+    float cost;
+    vec2 forward = sampleFlow(pixel, false, cost);
+    vec2 position = pixel + forward; // Current -> previous, in full-resolution pixels.
+    if (any(isnan(position)) || any(isinf(position)) || cost >= 64.0 ||
+        any(lessThan(position, vec2(0.0))) ||
+        any(greaterThan(position, vec2(p.width - 1u, p.height - 1u))))
+        return vec4(0.0);
+    float unusedCost;
+    vec2 backward = sampleFlow(position, true, unusedCost);
+    float disagreement = length(forward + backward);
+    // Allow subpixel hardware uncertainty, not a second surface's velocity.
+    float tolerance = min(2.0, 0.75 + 0.025 * length(forward));
+    if (isnan(disagreement) || isinf(disagreement) || disagreement >= tolerance)
+        return vec4(0.0);
+    candidate = true;
+    vec3 color = unpackColor(current.pixels[id.y * p.width + id.x]);
+    vec3 difference = abs(color - previousColor(position));
+    float mismatch = max(difference.r, max(difference.g, difference.b));
+    if (!dlss5Finite(difference) || mismatch >= 0.10)
+        return vec4(0.0);
+    float confidence = (1.0 - smoothstep(8.0, 64.0, cost)) *
+                       (1.0 - smoothstep(0.25, tolerance, disagreement)) *
+                       (1.0 - smoothstep(0.02, 0.10, mismatch));
+    if (confidence < 0.05) return vec4(0.0);
+    bool valid = true;
+    vec3 value = reconstructHistory(position, valid);
+    return valid ? vec4(value, confidence) : vec4(0.0);
+}
+
+void main() {
+    uvec2 id = gl_GlobalInvocationID.xy;
+    uint lane = gl_LocalInvocationIndex;
+    uvec2 counts = uvec2(0u);
+    if (id.x < p.width && id.y < p.height) {
+        bool candidate;
+        vec4 value = reproject(id, candidate);
+        reprojection.samples[id.y * p.width + id.x] = value;
+        counts = uvec2(value.a > 0.0 ? 1u : 0u, candidate ? 1u : 0u);
+    }
+    // Out-of-range invocations participate too (odd/non-workgroup-sized images).
+    groupCounts[lane] = counts;
+    barrier();
+    for (uint stride = 32u; stride != 0u; stride >>= 1u) {
+        if (lane < stride) groupCounts[lane] += groupCounts[lane + stride];
+        barrier();
+    }
+    if (lane == 0u) {
+        if (groupCounts[0].x != 0u) atomicAdd(reprojection.accepted, groupCounts[0].x);
+        if (groupCounts[0].y != 0u) atomicAdd(reprojection.candidates, groupCounts[0].y);
+    }
+}
