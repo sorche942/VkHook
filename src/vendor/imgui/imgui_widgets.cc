@@ -794,42 +794,14 @@ bool ImGui::ButtonEx(const char* label, const ImVec2& size_arg, ImGuiButtonFlags
     bool hovered, held;
     bool pressed = ButtonBehavior(bb, id, &hovered, &held, flags);
 
-    // VKIntox M3 Expressive: a plain Button() is a filled button. The container
-    // is `primary`, the label `on-primary`, the state layer inherits the label
-    // colour, and the corners morph from `corner-full` to `corner-small` while
-    // pressed — the shape-morphing move that defines the expressive update.
-    // ImGui::M3Button() covers the other four flavours. The morph runs on the
-    // expressive spatial spring off the pressed state, which is the same motion
-    // path the switch uses.
-    const float morph = ImGuiM3SpringStepSpatialSlow(id ^ 0x42544E, held ? 1.0f : 0.0f);
-    const float rest_radius = ImGuiM3PillRadius(size, ImGuiM3Radius(ImGuiM3Shape_Full));
-    const float press_radius = ImGuiM3Radius(ImGuiM3Shape_ExtraSmall);
-    const float radius = rest_radius + (press_radius - rest_radius) * morph;
-    const ImGuiM3ShapeRounding rounding{ radius, radius, radius, radius };
-    const bool disabled = (g.LastItemData.ItemFlags & ImGuiItemFlags_Disabled) != 0;
-    const ImU32 container = disabled ? ImGuiM3StateLayerU32(ImGuiM3Role_Primary, ImGuiM3State_Disabled)
-                                     : ImGuiM3ColorU32(ImGuiM3Role_Primary);
-    ImGuiM3DrawContainer(window->DrawList, bb, rounding, container, 0, 0.0f);
-    if (!disabled)
-    {
-        const ImGuiM3State state = (hovered && held) ? ImGuiM3State_Pressed : hovered ? ImGuiM3State_Hovered : ImGuiM3State_Enabled;
-        ImGuiM3DrawStateLayer(window->DrawList, bb, rounding, ImGuiM3Role_OnPrimary, state);
-    }
+    // Render
+    const ImU32 col = GetColorU32((held && hovered) ? ImGuiCol_ButtonActive : hovered ? ImGuiCol_ButtonHovered : ImGuiCol_Button);
     RenderNavCursor(bb, id);
+    RenderFrame(bb.Min, bb.Max, col, true, style.FrameRounding);
 
     if (g.LogEnabled)
         LogSetNextTextDecoration("[", "]");
-    PushStyleColor(ImGuiCol_Text, disabled ? ImGuiM3StateLayerU32(ImGuiM3Role_OnPrimary, ImGuiM3State_Disabled)
-                                           : ImGuiM3ColorU32(ImGuiM3Role_OnPrimary));
-    // M3 button labels are label-large (medium weight); body text stays regular.
-    ImFont* label_font = ImGuiM3FontMedium();
-    if (label_font)
-        PushFont(label_font, GetFontSize());
-    const ImVec2 label_size_weighted = label_font ? CalcTextSize(label, NULL, true) : label_size;
-    RenderTextClipped(bb.Min + style.FramePadding, bb.Max - style.FramePadding, label, NULL, &label_size_weighted, style.ButtonTextAlign, &bb);
-    if (label_font)
-        PopFont();
-    PopStyleColor();
+    RenderTextClipped(bb.Min + style.FramePadding, bb.Max - style.FramePadding, label, NULL, &label_size, style.ButtonTextAlign, &bb);
 
     // Automatically close popups
     //if (pressed && !(flags & ImGuiButtonFlags_DontClosePopups) && (window->Flags & ImGuiWindowFlags_Popup))
@@ -1136,51 +1108,16 @@ bool ImGui::ScrollbarEx(const ImRect& bb_frame, ImGuiID id, ImGuiAxis axis, ImS6
     }
 
     // Render
-    // VKIntox M3: a trackless pill thumb that is always visible. It is bold at
-    // rest (on-surface-variant), darkens under the pointer, and turns `primary`
-    // while dragging. There is no background track.
-    //
-    // If nearly everything is on screen the thumb would be a full-height sliver
-    // that adds noise without helping; skip it until the overflow is meaningful.
-    if (size_contents_v > 0 && (float)size_visible_v / (float)size_contents_v > 0.97f)
-        return held;
+    const ImU32 bg_col = GetColorU32(ImGuiCol_ScrollbarBg);
+    const ImU32 grab_col = GetColorU32(held ? ImGuiCol_ScrollbarGrabActive : hovered ? ImGuiCol_ScrollbarGrabHovered : ImGuiCol_ScrollbarGrab, alpha);
+    window->DrawList->AddRectFilled(bb_frame.Min, bb_frame.Max, bg_col, window->WindowRounding, draw_rounding_flags);
     ImRect grab_rect;
     if (axis == ImGuiAxis_X)
         grab_rect = ImRect(ImLerp(bb.Min.x, bb.Max.x, grab_v_norm), bb.Min.y, ImLerp(bb.Min.x, bb.Max.x, grab_v_norm) + grab_h_pixels, bb.Max.y);
     else
         grab_rect = ImRect(bb.Min.x, ImLerp(bb.Min.y, bb.Max.y, grab_v_norm), bb.Max.x, ImLerp(bb.Min.y, bb.Max.y, grab_v_norm) + grab_h_pixels);
+    window->DrawList->AddRectFilled(grab_rect.Min, grab_rect.Max, grab_col, style.ScrollbarRounding);
 
-    // 8dp at rest, 12dp under the pointer. The previous 4/6dp thumb was easy to
-    // miss entirely, which read as "no scrollbar". Menus take a slimmer pair so
-    // the shorter popups don't lose a chunk of width, still widening on hover.
-    const ImGuiM3Metrics& m = ImGuiM3GetMetrics();
-    const bool in_menu = (window->Flags & ImGuiWindowFlags_Popup) != 0;
-    const float thin = (in_menu ? 6.0f : 8.0f) * m.density;
-    const float thick = (in_menu ? 9.0f : 12.0f) * m.density;
-    const float grow = ImGuiM3SpringStepEffectsFast(id ^ 0x534342, (hovered || held) ? 1.0f : 0.0f);
-    const float thickness = ImLerp(thin, thick, ImSaturate(grow)) * alpha;
-
-    ImRect thumb = grab_rect;
-    if (axis == ImGuiAxis_X)
-    {
-        thumb.Min.y += (bb_frame.GetHeight() - thickness) * 0.5f;
-        thumb.Max.y -= (bb_frame.GetHeight() - thickness) * 0.5f;
-    }
-    else
-    {
-        thumb.Min.x += (bb_frame.GetWidth() - thickness) * 0.5f;
-        thumb.Max.x -= (bb_frame.GetWidth() - thickness) * 0.5f;
-    }
-
-    const ImU32 grab_col = held ? ImGuiM3ColorU32(ImGuiM3Role_Primary)
-                                : hovered ? ImGuiM3ColorU32(ImGuiM3Role_OnSurface)
-                                          : ImGuiM3ColorU32(ImGuiM3Role_OnSurfaceVariant);
-    if (thumb.GetWidth() > 0.0f && thumb.GetHeight() > 0.0f)
-        ImGuiM3PathRoundedRect(window->DrawList, thumb, ImGuiM3ShapeRounding{ thickness, thickness, thickness, thickness }, grab_col);
-
-    (void)style.ScrollbarRounding;
-    (void)window->WindowRounding;
-    (void)draw_rounding_flags;
     return held;
 }
 
@@ -1335,68 +1272,21 @@ bool ImGui::Checkbox(const char* label, bool* v)
     const bool mixed_value = (g.LastItemData.ItemFlags & ImGuiItemFlags_MixedValue) != 0;
     if (is_visible)
     {
-        // VKIntox M3: the checkbox is an 18dp box with a 2dp radius, an outline
-        // when unchecked, a `primary` fill plus `on-primary` check when checked,
-        // and a 40dp state layer that covers the whole tap target. The fill grows
-        // on the expressive fast spatial spring so a check appears to bloom.
-        const ImGuiM3Metrics& m = ImGuiM3GetMetrics();
-        const float box = m.checkbox_size * m.density;
-        const float radius = m.checkbox_radius * m.density;
-        const float outline_w = m.checkbox_outline * m.density;
-        // Centre the M3-sized box inside ImGui's frame square.
-        const ImVec2 box_min(check_bb.GetCenter().x - box * 0.5f, check_bb.GetCenter().y - box * 0.5f);
-        const ImRect box_bb(box_min, box_min + ImVec2(box, box));
-
-        const ImU32 fill_col = *v || mixed_value ? ImGuiM3ColorU32(ImGuiM3Role_Primary)
-                                                 : ImGuiM3StateLayerU32(ImGuiM3Role_SurfaceContainerHighest, ImGuiM3State_Disabled);
-        const ImU32 outline_col = *v || mixed_value ? ImGuiM3ColorU32(ImGuiM3Role_SurfaceTint) : ImGuiM3ColorU32(ImGuiM3Role_Outline);
-
-        // The state layer is a 40dp disc behind the box, per the M3 checkbox spec.
-        // The interaction rectangle includes the label, but the 40dp state
-        // layer belongs to the control itself. Centering it on total_bb made the
-        // hover highlight visibly drift right whenever the label was long.
-        const ImVec2 layer_center = check_bb.GetCenter();
-        const float layer_r = m.state_layer_size * m.density * 0.5f;
-        window->DrawList->AddCircleFilled(layer_center, layer_r,
-                                          ImGuiM3StateLayerU32(ImGuiM3Role_OnSurface, (hovered && held) ? ImGuiM3State_Pressed : hovered ? ImGuiM3State_Hovered : ImGuiM3State_Enabled),
-                                          window->DrawList->_CalcCircleAutoSegmentCount(layer_r));
-
-        // Pressed checkboxes use a flat, slightly larger box: M3's pressed shape.
-        const float press = ImGuiM3SpringStepSpatialDefault(id ^ 0x43484B, (hovered && held) ? 1.0f : 0.0f);
-        const float press_extra = 2.0f * m.density * press;
-        const ImRect grow(box_bb.Min - ImVec2(press_extra, press_extra), box_bb.Max + ImVec2(press_extra, press_extra));
-        ImGuiM3DrawContainer(window->DrawList, grow, ImGuiM3ShapeRounding{ radius, radius, radius, radius }, fill_col, outline_col, outline_w);
-
-        const ImU32 check_col = *v || mixed_value ? ImGuiM3ColorU32(ImGuiM3Role_OnPrimary) : ImGuiM3ColorU32(ImGuiM3Role_Primary);
+        RenderNavCursor(total_bb, id);
+        RenderFrame(check_bb.Min, check_bb.Max, GetColorU32((held && hovered) ? ImGuiCol_FrameBgActive : hovered ? ImGuiCol_FrameBgHovered : ImGuiCol_FrameBg), true, style.FrameRounding);
+        ImU32 check_col = GetColorU32(ImGuiCol_CheckMark);
         if (mixed_value)
         {
             // Undocumented tristate/mixed/indeterminate checkbox (#2644)
             // This may seem awkwardly designed because the aim is to make ImGuiItemFlags_MixedValue supported by all widgets (not just checkbox)
-            const ImVec2 pad(ImMax(1.0f, IM_TRUNC(box / 3.6f)), ImMax(1.0f, IM_TRUNC(box / 3.6f)));
-            ImGuiM3PathRoundedRect(window->DrawList, ImRect(grow.Min + pad, grow.Max - pad), ImGuiM3ShapeRounding{ 0, 0, 0, 0 }, check_col);
+            ImVec2 pad(ImMax(1.0f, IM_TRUNC(square_sz / 3.6f)), ImMax(1.0f, IM_TRUNC(square_sz / 3.6f)));
+            window->DrawList->AddRectFilled(check_bb.Min + pad, check_bb.Max - pad, check_col, style.FrameRounding);
         }
         else if (*v)
         {
-            // M3's check is a crisp, rounded 2dp stroke. Draw the Material
-            // Symbols `check` glyph rather than two hard line segments.
-            static const char kCheckGlyph[] = "\xEE\x97\x8A";
-            ImFont* icon = ImGuiM3IconFont();
-            if (icon)
-            {
-                const float px = box * 1.15f;
-                ImGuiM3DrawIcon(window->DrawList, kCheckGlyph, grow, px, check_col);
-            }
-            else
-            {
-                const float s = box * 0.30f;
-                const ImVec2 a = grow.GetCenter() + ImVec2(-s * 0.95f, 0.0f);
-                const ImVec2 b = grow.GetCenter() + ImVec2(-s * 0.30f, s * 0.62f);
-                const ImVec2 c = grow.GetCenter() + ImVec2(s * 0.95f, -s * 0.62f);
-                window->DrawList->AddLine(a, b, check_col, 2.0f * m.density);
-                window->DrawList->AddLine(b, c, check_col, 2.0f * m.density);
-            }
+            const float pad = ImMax(1.0f, IM_TRUNC(square_sz / 6.0f));
+            RenderCheckMark(window->DrawList, check_bb.Min + ImVec2(pad, pad), check_col, square_sz - pad * 2.0f);
         }
-        RenderNavCursor(total_bb, id);
     }
     const ImVec2 label_pos = ImVec2(check_bb.Max.x + style.ItemInnerSpacing.x, check_bb.Min.y + style.FramePadding.y);
     if (g.LogEnabled)
@@ -1477,42 +1367,27 @@ bool ImGui::RadioButton(const char* label, bool active)
     ImVec2 center = check_bb.GetCenter();
     center.x = IM_ROUND(center.x);
     center.y = IM_ROUND(center.y);
+    const float radius = (square_sz - 1.0f) * 0.5f;
 
     bool hovered, held;
     bool pressed = ButtonBehavior(total_bb, id, &hovered, &held);
     if (pressed)
         MarkItemEdited(id);
 
-    // VKIntox M3: 20dp radio, a `primary` dot inside a `primary` ring when
-    // selected, `outline` otherwise, plus the 40dp state layer behind it.
-    const ImGuiM3Metrics& m = ImGuiM3GetMetrics();
-    const float outer = m.radio_size * m.density;
-    const float inner = m.radio_inner * m.density;
-    center = check_bb.GetCenter();
-    const float radius = outer * 0.5f;
+    RenderNavCursor(total_bb, id);
     const int num_segment = window->DrawList->_CalcCircleAutoSegmentCount(radius);
-
-    const ImVec2 layer_center = check_bb.GetCenter();
-    const float layer_r = m.state_layer_size * m.density * 0.5f;
-    window->DrawList->AddCircleFilled(layer_center, layer_r,
-                                      ImGuiM3StateLayerU32(ImGuiM3Role_OnSurface, (hovered && held) ? ImGuiM3State_Pressed : hovered ? ImGuiM3State_Hovered : ImGuiM3State_Enabled),
-                                      window->DrawList->_CalcCircleAutoSegmentCount(layer_r));
-
-    const ImU32 ring = active ? ImGuiM3ColorU32(ImGuiM3Role_Primary) : ImGuiM3ColorU32(ImGuiM3Role_Outline);
-    window->DrawList->AddCircleFilled(center, radius, ring, num_segment);
-    // Punch the interior back out to the frame colour, leaving a 2dp ring.
-    window->DrawList->AddCircleFilled(center, radius - 2.0f * m.density,
-                                      active ? ImGuiM3ColorU32(ImGuiM3Role_SurfaceContainerHighest) : ImGuiM3ColorU32(ImGuiM3Role_SurfaceContainerLow),
-                                      num_segment);
+    window->DrawList->AddCircleFilled(center, radius, GetColorU32((held && hovered) ? ImGuiCol_FrameBgActive : hovered ? ImGuiCol_FrameBgHovered : ImGuiCol_FrameBg), num_segment);
     if (active)
     {
-        // The dot grows on a spring, so selection reads as a motion, not a swap.
-        const float dot_t = ImGuiM3SpringStepSpatialDefault(id ^ 0x524144, 1.0f);
-        const float dot_r = inner * 0.5f * ImMax(dot_t, 0.001f);
-        window->DrawList->AddCircleFilled(center, dot_r, ImGuiM3ColorU32(ImGuiM3Role_Primary),
-                                          window->DrawList->_CalcCircleAutoSegmentCount(dot_r));
+        const float pad = ImMax(1.0f, IM_TRUNC(square_sz / 6.0f));
+        window->DrawList->AddCircleFilled(center, radius - pad, GetColorU32(ImGuiCol_CheckMark));
     }
-    RenderNavCursor(total_bb, id);
+
+    if (style.FrameBorderSize > 0.0f)
+    {
+        window->DrawList->AddCircle(center + ImVec2(1, 1), radius, GetColorU32(ImGuiCol_BorderShadow), num_segment, style.FrameBorderSize);
+        window->DrawList->AddCircle(center, radius, GetColorU32(ImGuiCol_Border), num_segment, style.FrameBorderSize);
+    }
 
     ImVec2 label_pos = ImVec2(check_bb.Max.x + style.ItemInnerSpacing.x, check_bb.Min.y + style.FramePadding.y);
     if (g.LogEnabled)
@@ -1569,46 +1444,12 @@ void ImGui::ProgressBar(float fraction, const ImVec2& size_arg, const char* over
     }
 
     // Render
-    // VKIntox M3: a 4dp round-capped stroke, not a trough. determinate splits
-    // into indicator, seam and track, with the stop dot at the far end.
-    const ImGuiM3Metrics& m = ImGuiM3GetMetrics();
-    ImDrawList* dl = window->DrawList;
-    const float width = bb.GetWidth();
-    const float mid = bb.GetCenter().y;
-    const float stroke = m.progress_stroke_thickness * m.density;
-    const float radius = ImMin(stroke * 0.5f, bb.GetHeight() * 0.5f);
-    const ImGuiM3ShapeRounding pill{ radius, radius, radius, radius };
-    const ImU32 active_col = ImGuiM3ColorU32(ImGuiM3Role_Primary);
-    const ImU32 track_col = ImGuiM3ColorU32(ImGuiM3Role_SecondaryContainer);
-    const float lo = radius;
-    const float hi = ImMax(width - radius, radius);
-
-    const float head_raw = fill_n1 * width;
-    const float head = ImClamp(head_raw, lo, hi);
-    const float seam = (head_raw < lo) ? 0.0f : ImMin(head_raw - lo, m.progress_gap * m.density);
-    const float spacing = (head_raw >= lo) ? seam + radius * 2.0f : seam;
-    if (width - radius > head + spacing)
-        ImGuiM3PathRoundedRect(dl, ImRect(bb.Min.x + ImMax(lo, head + spacing) - radius, mid - radius, bb.Max.x, mid + radius),
-                               pill, track_col);
-
-    if (!is_indeterminate)
-    {
-        float stop = ImMin(stroke, m.progress_stop_size * m.density);
-        float stop_x = width - stop;
-        const float stop_progress_x = fraction * width + radius;
-        if (stop_x <= stop_progress_x)
-        {
-            stop = ImMax(0.0f, stop - (stop_progress_x - stop_x));
-            stop_x = stop_progress_x;
-        }
-        if (stop > 0.0f)
-            dl->AddCircleFilled(ImVec2(bb.Min.x + stop_x + stop * 0.5f, mid), stop * 0.5f, active_col);
-    }
-
-    const float fill_x1 = bb.Min.x + head;
-    const float tail = ImClamp(ImLerp(0.0f, width, fill_n0), lo, hi);
-    if (head > tail + 0.25f)
-        ImGuiM3PathRoundedRect(dl, ImRect(bb.Min.x + tail, mid - radius, fill_x1, mid + radius), pill, active_col);
+    RenderFrame(bb.Min, bb.Max, GetColorU32(ImGuiCol_FrameBg), true, style.FrameRounding);
+    bb.Expand(ImVec2(-style.FrameBorderSize, -style.FrameBorderSize));
+    float fill_x0 = ImLerp(bb.Min.x, bb.Max.x, fill_n0);
+    float fill_x1 = ImLerp(bb.Min.x, bb.Max.x, fill_n1);
+    if (fill_x0 < fill_x1)
+        RenderRectFilledInRangeH(window->DrawList, bb, GetColorU32(ImGuiCol_PlotHistogram), fill_x0, fill_x1, style.FrameRounding);
 
     // Default displaying the fraction as percentage string, but user can override it
     // Don't display text for indeterminate bars by default
@@ -1841,8 +1682,7 @@ void ImGui::SeparatorEx(ImGuiSeparatorFlags flags, float thickness)
         if (ItemAdd(bb, 0))
         {
             // Draw
-            // VKIntox M3: a divider is 1dp of `outline-variant`, full bleed.
-            window->DrawList->AddRectFilled(bb.Min, bb.Max, ImGuiM3ColorU32(ImGuiM3Role_OutlineVariant));
+            window->DrawList->AddRectFilled(bb.Min, bb.Max, GetColorU32(ImGuiCol_Separator));
             if (g.LogEnabled)
                 LogRenderedText(&bb.Min, "--------------------------------\n");
 
@@ -2110,40 +1950,21 @@ bool ImGui::BeginCombo(const char* label, const char* preview_value, ImGuiComboF
         popup_open = true;
     }
 
-    // VKIntox M3: an exposed-dropdown pill. One surface-container-high capsule
-    // with an on-surface-variant trailing arrow; hover/open is a state layer.
-    // (The old two-tone field + primary-container button read as two mismatched
-    // shapes and left the inner corners square.)
+    // Render shape
+    const ImU32 frame_col = GetColorU32(hovered ? ImGuiCol_FrameBgHovered : ImGuiCol_FrameBg);
     const float value_x2 = ImMax(bb.Min.x, bb.Max.x - arrow_size);
-    const float pill = ImGuiM3PillRadius(bb.GetSize(), ImGuiM3Radius(ImGuiM3Shape_Full));
-    const ImGuiM3ShapeRounding rounding = { pill, pill, pill, pill };
     RenderNavCursor(bb, id);
-    ImGuiM3PathRoundedRect(window->DrawList, bb, rounding, ImGuiM3ColorU32(ImGuiM3Role_SurfaceContainerHigh));
-    if (popup_open || hovered)
-        ImGuiM3DrawStateLayer(window->DrawList, bb, rounding, ImGuiM3Role_OnSurface,
-                              popup_open ? ImGuiM3State_Pressed : ImGuiM3State_Hovered);
+    if (!(flags & ImGuiComboFlags_NoPreview))
+        window->DrawList->AddRectFilled(bb.Min, ImVec2(value_x2, bb.Max.y), frame_col, style.FrameRounding, (flags & ImGuiComboFlags_NoArrowButton) ? ImDrawFlags_RoundCornersAll : ImDrawFlags_RoundCornersLeft);
     if (!(flags & ImGuiComboFlags_NoArrowButton))
     {
-        const ImU32 arrow_col = ImGuiM3ColorU32(ImGuiM3Role_OnSurfaceVariant);
-        // keyboard_arrow_down: a rounded Material chevron. (arrow_drop_down is a
-        // plain triangle and reads the same as ImGui's builtin arrow.)
-        static const char kDropdownGlyph[] = "\xEE\x8C\x93";
-        ImFont* icon = ImGuiM3IconFont();
-        if (icon)
-        {
-            const float px = ImMin(arrow_size, ImGui::GetFontSize() * 1.15f);
-            const ImVec2 icon_min(value_x2 + (arrow_size - px) * 0.5f, bb.GetCenter().y - px * 0.5f);
-            ImGuiM3DrawIcon(window->DrawList, kDropdownGlyph,
-                            ImRect(icon_min, ImVec2(icon_min.x + px, icon_min.y + px)), px, arrow_col);
-        }
-        else
-        {
-            const float arrow_px = ImMin(arrow_size, g.FontSize);
-            RenderArrow(window->DrawList,
-                        ImVec2(value_x2 + (arrow_size - arrow_px) * 0.5f, bb.GetCenter().y - arrow_px * 0.5f),
-                        arrow_col, ImGuiDir_Down, 1.0f);
-        }
+        ImU32 bg_col = GetColorU32((popup_open || hovered) ? ImGuiCol_ButtonHovered : ImGuiCol_Button);
+        ImU32 text_col = GetColorU32(ImGuiCol_Text);
+        window->DrawList->AddRectFilled(ImVec2(value_x2, bb.Min.y), bb.Max, bg_col, style.FrameRounding, (w <= arrow_size) ? ImDrawFlags_RoundCornersAll : ImDrawFlags_RoundCornersRight);
+        if (value_x2 + arrow_size - style.FramePadding.x <= bb.Max.x)
+            RenderArrow(window->DrawList, ImVec2(value_x2 + style.FramePadding.y, bb.Min.y + style.FramePadding.y), text_col, ImGuiDir_Down, 1.0f);
     }
+    RenderFrameBorder(bb.Min, bb.Max, style.FrameRounding);
 
     // Custom preview
     if (flags & ImGuiComboFlags_CustomPreview)
@@ -2205,6 +2026,7 @@ bool ImGui::BeginComboPopup(ImGuiID popup_id, const ImRect& bb, ImGuiComboFlags 
     // This is essentially a specialized version of BeginPopupEx()
     char name[16];
     ImFormatString(name, IM_COUNTOF(name), "##Combo_%02d", g.BeginComboDepth); // Recycle windows based on depth
+
     // Set position given a custom constraint (peak into expected window size so we can position it)
     // FIXME: This might be easier to express with an hypothetical SetNextWindowPosConstraints() function?
     // FIXME: This might be moved to Begin() or at least around the same spot where Tooltips and other Popups are calling FindBestWindowPosForPopupEx()?
@@ -2221,14 +2043,9 @@ bool ImGui::BeginComboPopup(ImGuiID popup_id, const ImRect& bb, ImGuiComboFlags 
 
     // We don't use BeginPopupEx() solely because we have a custom name string, which we could make an argument to BeginPopupEx()
     ImGuiWindowFlags window_flags = ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_Popup | ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoMove;
-
-    // VKIntox M3: the menu popup carries its own insets and corner instead of
-    // the dialog-scale window padding it used to inherit.
-    const ImGuiM3Metrics& m3m = ImGuiM3GetMetrics();
-    PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(m3m.menu_padding_x * m3m.density, m3m.menu_padding_y * m3m.density));
-    PushStyleVar(ImGuiStyleVar_PopupRounding, m3m.menu_radius * m3m.density);
+    PushStyleVarX(ImGuiStyleVar_WindowPadding, g.Style.FramePadding.x); // Horizontally align ourselves with the framed text
     bool ret = Begin(name, NULL, window_flags);
-    PopStyleVar(2);
+    PopStyleVar();
     if (!ret)
     {
         EndPopup();
@@ -3285,20 +3102,9 @@ bool ImGui::SliderBehaviorT(const ImRect& bb, ImGuiID id, ImGuiDataType data_typ
     if (!is_floating_point && v_range_f >= 0.0f)                         // v_range_f < 0 may happen on integer overflows
         grab_sz = ImMax(slider_sz / (v_range_f + 1), style.GrabMinSize); // For integer sliders: if possible have the grab size represent 1 unit
     grab_sz = ImMin(grab_sz, slider_sz);
-
-    // VKIntox M3: inset the clickable span by the drawn half-handle so it matches
-    // where the renderer actually puts the thumb. default is 2px + grab_sz/2,
-    // which left the hitbox short of the visible pill.
-    float slider_usable_pos_min = bb.Min[axis] + grab_padding + grab_sz * 0.5f;
-    float slider_usable_pos_max = bb.Max[axis] - grab_padding - grab_sz * 0.5f;
-    if (axis == ImGuiAxis_X)
-    {
-        const ImGuiM3Metrics& m3 = ImGuiM3GetMetrics();
-        const float half_handle = m3.slider_handle_width * m3.density * 0.5f;
-        slider_usable_pos_min = bb.Min[axis] + half_handle;
-        slider_usable_pos_max = bb.Max[axis] - half_handle;
-    }
-    const float slider_usable_sz = ImMax(0.0f, slider_usable_pos_max - slider_usable_pos_min);
+    const float slider_usable_sz = slider_sz - grab_sz;
+    const float slider_usable_pos_min = bb.Min[axis] + grab_padding + grab_sz * 0.5f;
+    const float slider_usable_pos_max = bb.Max[axis] - grab_padding - grab_sz * 0.5f;
 
     float logarithmic_zero_epsilon = 0.0f; // Only valid when is_logarithmic is true
     float zero_deadzone_halfsize = 0.0f; // Only valid when is_logarithmic is true
@@ -3551,12 +3357,13 @@ bool ImGui::SliderScalar(const char* label, ImGuiDataType data_type, void* p_dat
         return TempInputScalar(frame_bb, id, label, data_type, p_data, format, clamp_enabled ? p_min : NULL, clamp_enabled ? p_max : NULL);
     }
 
-    // VKIntox M3 Expressive slider: 16dp inactive track, `primary` active
-    // track, 4x44dp pill handle. the frame itself stays transparent.
-    const ImGuiM3Metrics& m3 = ImGuiM3GetMetrics();
+    // Draw frame
+    const ImU32 frame_col = GetColorU32(g.ActiveId == id ? ImGuiCol_FrameBgActive : hovered ? ImGuiCol_FrameBgHovered : ImGuiCol_FrameBg);
     RenderNavCursor(frame_bb, id);
+    RenderFrame(frame_bb.Min, frame_bb.Max, frame_col, false, style.FrameRounding);
     if (color_marker != 0 && style.ColorMarkerSize > 0.0f)
         RenderColorComponentMarker(frame_bb, GetColorU32(color_marker), style.FrameRounding);
+    RenderFrameBorder(frame_bb.Min, frame_bb.Max, g.Style.FrameRounding);
 
     // Slider behavior
     ImRect grab_bb;
@@ -3564,152 +3371,16 @@ bool ImGui::SliderScalar(const char* label, ImGuiDataType data_type, void* p_dat
     if (value_changed)
         MarkItemEdited(id);
 
-    // 16dp track with `corner-full` outer ends and rounded corners facing the
-    // thumb. the active/inactive split uses the resting handle width, not the
-    // animated press width, so the track edges don't twitch as the handle
-    // narrows on a drag.
-    const float track_h = m3.slider_track_height * m3.density;
-    const float track_half = track_h * 0.5f;
-    const float external_r = track_half;
-    const float inside_r = ImMin(m3.slider_track_inside_corner * m3.density, external_r);
-    const float gap = m3.slider_handle_padding * m3.density;
-    const float rest_half = m3.slider_handle_width * m3.density * 0.5f;
-    const ImRect track_rect(frame_bb.Min.x, frame_bb.GetCenter().y - track_half,
-                            frame_bb.Max.x, frame_bb.GetCenter().y + track_half);
-
-    // handle narrows while dragged, then springs back. the handle and its state
-    // layer are capped to the row height so neither can spill into the item
-    // above or below.
-    const bool slider_held = (g.ActiveId == id);
-    const float narrow = ImGuiM3SpringStepEffectsDefault(id ^ 0x534C44, slider_held ? 1.0f : 0.0f);
-    const float handle_w = ImLerp(m3.slider_handle_width, m3.slider_handle_width_pressed, ImSaturate(narrow)) * m3.density;
-    const float half_handle = handle_w * 0.5f;
-    const float row_h = frame_bb.GetHeight();
-    // M3's handle is 44dp tall on a 16dp track - deliberately taller than the row
-    // it sits in - so it is allowed a bounded overflow rather than being squashed
-    // down to the frame height.
-    const float handle_h = ImMin(m3.slider_handle_height * m3.density, row_h + 10.0f * m3.density);
-    const float handle_r = ImMin(half_handle, handle_h * 0.5f);
-    const ImVec2 handle_center = grab_bb.GetCenter();
-
-    const ImU32 inactive_col = ImGuiM3ColorU32(ImGuiM3Role_SurfaceContainerHighest);
-    const ImU32 active_col = ImGuiM3ColorU32(ImGuiM3Role_Primary);
-    // active stops `gap` short of the resting pill, inactive starts `gap` after
-    // it. both edges clamp to the track, so a value at either extreme shrinks its
-    // segment to nothing instead of overshooting. the readout needs the same
-    // edges, so they live out here.
-    const float active_end = ImClamp(handle_center.x - rest_half - gap, track_rect.Min.x, track_rect.Max.x);
-    const float inactive_start = ImClamp(handle_center.x + rest_half + gap, track_rect.Min.x, track_rect.Max.x);
-    if (track_rect.GetWidth() > 0.0f && row_h > 0.0f)
-    {
-        if (active_end > track_rect.Min.x)
-        {
-            const ImRect active(track_rect.Min.x, track_rect.Min.y, active_end, track_rect.Max.y);
-            const float ar = active.GetWidth() * 0.5f;
-            ImGuiM3PathRoundedRect(window->DrawList, active,
-                                   ImGuiM3ShapeRounding{ ImMin(external_r, ar), ImMin(inside_r, ar), ImMin(inside_r, ar), ImMin(external_r, ar) },
-                                   active_col);
-        }
-        if (inactive_start < track_rect.Max.x)
-        {
-            const ImRect inactive(inactive_start, track_rect.Min.y, track_rect.Max.x, track_rect.Max.y);
-            const float ir = inactive.GetWidth() * 0.5f;
-            ImGuiM3PathRoundedRect(window->DrawList, inactive,
-                                   ImGuiM3ShapeRounding{ ImMin(inside_r, ir), ImMin(external_r, ir), ImMin(external_r, ir), ImMin(inside_r, ir) },
-                                   inactive_col);
-        }
-    }
-
-    // Handle pill, with the state layer behind it.
-    if (grab_bb.Max.x > grab_bb.Min.x && handle_h > 0.0f)
-    {
-        const float layer_r = ImMin(m3.state_layer_size * m3.density * 0.5f, handle_h * 0.5f);
-        window->DrawList->AddCircleFilled(handle_center, layer_r,
-                                          ImGuiM3StateLayerU32(ImGuiM3Role_Primary, (hovered && slider_held) ? ImGuiM3State_Pressed : hovered ? ImGuiM3State_Hovered : ImGuiM3State_Enabled),
-                                          window->DrawList->_CalcCircleAutoSegmentCount(layer_r));
-        const ImRect handle(handle_center.x - half_handle, handle_center.y - handle_h * 0.5f,
-                            handle_center.x + half_handle, handle_center.y + handle_h * 0.5f);
-        ImGuiM3PathRoundedRect(window->DrawList, handle, ImGuiM3ShapeRounding{ handle_r, handle_r, handle_r, handle_r },
-                               active_col);
-    }
+    // Render grab
+    if (grab_bb.Max.x > grab_bb.Min.x)
+        window->DrawList->AddRectFilled(grab_bb.Min, grab_bb.Max, GetColorU32(g.ActiveId == id ? ImGuiCol_SliderGrabActive : ImGuiCol_SliderGrab), style.GrabRounding);
 
     // Display value using user-provided display format so user can add prefix/suffix/decorations to the value.
     char value_buf[64];
     const char* value_buf_end = value_buf + DataTypeFormatString(value_buf, IM_COUNTOF(value_buf), data_type, p_data, format);
     if (g.LogEnabled)
         LogSetNextTextDecoration("{", "}");
-    // The readout sits on up to five different tones: the filled track, the two
-    // seams either side of the thumb, the thumb itself, and the dim track. Each
-    // stretch is drawn in the ink that contrasts with the fill behind it, so the
-    // digits read across the whole widget without sampling the frame. Neighbours
-    // landing on the same ink collapse into one pass, which keeps this at three
-    // adds in the common case.
-    {
-        ImFont* value_font = ImGuiM3FontBold();
-        if (!value_font)
-            value_font = GetFont();
-        PushFont(value_font, GetFontSize());
-        const ImVec2 text_size = CalcTextSize(value_buf, value_buf_end);
-        PopFont();
-        const float text_left = frame_bb.GetCenter().x - text_size.x * 0.5f;
-        const float text_right = text_left + text_size.x;
-        const ImVec2 text_pos(text_left, frame_bb.GetCenter().y - text_size.y * 0.5f);
-        ImDrawList* value_dl = window->DrawList;
-
-        const ImVec4& c_primary = ImGuiM3Color(ImGuiM3Role_Primary);
-        const ImVec4& c_dim = ImGuiM3Color(ImGuiM3Role_SurfaceContainerHighest);
-        const ImVec4& c_surface = ImGuiM3Color(ImGuiM3Role_SurfaceContainer);
-        const ImVec4& c_on_primary = ImGuiM3Color(ImGuiM3Role_OnPrimary);
-        const ImVec4& c_on_surface = ImGuiM3Color(ImGuiM3Role_OnSurface);
-        auto luma = [](const ImVec4& c) { return 0.2126f * c.x + 0.7152f * c.y + 0.0722f * c.z; };
-        auto ink_for = [&](const ImVec4& bg) {
-            return ImAbs(luma(c_on_primary) - luma(bg)) >= ImAbs(luma(c_on_surface) - luma(bg))
-                       ? c_on_primary : c_on_surface;
-        };
-
-        // the thumb is filled with the active colour, the seams show the surface
-        const bool has_handle = grab_bb.Max.x > grab_bb.Min.x;
-        const float thumb_lo = has_handle ? handle_center.x - half_handle : frame_bb.Min.x;
-        const float thumb_hi = has_handle ? handle_center.x + half_handle : frame_bb.Min.x;
-        const float seam_lo = has_handle ? active_end : frame_bb.Min.x;
-        const float seam_hi = has_handle ? inactive_start : frame_bb.Min.x;
-        const float dim_start = has_handle ? inactive_start : frame_bb.Min.x;
-
-        struct Stretch { float x0, x1; ImU32 ink; };
-        Stretch stretches[5];
-        int stretch_count = 0;
-        auto add_stretch = [&](float x0, float x1, const ImVec4& fill) {
-            x0 = ImMax(x0, frame_bb.Min.x);
-            x1 = ImMin(x1, frame_bb.Max.x);
-            if (x1 - x0 <= 0.0f)
-                return;
-            const ImU32 ink = GetColorU32(ink_for(fill));
-            if (stretch_count > 0 && stretches[stretch_count - 1].ink == ink &&
-                ImAbs(stretches[stretch_count - 1].x1 - x0) < 0.01f)
-            {
-                stretches[stretch_count - 1].x1 = x1;
-                return;
-            }
-            stretches[stretch_count++] = Stretch{ x0, x1, ink };
-        };
-        add_stretch(frame_bb.Min.x, seam_lo, c_primary);
-        add_stretch(seam_lo, thumb_lo, c_surface);
-        add_stretch(thumb_lo, thumb_hi, c_primary);
-        add_stretch(thumb_hi, seam_hi, c_surface);
-        add_stretch(dim_start, frame_bb.Max.x, c_dim);
-
-        PushFont(value_font, GetFontSize());
-        for (int i = 0; i < stretch_count; ++i)
-        {
-            if (stretches[i].x1 <= text_left || stretches[i].x0 >= text_right)
-                continue;   // the number never reaches this stretch
-            value_dl->PushClipRect(ImVec2(stretches[i].x0, frame_bb.Min.y),
-                                   ImVec2(stretches[i].x1, frame_bb.Max.y), true);
-            value_dl->AddText(value_font, GetFontSize(), text_pos, stretches[i].ink, value_buf, value_buf_end);
-            value_dl->PopClipRect();
-        }
-        PopFont();
-    }
+    RenderTextClipped(frame_bb.Min, frame_bb.Max, value_buf, value_buf_end, NULL, ImVec2(0.5f, 0.5f));
 
     if (label_size.x > 0.0f)
         RenderText(ImVec2(frame_bb.Max.x + style.ItemInnerSpacing.x, frame_bb.Min.y + style.FramePadding.y), label);
@@ -5718,27 +5389,11 @@ bool ImGui::InputTextEx(const char* label, const char* hint, char* buf, int buf_
     if (g.ActiveId == id && clear_active_id)
         ClearActiveID();
 
-    // VKIntox M3: a single-line text field is the *filled* variant —
-    // surface-container-high with 4dp top corners only (corner-extra-small-top),
-    // plus a 1dp primary active indicator along the bottom edge while focused.
-    // Multiline keeps a fully rounded field, since it behaves like a card.
+    // Render frame
     if (!is_multiline)
     {
-        const ImGuiM3Metrics& m3 = ImGuiM3GetMetrics();
-        const float top_r = m3.text_field_top_radius * m3.density;
-        // All four corners share the field radius; a filled text field with only
-        // its top corners rounded read as an unfinished box.
-        const ImGuiM3ShapeRounding field_rounding = { top_r, top_r, top_r, top_r };
         RenderNavCursor(frame_bb, id);
-        ImGuiM3PathRoundedRect(window->DrawList, frame_bb, field_rounding, ImGuiM3ColorU32(ImGuiM3Role_SurfaceContainerHigh));
-        const bool field_focused = (g.ActiveId == id);
-        if (hovered || field_focused)
-            ImGuiM3PathRoundedRect(window->DrawList, frame_bb, field_rounding,
-                                   ImGuiM3StateLayerU32(ImGuiM3Role_OnSurface, field_focused ? ImGuiM3State_Focused : ImGuiM3State_Hovered));
-        const float indicator = m3.text_field_active_indicator * m3.density;
-        if (indicator > 0.0f)
-            window->DrawList->AddRectFilled(ImVec2(frame_bb.Min.x, frame_bb.Max.y - indicator), frame_bb.Max,
-                                            ImGuiM3ColorU32(field_focused ? ImGuiM3Role_Primary : ImGuiM3Role_Outline));
+        RenderFrame(frame_bb.Min, frame_bb.Max, GetColorU32(ImGuiCol_FrameBg), true, style.FrameRounding);
     }
 
     ImVec2 draw_pos = is_multiline ? draw_window->DC.CursorPos : frame_bb.Min + style.FramePadding;
@@ -7371,34 +7026,22 @@ bool ImGui::TreeNodeBehavior(ImGuiID id, ImGuiTreeNodeFlags flags, const char* l
 
     // Render
     {
-        // VKIntox M3: selected rows read in on-secondary-container.
-        const ImU32 text_col = selected ? ImGuiM3ColorU32(ImGuiM3Role_OnSecondaryContainer) : ImGuiM3ColorU32(ImGuiM3Role_OnSurface);
+        const ImU32 text_col = GetColorU32(ImGuiCol_Text);
         ImGuiNavRenderCursorFlags nav_render_cursor_flags = ImGuiNavRenderCursorFlags_Compact;
         if (is_multi_select)
             nav_render_cursor_flags |= ImGuiNavRenderCursorFlags_AlwaysDraw; // Always show the nav rectangle
         if (display_frame)
         {
-            // VKIntox M3: a tree node is a list item. Selected nodes get the
-            // secondary-container swap, and the row's radius morphs from
-            // corner-extra-small (expressive list item) toward corner-large on
-            // hover, exactly as the expressive list-item tokens describe.
-            const ImGuiM3Metrics& m3 = ImGuiM3GetMetrics();
-            const ImGuiM3State st = (held && hovered) ? ImGuiM3State_Pressed : hovered ? ImGuiM3State_Hovered : ImGuiM3State_Enabled;
-            const float rest_r = selected ? ImGuiM3Radius(ImGuiM3Shape_Large) : m3.list_item_radius_expressive * m3.density;
-            const ImGuiM3ShapeRounding row_rounding = ImGuiM3MorphedRounding(frame_bb.GetSize(), rest_r,
-                                                                            ImGuiM3Radius(ImGuiM3Shape_Large), hovered && held, id);
-            if (selected)
-                ImGuiM3PathRoundedRect(window->DrawList, frame_bb, row_rounding, ImGuiM3ColorU32(ImGuiM3Role_SecondaryContainer));
-            if (hovered || (held && hovered))
-                ImGuiM3DrawStateLayer(window->DrawList, frame_bb, row_rounding,
-                                      selected ? ImGuiM3Role_OnSecondaryContainer : ImGuiM3Role_OnSurface, st);
+            // Framed type
+            const ImU32 bg_col = GetColorU32((held && hovered) ? ImGuiCol_HeaderActive : hovered ? ImGuiCol_HeaderHovered : ImGuiCol_Header);
+            RenderFrame(frame_bb.Min, frame_bb.Max, bg_col, true, style.FrameRounding);
             RenderNavCursor(frame_bb, id, nav_render_cursor_flags);
             if (span_all_columns && !span_all_columns_label)
                 TablePopBackgroundChannel();
             if (flags & ImGuiTreeNodeFlags_Bullet)
                 RenderBullet(window->DrawList, ImVec2(text_pos.x - text_offset_x * 0.60f, text_pos.y + g.FontSize * 0.5f), text_col);
             else if (!is_leaf)
-                ImGuiM3TreeNodeArrow(window->DrawList, ImVec2(text_pos.x - text_offset_x + padding.x, text_pos.y), g.FontSize, text_col, is_open);
+                RenderArrow(window->DrawList, ImVec2(text_pos.x - text_offset_x + padding.x, text_pos.y), text_col, is_open ? ((flags & ImGuiTreeNodeFlags_UpsideDownArrow) ? ImGuiDir_Up : ImGuiDir_Down) : ImGuiDir_Right, 1.0f);
             else // Leaf without bullet, left-adjusted text
                 text_pos.x -= text_offset_x - padding.x;
             if (flags & ImGuiTreeNodeFlags_ClipLabelForTrailingButton)
@@ -7408,24 +7051,19 @@ bool ImGui::TreeNodeBehavior(ImGuiID id, ImGuiTreeNodeFlags flags, const char* l
         }
         else
         {
-            // Unframed tree node: still an M3 list item, just without the
-            // corner-large rest radius, so it sits flush with the text.
-            const ImGuiM3Metrics& m3 = ImGuiM3GetMetrics();
-            const ImGuiM3State st = (held && hovered) ? ImGuiM3State_Pressed : hovered ? ImGuiM3State_Hovered : ImGuiM3State_Enabled;
-            const ImGuiM3ShapeRounding row_rounding = { m3.list_item_radius_expressive * m3.density, m3.list_item_radius_expressive * m3.density,
-                                                       m3.list_item_radius_expressive * m3.density, m3.list_item_radius_expressive * m3.density };
-            if (selected)
-                ImGuiM3PathRoundedRect(window->DrawList, frame_bb, row_rounding, ImGuiM3ColorU32(ImGuiM3Role_SecondaryContainer));
-            if (hovered || (held && hovered))
-                ImGuiM3DrawStateLayer(window->DrawList, frame_bb, row_rounding,
-                                      selected ? ImGuiM3Role_OnSecondaryContainer : ImGuiM3Role_OnSurface, st);
+            // Unframed typed for tree nodes
+            if (hovered || selected)
+            {
+                const ImU32 bg_col = GetColorU32((held && hovered) ? ImGuiCol_HeaderActive : hovered ? ImGuiCol_HeaderHovered : ImGuiCol_Header);
+                RenderFrame(frame_bb.Min, frame_bb.Max, bg_col, false);
+            }
             RenderNavCursor(frame_bb, id, nav_render_cursor_flags);
             if (span_all_columns && !span_all_columns_label)
                 TablePopBackgroundChannel();
             if (flags & ImGuiTreeNodeFlags_Bullet)
                 RenderBullet(window->DrawList, ImVec2(text_pos.x - text_offset_x * 0.5f, text_pos.y + g.FontSize * 0.5f), text_col);
             else if (!is_leaf)
-                ImGuiM3TreeNodeArrow(window->DrawList, ImVec2(text_pos.x - text_offset_x + padding.x, text_pos.y + g.FontSize * 0.15f), g.FontSize, text_col, is_open);
+                RenderArrow(window->DrawList, ImVec2(text_pos.x - text_offset_x + padding.x, text_pos.y + g.FontSize * 0.15f), text_col, is_open ? ((flags & ImGuiTreeNodeFlags_UpsideDownArrow) ? ImGuiDir_Up : ImGuiDir_Down) : ImGuiDir_Right, 0.70f);
             if (g.LogEnabled)
                 LogSetNextTextDecoration(">", NULL);
         }
@@ -7794,39 +7432,11 @@ bool ImGui::Selectable(const char* label, bool selected, ImGuiSelectableFlags fl
     if (is_visible)
     {
         const bool highlighted = hovered || (flags & ImGuiSelectableFlags_Highlight);
-        const bool in_popup = (window->Flags & ImGuiWindowFlags_Popup) != 0;
-        // VKIntox M3: a popup row is a capsule of on-surface tint — faint at
-        // rest so the list reads as separate items, brighter under the pointer.
-        // The selected row is the accent: primary fill with on-primary text,
-        // lifted off the surface. A list row outside a popup keeps the
-        // secondary-container selection swap instead.
-        if (in_popup)
+        if (highlighted || selected)
         {
-            const float pill = ImGuiM3PillRadius(bb.GetSize(), ImGuiM3Radius(ImGuiM3Shape_Full));
-            const ImGuiM3ShapeRounding row_rounding{ pill, pill, pill, pill };
-            if (selected)
-            {
-                ImGuiM3DrawElevation(window->DrawList, bb, row_rounding, 1);
-                ImGuiM3PathRoundedRect(window->DrawList, bb, row_rounding, ImGuiM3ColorU32(ImGuiM3Role_Primary));
-            }
-            else
-            {
-                const float alpha = (held && highlighted) ? 0.10f : highlighted ? 0.08f : 0.04f;
-                ImVec4 tint = ImGuiM3StateLayer(ImGuiM3Role_OnSurface, ImGuiM3State_Hovered);
-                tint.w = alpha;
-                ImGuiM3PathRoundedRect(window->DrawList, bb, row_rounding, ImGui::ColorConvertFloat4ToU32(tint));
-            }
-        }
-        else if (highlighted || selected)
-        {
-            const ImGuiM3Metrics& m3 = ImGuiM3GetMetrics();
-            const float rest_r = selected ? ImGuiM3Radius(ImGuiM3Shape_Medium) : m3.list_item_radius_expressive * m3.density;
-            const ImGuiM3ShapeRounding row_rounding = ImGuiM3MorphedRounding(bb.GetSize(), rest_r, ImGuiM3Radius(ImGuiM3Shape_Large), highlighted && held, id);
-            if (selected)
-                ImGuiM3PathRoundedRect(window->DrawList, bb, row_rounding, ImGuiM3ColorU32(ImGuiM3Role_SecondaryContainer));
-            else
-                ImGuiM3DrawStateLayer(window->DrawList, bb, row_rounding, ImGuiM3Role_OnSurface,
-                                      (held && highlighted) ? ImGuiM3State_Pressed : ImGuiM3State_Hovered);
+            // Between 1.91.0 and 1.91.4 we made selected Selectable use an arbitrary lerp between _Header and _HeaderHovered. Removed that now. (#8106)
+            ImU32 col = GetColorU32((held && highlighted) ? ImGuiCol_HeaderActive : highlighted ? ImGuiCol_HeaderHovered : ImGuiCol_Header);
+            RenderFrame(bb.Min, bb.Max, col, false, 0.0f);
         }
         if (g.NavId == id)
         {
@@ -7847,16 +7457,7 @@ bool ImGui::Selectable(const char* label, bool selected, ImGuiSelectableFlags fl
 
     // Text stays at the submission position. Alignment/clipping extents ignore SpanAllColumns.
     if (is_visible)
-    {
-        const bool in_popup = (window->Flags & ImGuiWindowFlags_Popup) != 0;
-        const ImU32 row_text = in_popup ? (selected ? ImGuiM3ColorU32(ImGuiM3Role_OnPrimary)
-                                                     : ImGuiM3ColorU32(ImGuiM3Role_OnSurface))
-                                        : (selected ? ImGuiM3ColorU32(ImGuiM3Role_OnSecondaryContainer)
-                                                    : ImGuiM3ColorU32(ImGuiM3Role_OnSurface));
-        PushStyleColor(ImGuiCol_Text, row_text);
         RenderTextClipped(pos, ImVec2(ImMin(pos.x + size.x, window->WorkRect.Max.x), pos.y + size.y), label, NULL, &label_size, style.SelectableTextAlign, &bb);
-        PopStyleColor();
-    }
 
     // Automatically close popups
     if (pressed && !auto_selected && (window->Flags & ImGuiWindowFlags_Popup) && !(flags & ImGuiSelectableFlags_NoAutoClosePopups) && (g.LastItemData.ItemFlags & ImGuiItemFlags_AutoClosePopups))
@@ -9179,14 +8780,7 @@ int ImGui::PlotEx(ImGuiPlotType plot_type, const char* label, float (*values_get
             scale_max = v_max;
     }
 
-    // VKIntox M3: plots sit on a surface-container-low card with a medium radius,
-    // rather than on a sunken frame.
-    {
-        const ImGuiM3Metrics& m3 = ImGuiM3GetMetrics();
-        const float r = m3.card_radius * m3.density;
-        ImGuiM3PathRoundedRect(window->DrawList, frame_bb, ImGuiM3ShapeRounding{ r, r, r, r },
-                               ImGuiM3ColorU32(ImGuiM3Role_SurfaceContainerLow));
-    }
+    RenderFrame(frame_bb.Min, frame_bb.Max, GetColorU32(ImGuiCol_FrameBg), true, style.FrameRounding);
 
     const int values_count_min = (plot_type == ImGuiPlotType_Lines) ? 2 : 1;
     int idx_hovered = -1;
@@ -10927,6 +10521,7 @@ bool    ImGui::TabItemEx(ImGuiTabBar* tab_bar, const char* label, bool* p_open, 
     tab->BeginOrder = tab_bar->TabsActiveCount++;
 
     const bool tab_bar_appearing = (tab_bar->PrevFrameVisible + 1 < g.FrameCount);
+    const bool tab_bar_focused = (tab_bar->Flags & ImGuiTabBarFlags_IsFocused) != 0;
     const bool tab_appearing = (tab->LastFrameVisible + 1 < g.FrameCount);
     const bool tab_just_unsaved = (flags & ImGuiTabItemFlags_UnsavedDocument) && !(tab->Flags & ImGuiTabItemFlags_UnsavedDocument);
     const bool is_tab_button = (flags & ImGuiTabItemFlags_Button) != 0;
@@ -11108,29 +10703,24 @@ bool    ImGui::TabItemEx(ImGuiTabBar* tab_bar, const char* label, bool* p_open, 
     if (is_visible)
     {
         ImDrawList* display_draw_list = window->DrawList;
-        // VKIntox M3: `primary` label when selected, `on-surface-variant`
-        // otherwise; the state layer comes from the transparent TabHovered slot.
-        const ImU32 tab_col = GetColorU32((held || hovered) ? ImGuiCol_TabHovered : ImGuiCol_Tab);
+        const ImU32 tab_col = GetColorU32((held || hovered) ? ImGuiCol_TabHovered : tab_contents_visible ? (tab_bar_focused ? ImGuiCol_TabSelected : ImGuiCol_TabDimmedSelected) : (tab_bar_focused ? ImGuiCol_Tab : ImGuiCol_TabDimmed));
         TabItemBackground(display_draw_list, bb, flags, tab_col);
-        if (tab_contents_visible)
+        if (tab_contents_visible && (tab_bar->Flags & ImGuiTabBarFlags_DrawSelectedOverline) && style.TabBarOverlineSize > 0.0f)
         {
-            // M3 primary tab active indicator: 64dp wide, 3dp tall, corner-full,
-            // sitting on the bottom edge of the tab. Width follows the M3 token
-            // rather than being a fraction of the label.
-            const ImGuiM3Metrics& m = ImGuiM3GetMetrics();
-            const float indicator_h = m.tab_indicator_height * m.density;
-            const float indicator_w = ImMin(bb.GetWidth() - 8.0f * m.density, m.nav_indicator_width * m.density);
-            const float y1 = bb.Max.y - indicator_h;
-            const float x0 = bb.GetCenter().x - indicator_w * 0.5f;
-            const float x1 = bb.GetCenter().x + indicator_w * 0.5f;
-            const float r = m.tab_indicator_radius * m.density;
-            if (indicator_w > 0.0f)
+            // Might be moved to TabItemBackground() ?
+            ImVec2 tl = bb.GetTL() + ImVec2(0, 1.0f * g.CurrentDpiScale);
+            ImVec2 tr = bb.GetTR() + ImVec2(0, 1.0f * g.CurrentDpiScale);
+            ImU32 overline_col = GetColorU32(tab_bar_focused ? ImGuiCol_TabSelectedOverline : ImGuiCol_TabDimmedSelectedOverline);
+            if (style.TabRounding > 0.0f)
             {
-                display_draw_list->PathLineTo(ImVec2(x0, bb.Max.y));
-                display_draw_list->PathArcToFast(ImVec2(x0 + r, y1 + r), r, 6, 9);
-                display_draw_list->PathArcToFast(ImVec2(x1 - r, y1 + r), r, 9, 12);
-                display_draw_list->PathLineTo(ImVec2(x1, bb.Max.y));
-                display_draw_list->PathFillConvex(ImGuiM3ColorU32(ImGuiM3Role_Primary));
+                float rounding = style.TabRounding;
+                display_draw_list->PathArcToFast(tl + ImVec2(+rounding, +rounding), rounding, 7, 9);
+                display_draw_list->PathArcToFast(tr + ImVec2(-rounding, +rounding), rounding, 9, 11);
+                display_draw_list->PathStroke(overline_col, 0, style.TabBarOverlineSize);
+            }
+            else
+            {
+                display_draw_list->AddLine(tl - ImVec2(0.5f, 0.5f), tr - ImVec2(0.5f, 0.5f), overline_col, style.TabBarOverlineSize);
             }
         }
         RenderNavCursor(bb, id);
@@ -11225,23 +10815,27 @@ ImVec2 ImGui::TabItemCalcSize(ImGuiWindow* window)
 
 void ImGui::TabItemBackground(ImDrawList* draw_list, const ImRect& bb, ImGuiTabItemFlags flags, ImU32 col)
 {
-    // VKIntox M3 Expressive primary tabs: a tab has no container of its own. The
-    // selection is a 3dp active indicator on the bottom edge (drawn by the caller,
-    // which knows which tab is selected), and hover/press is a plain state layer
-    // in the tab's content colour. `col` carries the hover state for us.
+    // While rendering tabs, we trim 1 pixel off the top of our bounding box so they can fit within a regular frame height while looking "detached" from it.
     ImGuiContext& g = *GImGui;
     const float width = bb.GetWidth();
+    IM_UNUSED(flags);
     IM_ASSERT(width > 0.0f);
-
-    // col is ImGuiCol_TabHovered when hovered or held, transparent otherwise.
-    if ((col & IM_COL32_A_MASK) != 0)
+    const float rounding = ImMax(0.0f, ImMin((flags & ImGuiTabItemFlags_Button) ? g.Style.FrameRounding : g.Style.TabRounding, width * 0.5f - 1.0f));
+    const float y1 = bb.Min.y + 1.0f;
+    const float y2 = bb.Max.y - g.Style.TabBarBorderSize;
+    draw_list->PathLineTo(ImVec2(bb.Min.x, y2));
+    draw_list->PathArcToFast(ImVec2(bb.Min.x + rounding, y1 + rounding), rounding, 6, 9);
+    draw_list->PathArcToFast(ImVec2(bb.Max.x - rounding, y1 + rounding), rounding, 9, 12);
+    draw_list->PathLineTo(ImVec2(bb.Max.x, y2));
+    draw_list->PathFillConvex(col);
+    if (g.Style.TabBorderSize > 0.0f)
     {
-        const ImU32 layer = col;
-        draw_list->AddRectFilled(bb.Min, bb.Max, layer);
+        draw_list->PathLineTo(ImVec2(bb.Min.x + 0.5f, y2));
+        draw_list->PathArcToFast(ImVec2(bb.Min.x + rounding + 0.5f, y1 + rounding + 0.5f), rounding, 6, 9);
+        draw_list->PathArcToFast(ImVec2(bb.Max.x - rounding - 0.5f, y1 + rounding + 0.5f), rounding, 9, 12);
+        draw_list->PathLineTo(ImVec2(bb.Max.x - 0.5f, y2));
+        draw_list->PathStroke(GetColorU32(ImGuiCol_Border), 0, g.Style.TabBorderSize);
     }
-
-    (void)flags;
-    (void)g.Style.TabRounding;
 }
 
 // Render text label (with custom clipping) + Unsaved Document marker + Close Button logic
@@ -11334,13 +10928,7 @@ void ImGui::TabItemLabelAndCloseButton(ImDrawList* draw_list, const ImRect& bb, 
         }
     }
     LogSetNextTextDecoration("/", "\\");
-    // VKIntox M3: selected tabs read in `primary`, the rest in
-    // `on-surface-variant`. This is the "emphasized" label treatment the
-    // expressive spec calls for on selection.
-    PushStyleColor(ImGuiCol_Text, is_contents_visible ? ImGuiM3ColorU32(ImGuiM3Role_Primary)
-                                                      : ImGuiM3ColorU32(ImGuiM3Role_OnSurfaceVariant));
     RenderTextEllipsis(draw_list, text_ellipsis_clip_bb.Min, text_ellipsis_clip_bb.Max, ellipsis_max_x, label, NULL, &label_size);
-    PopStyleColor();
 
 #if 0
     if (!is_contents_visible)
