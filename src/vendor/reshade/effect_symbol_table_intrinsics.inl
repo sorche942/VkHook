@@ -1709,7 +1709,7 @@ IMPLEMENT_INTRINSIC_HLSL(tex1Dfetch, 0, {
 			id_to_name(args[1].base) + " + 0.5) * " + id_to_name(args[0].base) + ".pixelsize.x, 0.5 * " + id_to_name(args[0].base) + ".pixelsize.y, 0, 0))";
 	})
 IMPLEMENT_INTRINSIC_SPIRV(tex1Dfetch, 0, {
-	const spv::Id zero = emit_constant(0);
+	const spv::Id zero = emit_constant({ type::t_int, 1, 1 }, 0);
 	const spv::Id coords = add_instruction(spv::OpCompositeConstruct, convert_type({ type::t_int, 2, 1 }))
 		.add(args[1].base)
 		.add(zero)
@@ -1751,7 +1751,7 @@ IMPLEMENT_INTRINSIC_HLSL(tex1Dstore, 1, {
 	})
 IMPLEMENT_INTRINSIC_SPIRV(tex1Dstore, 0, {
 	add_capability(spv::CapabilityStorageImageWriteWithoutFormat);
-	const spv::Id zero = emit_constant(0);
+	const spv::Id zero = emit_constant({ type::t_int, 1, 1 }, 0);
 	const spv::Id coords = add_instruction(spv::OpCompositeConstruct, convert_type({ type::t_int, 2, 1 }))
 		.add(args[1].base)
 		.add(zero)
@@ -1768,7 +1768,7 @@ IMPLEMENT_INTRINSIC_SPIRV(tex1Dstore, 0, {
 	})
 IMPLEMENT_INTRINSIC_SPIRV(tex1Dstore, 1, {
 	add_capability(spv::CapabilityStorageImageWriteWithoutFormat);
-	const spv::Id zero = emit_constant(0);
+	const spv::Id zero = emit_constant({ type::t_int, 1, 1 }, 0);
 	const spv::Id coords = add_instruction(spv::OpCompositeConstruct, convert_type({ type::t_int, 2, 1 }))
 		.add(args[1].base)
 		.add(zero)
@@ -1885,7 +1885,7 @@ IMPLEMENT_INTRINSIC_HLSL(tex2Dfetch, 3, {
 			id_to_name(args[1].base) + " + 0.5) * " + id_to_name(args[0].base) + ".pixelsize.x, 0.5 * " + id_to_name(args[0].base) + ".pixelsize.y, 0, 0))";
 	})
 IMPLEMENT_INTRINSIC_SPIRV(tex2Dfetch, 3, {
-	const spv::Id zero = emit_constant(0);
+	const spv::Id zero = emit_constant({ type::t_int, 1, 1 }, 0);
 	const spv::Id coords = add_instruction(spv::OpCompositeConstruct, convert_type({ type::t_int, 2, 1 }))
 		.add(args[1].base)
 		.add(zero)

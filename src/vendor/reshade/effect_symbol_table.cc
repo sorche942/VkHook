@@ -7,6 +7,7 @@
 #include <cassert>
 #include <algorithm> // std::upper_bound, std::sort
 #include <stdexcept>
+#include <alloca.h>
 
 // Override assert to throw instead of abort — lets callers catch compilation failures gracefully
 #undef assert

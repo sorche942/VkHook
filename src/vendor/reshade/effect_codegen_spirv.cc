@@ -6,6 +6,7 @@
 #include "effect_parser.hh"
 #include "effect_codegen.hh"
 #include <cassert>
+#include <cstdlib>
 #include <cstring> // memcmp
 #include <algorithm> // std::find_if, std::max
 #include <cctype>

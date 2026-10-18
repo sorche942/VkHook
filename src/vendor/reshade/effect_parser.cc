@@ -927,14 +927,13 @@ bool reshadefx::parser::parse_expression_unary(expression &exp)
 				if (arguments[i].type.components() > param_type.components())
 					warning(arguments[i].location, 3206, "implicit truncation of vector type");
 
-				arguments[i].add_cast_operation(param_type);
-
 				if (symbol.op == symbol_type::function || param_type.has(type::q_out))
 				{
 				if (param_type.is_sampler() || (symbol.op != symbol_type::function && param_type.has(type::q_inout)))
 				{
 					// Do not shadow sampler parameters to function calls (but do load them for intrinsics)
 					parameters[i] = arguments[i];
+					parameters[i].add_cast_operation(param_type);
 				}
 					else
 					{
@@ -945,6 +944,7 @@ bool reshadefx::parser::parse_expression_unary(expression &exp)
 				}
 				else
 				{
+					arguments[i].add_cast_operation(param_type);
 					// Preserve sampler/storage qualifiers for intrinsics (e.g. storage samplers)
 					// so backend codegen can pick the correct SPIR-V image operations.
 					const reshadefx::type loaded_type = (symbol.op != symbol_type::function && param_type.is_sampler()) ?
@@ -960,7 +960,11 @@ bool reshadefx::parser::parse_expression_unary(expression &exp)
 			for (size_t i = 0; i < total_argument_count; ++i)
 				// Only do this for pointer parameters as discovered above
 				if (parameters[i].is_lvalue && parameters[i].type.has(type::q_in) && !parameters[i].type.is_sampler())
-					_codegen->emit_store(parameters[i], _codegen->emit_load(arguments[i]));
+				{
+					expression value = arguments[i];
+					value.add_cast_operation(parameters[i].type);
+					_codegen->emit_store(parameters[i], _codegen->emit_load(value));
+				}
 
 			// Check if the call resolving found an intrinsic or function and invoke the corresponding code
 			const auto result = symbol.op == symbol_type::function ?
@@ -973,7 +977,11 @@ bool reshadefx::parser::parse_expression_unary(expression &exp)
 			for (size_t i = 0; i < total_argument_count; ++i)
 				// Only do this for pointer parameters as discovered above
 				if (parameters[i].is_lvalue && parameters[i].type.has(type::q_out) && !parameters[i].type.is_sampler())
-					_codegen->emit_store(arguments[i], _codegen->emit_load(parameters[i]));
+				{
+					expression value = parameters[i];
+					value.add_cast_operation(arguments[i].type);
+					_codegen->emit_store(arguments[i], _codegen->emit_load(value));
+				}
 		}
 		else if (symbol.op == symbol_type::invalid)
 		{
