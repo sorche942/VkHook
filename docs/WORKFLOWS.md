@@ -2,6 +2,78 @@
 
 GitHub Actions builds VKIntox, runs the unit tests, compiles every ReShade shader from the package list, and smoke-tests the layer under `vkcube`. CI runs on Ubuntu with lavapipe, so the shader and smoke jobs exercise the layer without a GPU.
 
+## vendor subtrees
+
+`src/vendor/imgui` and `src/vendor/reshade` are ordinary tracked directories,
+imported with `git subtree --squash`. A normal clone or Git source archive
+contains their complete patched sources; no submodule initialization is needed.
+
+| Prefix | Source repository | Initial imported revision |
+| --- | --- | --- |
+| `src/vendor/imgui` | https://github.com/buwryme/imgui-material-3.git | `80b80599b864489b78b6692a39ed7709c3404b2a` |
+| `src/vendor/reshade` | https://github.com/buwryme/reshade-vkintox.git | `4e296c625414adbc3ff846a363492e977a86780f` |
+
+These are the existing VKIntox-specific forks, not direct imports of
+`ocornut/imgui` or `crosire/reshade`: extensions, file names and directory
+layouts differ. The migration retained the pinned versions and committed all
+existing local patches separately, including removal of the Material UI and
+the ReShade code-generation fixes. No dependency upgrade was performed.
+
+### committing local patches
+
+Edit vendor sources in place and commit them in VKIntox:
+
+```bash
+git add src/vendor/imgui
+git commit -m "Fix ImGui integration"
+# Or stage src/vendor/reshade for a compiler patch.
+```
+
+Prefer separate vendor and application commits so exported patches stay focused.
+There is no nested repository to commit or push first.
+
+### updating a subtree
+
+Start with a clean working tree. Review the source changes and replace `main`
+below with a specific reviewed commit or tag when pinning an update:
+
+```bash
+git subtree pull --prefix=src/vendor/imgui \
+    https://github.com/buwryme/imgui-material-3.git main --squash
+git subtree pull --prefix=src/vendor/reshade \
+    https://github.com/buwryme/reshade-vkintox.git main --squash
+```
+
+These commands merge the update with local patches; resolve conflicts normally.
+Always retain `--squash`. Review theme removals and compiler fixes before
+accepting an update, then build and smoke-test both architectures. Do not point
+these commands at the original upstream repositories without a separate layout
+migration. URLs are used deliberately: local Git remotes are not copied by clone.
+This workstation also has `vendor-imgui` and `vendor-reshade` convenience remotes.
+
+### exporting patches
+
+Create vendor-only branches when preparing patches for a fork or upstream:
+
+```bash
+git subtree split --prefix=src/vendor/imgui --branch=patches/imgui
+git subtree split --prefix=src/vendor/reshade --branch=patches/reshade
+```
+
+Use a new branch name if that name already exists. Splitting does not change
+the checked-out application branch or push anything. The exported histories
+start from the corresponding vendor baseline and contain VKIntox's vendor edits.
+
+### local migration backup
+
+Before conversion, both dirty submodule worktrees, binary diffs, complete Git
+bundles, and file/hash inventories were saved outside the checkout under
+`~/.local/state/vkintox/vendor-subtrees-20261018-204334/`.
+Restored vendor files matched the original contents, modes, and symlinks before
+the documentation updates. The old submodule object stores remain in `.git/modules`
+for recovery, but their active local configuration and `.gitmodules` were removed.
+
+
 ## user-local native installation
 
 Install existing 64-bit and 32-bit builds without root or changes to `/usr`:
@@ -536,9 +608,9 @@ uv tool run --with ninja meson test -C build-zig32 --no-rebuild --print-errorlog
 scripts/install-local.sh install build-zig32
 ```
 
-The ReShade submodule has small local C++20/libc++ compatibility fixes (qualified
+The ReShade subtree has small local C++20/libc++ compatibility fixes (qualified
 `reshadefx::module`, explicit `<cstdlib>` and `<alloca.h>` includes). Retain them
-when updating that submodule. The main source also preserves full-width Vulkan
+when updating that subtree. The main source also preserves full-width Vulkan
 handles on i386 and handles both ELF32 REL and ELF64 RELA relocations, including
 Wayland's non-PLT `GLOB_DAT` GOT entries.
 

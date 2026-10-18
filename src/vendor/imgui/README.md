@@ -12,5 +12,15 @@ Vulkan backend changes. The runtime uses ImGui's embedded default font; setup
 does not download or install interface fonts. Optional font fixtures and their
 licenses remain separate from the runtime for the variable-font tests.
 
+### repository integration
+
+This directory is tracked directly in VKIntox as a squashed Git subtree of
+[`buwryme/imgui-material-3`](https://github.com/buwryme/imgui-material-3), initially
+imported at `80b80599b864489b78b6692a39ed7709c3404b2a`. That fork supplies the
+VKIntox file layout and extensions; local commits remove its Material theme and
+restore the upstream widgets described above. This is not a direct subtree of
+`ocornut/imgui`. See the repository's `docs/WORKFLOWS.md` for updates and patch
+export. No submodule initialization is required.
+
 ### license
 ImGui is licensed under the MIT License, see [LICENSE.txt](LICENSE.txt). the modifications that this repository has are under that license too.
