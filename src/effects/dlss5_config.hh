@@ -49,7 +49,27 @@ namespace VKIntox
         add("localStructure", "Local structure", 1.0f, 0.0f, 1.0f,
             "OpenDLSS neural local-structure conditioning at the original resolution.");
         add("skinStructure", "Skin structure (-1: follow local)", -1.0f, -1.0f, 1.0f,
-            "OpenDLSS skin-structure conditioning. Negative values follow Local structure.");
+            "OpenDLSS skin-structure conditioning when Auto-mask is enabled. Negative values follow Local structure; ignored when Auto-mask is disabled.");
+        auto autoMask = std::make_unique<BoolParam>();
+        autoMask->effectName = name;
+        autoMask->name = "autoMask";
+        autoMask->label = "Auto-mask";
+        autoMask->uiType = "checkbox";
+        autoMask->defaultValue = true;
+        autoMask->value = config ? config->getOption<bool>(name + ".autoMask", true) : true;
+        autoMask->tooltip = "OpenDLSS structure-conditioning mode, not an explicit segmentation mask. Disable to use global Local structure and ignore Skin structure.";
+        effect.parameters.push_back(std::move(autoMask));
+        add("style", "Style (experimental)", 0.0f, 0.0f, 128.0f,
+            "Experimental OpenDLSS conditioning, passed to the model as Style / 128. The 0-128 range is exploratory, not a validated visual scale. Zero preserves the existing input.");
+        auto seed = std::make_unique<UintParam>();
+        seed->effectName = name;
+        seed->name = "seed";
+        seed->label = "Noise seed";
+        seed->uiType = "slider";
+        seed->maxValue = 65535;
+        seed->value = config ? config->getOption<uint32_t>(name + ".seed", 0u) : 0u;
+        seed->tooltip = "Fixed Gaussian input seed, not randomized each frame. Right-click to enter any unsigned 32-bit value (0-4294967295). Changing it resets temporal history; it is not a quality level.";
+        effect.parameters.push_back(std::move(seed));
         auto temporal = std::make_unique<BoolParam>();
         temporal->effectName = name;
         temporal->name = "temporal";

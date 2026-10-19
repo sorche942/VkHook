@@ -67,10 +67,10 @@ void main() {
         features[base + 7u + c] = history[c];
     }
     features[base + 3u] = 1.0;
-    features[base + 10u] = 0.0;
+    features[base + 10u] = p.style / 128.0;
     features[base + 11u] = roundF16(p.localTone);
-    features[base + 12u] = 1.0;
-    features[base + 13u] = roundF16(p.skinStructure < 0.0 ? p.localStructure : p.skinStructure);
-    features[base + 14u] = roundF16(p.localStructure);
+    features[base + 12u] = roundF16(p.autoMask != 0u ? 1.0 : p.localStructure);
+    features[base + 13u] = roundF16(p.autoMask != 0u ? (p.skinStructure < 0.0 ? p.localStructure : p.skinStructure) : -1.0);
+    features[base + 14u] = roundF16(p.autoMask != 0u ? p.localStructure : -1.0);
     features[base + 15u] = 0.0;
 }

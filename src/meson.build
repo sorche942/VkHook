@@ -43,6 +43,11 @@ if dlss5_available
     dlss5_paths = configuration_data()
     dlss5_paths.set_quoted('DLSS5_SHADER_DIR', opendlss_nr_install_shader_dir)
     dlss5_paths.set_quoted('DLSS5_PTX_DIR', opendlss_nr_install_ptx_dir)
+    dlss5_library_dir = get_option('prefix') / lib_dir
+    dlss5_paths.set_quoted('DLSS5_SHADER_RELATIVE_DIR',
+        dlss5_fs.relative_to(opendlss_nr_install_shader_dir, dlss5_library_dir))
+    dlss5_paths.set_quoted('DLSS5_PTX_RELATIVE_DIR',
+        dlss5_fs.relative_to(opendlss_nr_install_ptx_dir, dlss5_library_dir))
     configure_file(output : 'dlss5_paths.hh', configuration : dlss5_paths)
     dlss5_chain = custom_target('dlss5 device feature chain',
         input : get_option('dlss5_vulkan_registry'),

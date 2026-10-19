@@ -28,15 +28,23 @@ namespace VKIntox
             return config->getOption<std::string>(key, value && *value ? value : fallback);
         }
 
-        std::string installedAssets(const char* kind, const char* systemPath)
+        std::string installedAssets(const char* kind, const char* relativePath, const char* systemPath)
         {
-            // User-local installs keep kernels next to each architecture's .so.
-            // System/Flatpak installs use Meson's configured data directory.
+            // Resolve loader-created symlinks before looking beside the library:
+            // pressure-vessel remaps the original installation under /run/parent.
             Dl_info module{};
             if (dladdr(reinterpret_cast<void*>(&installedAssets), &module) && module.dli_fname)
             {
-                const auto path = std::filesystem::path(module.dli_fname).parent_path() / "dlss5" / kind;
-                if (std::filesystem::is_directory(path)) return path.string();
+                std::error_code error;
+                auto library = std::filesystem::canonical(module.dli_fname, error);
+                if (error) library = module.dli_fname;
+                const auto directory = library.parent_path();
+                // User-local installs keep assets beside each architecture's .so.
+                const auto adjacent = directory / "dlss5" / kind;
+                if (std::filesystem::is_directory(adjacent)) return adjacent.string();
+                // Preserve Meson's libdir/datadir relationship after relocation.
+                const auto installed = (directory / relativePath).lexically_normal();
+                if (std::filesystem::is_directory(installed)) return installed.string();
             }
             return systemPath;
         }
@@ -113,8 +121,10 @@ namespace VKIntox
             (std::filesystem::path(ConfigSerializer::getBaseConfigDir()) / "models/dlss5").string());
         if (!std::filesystem::is_regular_file(std::filesystem::path(modelPath) / "manifest.json"))
             throw std::runtime_error("DLSS5 model missing: extract your DLL with scripts/extract-dlss5-weights.py and set dlss5ModelPath or VKINTOX_DLSS5_MODEL");
-        const std::string shaderPath = pathOption(config, "dlss5ShaderPath", "VKINTOX_DLSS5_SHADER_DIR", installedAssets("shaders", DLSS5_SHADER_DIR));
-        const std::string ptxPath = pathOption(config, "dlss5PtxPath", "VKINTOX_DLSS5_PTX_DIR", installedAssets("ptx", DLSS5_PTX_DIR));
+        const std::string shaderPath = pathOption(config, "dlss5ShaderPath", "VKINTOX_DLSS5_SHADER_DIR",
+            installedAssets("shaders", DLSS5_SHADER_RELATIVE_DIR, DLSS5_SHADER_DIR));
+        const std::string ptxPath = pathOption(config, "dlss5PtxPath", "VKINTOX_DLSS5_PTX_DIR",
+            installedAssets("ptx", DLSS5_PTX_RELATIVE_DIR, DLSS5_PTX_DIR));
         auto& s = *state;
         s.device = device;
         s.registry = registry;
@@ -232,6 +242,13 @@ namespace VKIntox
         s.parameters.localTone = value("localTone", 1, 0, 1);
         s.parameters.localStructure = value("localStructure", 1, 0, 1);
         s.parameters.skinStructure = value("skinStructure", -1, -1, 1);
+        const auto autoMask = s.registry->getParameter(s.name, "autoMask");
+        s.parameters.autoMask = !autoMask || (*autoMask)->getType() != ParamType::Bool
+            || static_cast<const BoolParam*>(*autoMask)->value;
+        s.parameters.style = value("style", 0, 0, 128);
+        const auto seed = s.registry->getParameter(s.name, "seed");
+        s.parameters.seed = seed && (*seed)->getType() == ParamType::Uint
+            ? static_cast<const UintParam*>(*seed)->value : 0u;
         const auto temporal = s.registry->getParameter(s.name, "temporal");
         s.parameters.temporal = s.flow && (!temporal || (*temporal)->getType() != ParamType::Bool
             || static_cast<const BoolParam*>(*temporal)->value);
@@ -248,9 +265,12 @@ namespace VKIntox
     {
         auto& s = *state;
         const auto now = std::chrono::steady_clock::now();
-        const bool sameControls = std::memcmp(&s.parameters, &s.submittedParameters, 40) == 0
+        const bool sameControls = std::memcmp(&s.parameters, &s.submittedParameters,
+                                             offsetof(Dlss5Parameters, temporal)) == 0
             && s.parameters.temporal == s.submittedParameters.temporal
-            && s.parameters.historyStrength == s.submittedParameters.historyStrength;
+            && s.parameters.historyStrength == s.submittedParameters.historyStrength
+            && s.parameters.autoMask == s.submittedParameters.autoMask
+            && s.parameters.style == s.submittedParameters.style;
         s.parameters.historyValid = s.parameters.temporal && s.lastFrameSerial != 0
             && frameSerial == s.lastFrameSerial + 1 && sameControls
             && now - s.lastSubmission < std::chrono::milliseconds(250);

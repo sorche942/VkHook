@@ -1,4 +1,4 @@
-project('VKIntox', ['c', 'cpp'], default_options: ['c_std=c11', 'cpp_std=c++2a'])
+project('VKIntox', ['c', 'cpp'], meson_version: '>=1.3.0', default_options: ['c_std=c11', 'cpp_std=c++2a'])
 
 cpp = meson.get_compiler('cpp')
 

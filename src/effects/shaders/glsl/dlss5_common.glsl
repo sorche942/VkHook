@@ -1,7 +1,7 @@
 #ifndef DLSS5_COMMON_GLSL
 #define DLSS5_COMMON_GLSL
 
-// Scalar std430 layout shared with VKIntox::Dlss5Parameters (64 bytes).
+// Scalar std430 layout shared with VKIntox::Dlss5Parameters (72 bytes).
 layout(std430, binding = 1) readonly buffer Parameters {
     uint width, height, fullWidth, fullHeight;
     uint bgra, seed;
@@ -9,6 +9,8 @@ layout(std430, binding = 1) readonly buffer Parameters {
     uint temporal, historyValid, flowWidth, flowHeight;
     float historyStrength;
     uint debugView;
+    uint autoMask;
+    float style;
 } p;
 
 bool dlss5Finite(vec3 value) {

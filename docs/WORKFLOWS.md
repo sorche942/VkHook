@@ -116,6 +116,10 @@ per-device downstream dispatch; it does not create a second Vulkan device.
 - Both native and i686 builds compile the backend. The regular Meson install
   includes SPIR-V/PTX assets under `share/vkintox/dlss5`; `install-local.sh`
   stages them beside each architecture's library instead.
+  The Flatpak manifest builds pinned glslang 16.6.0 (the 26.08 SDK ships 16.4.0)
+  and requires `-Ddlss5=enabled`, so missing build prerequisites fail explicitly
+  instead of silently omitting the backend. The compiler is build-only; the
+  extension ships the compiled SPIR-V/PTX assets.
   NVIDIA driver 615.78.08 exposes CUDA kernel launch to x86-64 applications but
   not i686 applications on this workstation: i686 inference is unavailable.
   The i686 layer reports the missing extension and keeps rendering without
@@ -161,16 +165,32 @@ DLSS5.intensity = 1
 DLSS5.localTone = 1
 DLSS5.localStructure = 1
 DLSS5.skinStructure = -1
+DLSS5.autoMask = true
+DLSS5.style = 0
+DLSS5.seed = 0
 DLSS5.temporal = true
 DLSS5.historyStrength = 1
 ```
 
-The existing parameter UI exposes these controls. Intensity ranges from 0
-(byte-exact passthrough) to 1; local tone and structure range from 0 to 1, and
-skin structure from -1 to 1. Temporal enables hardware optical-flow history;
-history strength ranges from 0 (no reuse) to 1 (full confidence-weighted reuse).
-Both default to enabled/full strength. Parameters update without rebuilding
-the network; toggling temporal re-records the affected command buffers.
+The parameter UI exposes these controls. Intensity ranges from 0 (byte-exact
+passthrough) to 1; local tone and structure range from 0 to 1, and skin structure
+from -1 to 1.
+
+| Conditioning control | Default | Behavior |
+| --- | --- | --- |
+| Auto-mask (`autoMask`) | On | Uses the bundled OpenDLSS-NR auto-mask conditioning mode. Off uses global Local structure and ignores Skin structure. This is not an explicit segmentation mask or a guarantee of face/HUD detection. |
+| Style (experimental) (`style`) | 0 | Passed to the model as `style / 128`. VKIntox bounds it to 0–128, an exploratory range rather than a validated visual scale. Zero preserves the previous conditioning input. |
+| Noise seed (`seed`) | 0 | Fixed unsigned 32-bit seed for Gaussian model input. The slider covers 0–65535; right-click **Type in manually...** accepts the full 0–4294967295 range. It does not randomize each frame or select a quality level. |
+
+These defaults preserve the previous model inputs. Controls persist in shader
+profiles under `[DLSS5]` (or the individual instance's section); changing
+Auto-mask, Style, or Noise seed invalidates temporal history on the next
+submission. They do not reduce neural-network work or replace native DLSS SR.
+
+Temporal enables hardware optical-flow history; history strength ranges from 0
+(no reuse) to 1 (full confidence-weighted reuse). Both default to enabled/full
+strength. Parameters update without rebuilding the network; toggling temporal
+re-records the affected command buffers.
 Keep the normal `depthCapture = on` setting: the layer's existing depth-transition
 submission gate is also used for native effects.
 
@@ -186,10 +206,54 @@ ENABLE_VKINTOX=1 your-application
 ```
 
 Equivalent config keys are `dlss5ShaderPath` and `dlss5PtxPath`; explicit config
-values override environment defaults. Installed builds discover adjacent assets first,
-then their configured installation paths. Restart the application after changing
-model or kernel paths. Missing assets or unsupported hardware/formats produce
-an effect error and preserve the ordinary transfer path.
+values override environment defaults. Installed builds resolve the layer library's
+symlinks, check adjacent assets, then locate assets using Meson's libdir/datadir
+relationship relative to that library. The configured absolute installation paths
+are the final fallback. Building this relocation support requires Meson 1.3 or newer.
+Restart the application after changing model or kernel paths. Missing assets or
+unsupported hardware/formats produce an effect error and preserve the ordinary
+transfer path.
+
+### Heroic Flatpak
+
+Build/install the current checkout for Heroic with:
+
+```bash
+./setup flatpak com.heroicgameslauncher.hgl
+```
+
+This installs the 26.08 Vulkan layer extension and enables `ENABLE_VKINTOX=1`
+for Heroic. A native host installation is separate and does not update this
+extension. The installer needs `just`, Python, `sha256sum`, `flatpak`,
+`flatpak-builder`, `curl`, and `unzip`.
+
+Place your already-extracted model directory, containing `manifest.json` and
+the stage files, at:
+
+```text
+~/.var/app/com.heroicgameslauncher.hgl/config/VKIntox/models/dlss5/
+```
+
+Alternatively, use `VKINTOX_DLSS5_MODEL` with a path the sandbox can read;
+setting an environment variable alone does not grant filesystem access.
+No shader/PTX path overrides are needed for the installed extension.
+Fully quit Heroic (including its tray process) and the game, then relaunch.
+The log is
+`~/.var/app/com.heroicgameslauncher.hgl/config/VKIntox/vkintox.log`.
+
+“Built without DLSS5 support” indicates an old/backend-disabled layer binary,
+not missing weights. A supported build with missing weights instead reports
+the missing model.
+
+Proton/UMU adds a pressure-vessel container inside Heroic's Flatpak. Its imported
+layer symlink can target
+`/run/parent/usr/lib/extensions/vulkan/VKIntox/lib/libvkintox.so`, while the
+compiled `/usr/lib/extensions/...` asset paths are absent. Library-relative
+lookup handles this remapping without environment overrides or copied kernels.
+A missing `dlss5_luma.spv` at the old absolute path can indicate an older layer
+without this relocation support. The corrected extension rendered 1,800 vkcube
+frames with the full 71-block model and hardware optical flow inside Heroic's
+pressure-vessel runtime, then exited cleanly.
 
 ### Inspect optical flow and temporal reuse
 

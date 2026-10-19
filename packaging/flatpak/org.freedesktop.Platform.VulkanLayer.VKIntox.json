@@ -22,6 +22,27 @@
       ]
     },
     {
+      "name": "glslang",
+      "buildsystem": "cmake-ninja",
+      "config-opts": [
+        "-DCMAKE_BUILD_TYPE=Release",
+        "-DCMAKE_INSTALL_PREFIX=/usr/lib/extensions/vulkan/VKIntox",
+        "-DBUILD_SHARED_LIBS=OFF",
+        "-DBUILD_EXTERNAL=OFF",
+        "-DENABLE_OPT=OFF",
+        "-DGLSLANG_TESTS=OFF"
+      ],
+      "cleanup": ["*"],
+      "sources": [
+        {
+          "type": "git",
+          "url": "https://github.com/KhronosGroup/glslang.git",
+          "tag": "16.6.0",
+          "commit": "e1b562a8bed273a02f30b59b66a5d499793cede5"
+        }
+      ]
+    },
+    {
       "name": "vkintox",
       "buildsystem": "meson",
       "build-options": {
@@ -30,6 +51,7 @@
           "CXX": "/usr/lib/sdk/llvm22/bin/clang++",
           "CPPFLAGS": "-I/usr/lib/extensions/vulkan/VKIntox/include"
         },
+        "prepend-path": "/usr/lib/extensions/vulkan/VKIntox/bin",
         "prepend-pkg-config-path": "/usr/lib/extensions/vulkan/VKIntox/lib/pkgconfig"
       },
       "config-opts": [
@@ -39,6 +61,7 @@
         "-Dappend_libdir_vkintox=false",
         "-Dwith_so=true",
         "-Dwith_json=true",
+        "-Ddlss5=enabled",
         "-Dcpp_args=-I/usr/lib/extensions/vulkan/VKIntox/include"
       ],
       "sources": [
