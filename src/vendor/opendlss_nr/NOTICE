@@ -21,5 +21,7 @@ VKIntox vendor integration:
 - Includes only the OpenDLSS-NR compute host, CPU numeric references, shaders and PTX generators.
 - Uses per-context downstream Vulkan dispatch instead of process-global volk.
 - Adds Linux Meson/Python asset generation, explicit shader/PTX paths, and borrowed-device lifetime handling.
-- Preserves the upstream network, shader arithmetic, PTX generators and original license above.
+- Preserves the upstream network, shader arithmetic and original license above. The PTX generators carry
+  RTX 50 (Blackwell) scheduling changes (chain fences, qkv head residency, FFN skip staging, register caps) whose
+  outputs are bit-identical to upstream's; see docs/WORKFLOWS.md "Network performance".
 - NVIDIA model weights are not part of this vendored source directory.

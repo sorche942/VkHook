@@ -15,11 +15,12 @@ def variants():
     for k in (64, 128, 256):
         add(f'mlp_e4m3_K{k}', 'mlp_e4m3', (k,), (3, 1, 1))
     for c in (64, 128, 256, 512):
-        add(f'qkv_e4m3_K{c}', 'qkv_e4m3', (c,), (80,))
+        add(f'qkv_e4m3_K{c}', 'qkv_e4m3', (c,), (88,))   # 88: measured 2-5% ahead of 80 on Blackwell
     for k in (32, 64, 128, 256, 512, 1024):
         for flags in (5, 13, 4, 8, 6):
             add(f'gemm2_e4m3_K{k}_f{flags}', 'gemm2_e4m3', (k, flags))
-    for c, rows, regs in ((64, 4, 0), (128, 4, 0), (256, 3, 80), (256, 4, 64)):
+    # C128 at .maxnreg 64: two 16-warp workgroups per SM on Blackwell (a few spills, ~25% faster than one at 88).
+    for c, rows, regs in ((64, 4, 0), (128, 4, 64), (256, 3, 80), (256, 4, 64)):
         add(f'ffn_e4m3_C{c}_R{rows}', 'ffn_e4m3', (c, rows), (regs,))
         add(f'ffn_e4m3_C{c}_R{rows}_proj', 'ffn_e4m3', (c, rows), (regs, 1))
     for k, flags, steps, splits in ((4096, 1, 32, 4), (1024, 0, 16, 2), (1024, 1, 8, 4), (1024, 0, 8, 4)):

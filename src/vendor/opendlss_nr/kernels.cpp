@@ -861,7 +861,9 @@ void Kernels::qkvAttention(VkCommandBuffer commands, const Activation& input, co
     dispatchLabel_ = "qkv_ptx " + std::to_string(windows) + "w x" + std::to_string(heads) + " K" + std::to_string(heads * 32);
     check((heads & (heads - 1)) == 0 && windows * heads < (1u << 24), "PTX qkv item indexing");
     noteChain(pWait, 0, pSignal);
-    cudaLaunchTracked(commands, kernel.function, std::min(items, qkvGroups), 1, 1, 128, 0, params, 18, chain.chained);
+    // A multiple of the head count: every workgroup keeps one head, so its prior rows and (K <= 128) weights load once.
+    const uint32_t qkvGrid = std::min(items, qkvGroups) / heads * heads;
+    cudaLaunchTracked(commands, kernel.function, qkvGrid, 1, 1, 128, 0, params, 18, chain.chained);
     return;
   }
   check(!chain.waitBands && !chain.waitRows && !chain.signal && !chain.chained,

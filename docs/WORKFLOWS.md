@@ -341,6 +341,51 @@ check the `DLSS5 optical flow`/`DLSS5 temporal unavailable` startup messages.
 GPU inference requires the hardware above and locally extracted weights;
 lavapipe CI cannot prove it. These checks do not establish NVIDIA DLL parity.
 
+### Network performance
+
+`vkintox-dlss5-bench` (built with the backend) times the neural network alone on
+a private Vulkan device with synthetic input features; no weights leave the model
+directory and no window is needed:
+
+```bash
+B=build-gcc/src/vendor/opendlss_nr
+build-gcc/src/vkintox-dlss5-bench --model build-gcc/dlss5-model \
+  --shaders "$B" --ptx "$B" --width 3840 --height 2160 --frames 40
+```
+
+It records the graph once, resubmits it, and prints the minimum and median GPU
+time. `--profile` re-records every frame with per-launch timestamps and lists the
+minimum span per kernel and per block. `--chain 0|1` selects Vulkan barriers
+(the effect's schedule) or upstream's spinning counter chains. `--dump FILE`
+writes the network head as f32, and `--compare FILE` reports how many values
+differ from such a dump, so a PTX or scheduling change can be checked for
+bit-exact output against a previous build's `--ptx` directory.
+
+The vendored PTX generators are tuned for the RTX 5070 Ti (Blackwell, 70 SMs);
+every change only moves data or synchronization, so the head is bit-identical
+to the untuned graph:
+
+- Release fences before chain signals run only when chaining is on.
+- The window-attention (`qkv_e4m3`) grid is a multiple of the head count, so a
+  workgroup keeps one head: its prior rows load once, and for K ≤ 128 its weights
+  stay in shared memory; the kernel runs at `.maxnreg 88`.
+- The fused FFN reads its residual seeds from shared tiles instead of narrow
+  global loads, and C = 128 runs at `.maxnreg 64` (two workgroups per SM).
+
+Minimum of 40 frames, barrier schedule, interleaved runs of the original and
+tuned PTX on the same build:
+
+| Resolution | Original | Tuned | Change |
+| --- | ---: | ---: | ---: |
+| 1920×1080 | 7.02 ms | 6.40 ms | −8.9% |
+| 2560×1440 | 10.76 ms | 9.75 ms | −9.3% |
+| 3840×2160 | 23.36 ms | 20.99 ms | −10.2% |
+
+The PTX still targets `sm_89`, so Ada GPUs run it, but the register caps were
+chosen on Blackwell; re-measure them with this tool before tuning for another GPU.
+Absolute times on this GPU vary by up to ~10% between processes, so compare
+builds with interleaved runs.
+
 ## user-local native installation
 
 Install existing 64-bit and 32-bit builds without root or changes to `/usr`:

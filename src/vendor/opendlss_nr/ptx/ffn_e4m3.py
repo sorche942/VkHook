@@ -9,6 +9,8 @@ e = w / ROWT, row tile q = w % ROWT), rows per workgroup = 16 ROWT, grid = ceil(
            packs into the W2 A fragment through the permuted W1 columns), narrow tile [16 ROWT][C + 16] E4 in shared.
   phase 3: out[rows][32 e ..] = E4( skip * aux + narrow W3[:, 32 e ..] ), W3 tiles ring-staged per k32 step, the
            narrow rows read with ldmatrix (padded stride: conflict-free), output through the narrow region.
+The skip is read from shared, never with narrow global loads: from the staged A tile of k32 step e (plain) or the
+state tile (proj, whose ffnPrev tile is copied into the narrow region with the first Wproj stage).
 Arithmetic identical to mlp_e4m3 + gemm2_e4m3 (verified bit-exact). Dynamic shared memory (up to ~83 KB).
 
 python ffn_e4m3.py <C> <ROWT> out.ptx [maxregs] [proj]
@@ -60,14 +62,6 @@ def generate(C, rowt, max_regs=None, proj=False):
         p.emit(f"div.u32 {e}, {warp}, {rowt};"); p.emit(f"rem.u32 {q}, {warp}, {rowt};")
     blockRow = p.mul32(ctaid, rowsPerWg)
     rowsMinus1 = p.sub32(P["rows"], 1)
-    # this warp's rows g, g + 8 (clamped for the loads, never stored past the end)
-    rowOk = []; aRow = []; rowIdx = []
-    for h in range(2):
-        r = p.add32(blockRow, p.add32(p.shl32(q, 4), p.add32(g, p.imm32(8 * h))))
-        rowIdx.append(r)
-        rowOk.append(p.setp("lt.u32", r, P["rows"]))
-        rc = p.selp32(rowOk[h], r, rowsMinus1)
-        aRow.append(p.add64(P["pA"], p.widen(p.add32(p.mul32(rc, C), p.shl32(t, 2)))))
     stgAddr = [p.add32(smem, RING + s * stageBytes) for s in range(2)]
     # ---- chaining: wait for the producers of this workgroup's rows
     rowLast = p.add32(blockRow, p.imm32(rowsPerWg - 1))
@@ -167,12 +161,17 @@ def generate(C, rowt, max_regs=None, proj=False):
         r = p.reg("b32"); p.emit(f"ld.global.nc.b32 {r}, [{auxAddr}+{16 * j}];"); scales.append(r)
     # the state tile (proj): [rowsPerWg][C + 16] E4 aliasing the narrow region (dead before phase 2 writes it)
     stateOut = p.add32(narrowBase, p.add32(p.mul32(p.add32(p.shl32(q, 4), g), narrowStride), p.add32(p.shl32(e, 5), p.shl32(t, 1))))
+    seedBase = []
     if not proj:
+        # the residual seeds come from the staged A tiles: warp (e, q) reads rows 16 q + g (+8), columns 32 e + 8 j + 2 t
+        # of k32 step e's tile (chunk j >> 1, swizzled) right after that step's barrier (no separate global loads)
         for h in range(2):
-            resAddr = p.add64(P["pA"], p.widen(p.add32(p.mul32(p.selp32(rowOk[h], rowIdx[h], rowsMinus1), C), p.add32(p.shl32(e, 5), p.shl32(t, 1)))))
+            row = p.add32(p.shl32(q, 4), p.add32(g, p.imm32(8 * h)))
+            rowOff = p.add32(p.shl32(row, 5), p.add32(p.shl32(t, 1), p.imm32(A_OFF)))
+            sw = p.and32(p.shr32(row, 2), 1)
+            seedBase.append([p.add32(rowOff, p.shl32(p.xor32(p.imm32(c), sw), 4)) for c in range(2)])
             for j in range(4):
-                hc = p.reg("b16"); p.emit(f"ld.global.cg.b16 {hc}, [{resAddr}+{8 * j}];")
-                seedRegs.append((j, h, hc))
+                seedRegs.append((j, h, p.reg("b16")))
 
 
     chunksPerRow = C // 16
@@ -201,12 +200,16 @@ def generate(C, rowt, max_regs=None, proj=False):
         for j in range(4):
             r = p.reg("b32"); p.emit(f"ld.global.nc.b32 {r}, [{auxAttnAddr}+{16 * j}];")
             scalesAttn.append(r)
+        # the previous FFN output tile [rowsPerWg][C] -> the narrow region (one 16-byte chunk per thread, rows clamped),
+        # in the first copy group; each warp reads back exactly the slice its state tile later overwrites
+        assert threads == rowsPerWg * C // 16
+        prevRow = p.shr32(tid, (C // 16).bit_length() - 1); prevChunk = p.and32(tid, C // 16 - 1)
+        prevRowG = p.add32(blockRow, prevRow)
+        prevRowG = p.selp32(p.setp("lt.u32", prevRowG, P["rows"]), prevRowG, rowsMinus1)
+        prevDst = p.add32(narrowBase, p.add32(p.mul32(prevRow, narrowStride), p.shl32(prevChunk, 4)))
+        prevSrc = p.add64(P["pFfnPrev"], p.widen(p.add32(p.mul32(prevRowG, C), p.shl32(prevChunk, 4))))
+        p.emit(f"cp.async.cg.shared.global [{prevDst}], [{prevSrc}], 16;")
         pacc = [[None, None] for _ in range(4)]
-        for h in range(2):
-            prevAddr = p.add64(P["pFfnPrev"], p.widen(p.add32(p.mul32(p.selp32(rowOk[h], rowIdx[h], rowsMinus1), C), p.add32(p.shl32(e, 5), p.shl32(t, 1)))))
-            for j in range(4):
-                hc = p.reg("b16"); p.emit(f"ld.global.cg.b16 {hc}, [{prevAddr}+{8 * j}];")
-                pacc[j][h] = hmul2(p, e4x2_to_f16x2(p, hc), scalesAttn[j])
         # Wproj tiles share the W3 copy geometry: chunk offsets relative to the matrix base
         wpCopies = []
         for i in range((w3Chunks + threads - 1) // threads):
@@ -234,6 +237,11 @@ def generate(C, rowt, max_regs=None, proj=False):
             p.emit("bar.sync 0;")
             if step + 1 < steps: issue_wproj(stage ^ 1, step + 1)
             else: p.emit("cp.async.commit_group;")
+            if step == 0:
+                for h in range(2):
+                    for j in range(4):
+                        hc = p.reg("b16"); p.emit(f"ld.shared.b16 {hc}, [{stateOut}+{8 * j + 8 * narrowStride * h}];")
+                        pacc[j][h] = hmul2(p, e4x2_to_f16x2(p, hc), scalesAttn[j])
             a = ldm4(p, p.add32(p.add32(smem, RING + stage * wpStageBytes + C * 32), aFragOff))
             for i2 in range(2):
                 r = ldm4(p, p.add32(wpB[stage], i2 * 512))
@@ -270,6 +278,9 @@ def generate(C, rowt, max_regs=None, proj=False):
             a = ldm4(p, p.add32(narrowA, 32 * step))   # the state tile in shared
         else:
             a = ldm4(p, p.add32(stgAddr[stage], p.add32(aFragOff, p.imm32(A_OFF))))
+            pSeed = p.setp("eq.u32", e, step)
+            for j, h, hc in seedRegs:
+                p.emit(f"@{pSeed} ld.shared.b16 {hc}, [{p.add32(stgAddr[stage], seedBase[h][j >> 1])}+{8 * (j & 1)}];")
         for i2 in range(8):
             r = ldm4(p, p.add32(w1B[stage], i2 * 512))
             mma_e4(p, hid[2 * i2], a, (r[0], r[1]), hid[2 * i2])
@@ -322,7 +333,7 @@ def generate(C, rowt, max_regs=None, proj=False):
     store_tile(P["pOut"])
     # ---- chaining: release the FFN rows (bands b0 .. b1 of this workgroup)
     pSignalOn = p.setp("ne.u64", P["pSignal"], 0)
-    p.emit("fence.acq_rel.gpu;")
+    p.emit(f"@{pSignalOn} fence.acq_rel.gpu;")   # unchained: the barrier after the launch orders the stores
     p.emit("bar.sync 0;")
     pT0 = p.reg("pred"); p.emit(f"and.pred {pT0}, {pSignalOn}, {p.setp('eq.u32', tid, 0)};")
     bIter = p.reg("b32"); p.emit(f"mov.u32 {bIter}, {b0};")

@@ -363,6 +363,10 @@ if dlss5_available
         link_depends : dlss5_assets)
     test('DLSS5 optical-flow temporal GPU', dlss5_temporal_gpu,
         args : [opendlss_nr_build_shader_dir], timeout : 120)
+    # GPU timing and head parity of the network alone: see docs/WORKFLOWS.md.
+    executable('vkintox-dlss5-bench', 'tests/dlss5_network_bench.cc',
+        dependencies : [opendlss_nr_dep, libdl_dep],
+        link_depends : dlss5_assets)
 endif
 
 # Link the production recorder and fake only Vulkan dispatch. Section GC keeps

@@ -370,8 +370,9 @@ def sync_wait(p, base64, first, last, expected, lane, guard=None, warp=None, *, 
 
 def sync_signal(p, addrs, tid, guard=None):
     """After this workgroup's global stores: release them and increment the counters at addrs (u64 regs) by one.
-    All threads must reach this point (bar.sync inside)."""
-    p.emit("fence.acq_rel.gpu;")
+    All threads must reach this point (bar.sync inside). The release fence only runs under `guard`: an unchained
+    launch is ordered by the barrier after it and pays for no L2 round trip."""
+    p.emit(f"@{guard} fence.acq_rel.gpu;" if guard is not None else "fence.acq_rel.gpu;")
     p.emit("bar.sync 0;")
     pT0 = p.setp("eq.u32", tid, 0)
     if guard is not None:

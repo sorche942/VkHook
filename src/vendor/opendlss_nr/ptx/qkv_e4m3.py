@@ -1,11 +1,13 @@
 """QKV projection + cosine normalization + 8x8 window attention for (window, head) items in PTX
 (the qkv_attention.comp dataflow at the fragment level; see block32_e4m3.py for the block-level version).
 
-Workgroup = 4 warps, persistent over items (item = head * windowCount + window, stride = grid); warp q owns the
-window's tokens 16q .. 16q+15.
-  q/k/v = A(window rows of the E4 block state, K = C) x Wqkv[head columns] over K in k32 steps: the A fragments come
-  straight from global memory (ADEPTH k32 steps in flight in registers, zero outside the image); the head's 96
-  weight columns per k32 step are staged in a cp.async ring (3 KB per step).
+Workgroup = 4 warps, persistent over items (item = window * heads + head, stride = grid); warp q owns the
+window's tokens 16q .. 16q+15. The host sizes the grid as a multiple of the head count, so a workgroup keeps
+one head for the whole launch: its attention prior rows (registers) and, for K <= 128, its whole weight set
+(shared) are loaded once and only reloaded if the head ever changes.
+  q/k/v = A(window rows of the E4 block state, K = C) x Wqkv[head columns] over K in k32 steps: the window's A tile
+  per k32 step is staged in a cp.async ring (zero outside the image); the head's 96 weight columns per k32 step
+  (3 KB) are resident (K <= 128) or ring-staged beside the A tile.
   normalize q (learned scale) and k; K rows / transposed V of this head into shared (physical token order);
   S = prior[head] + Q K^T; the specified softmax; P V; E4 output at columns head * 32 of the attended tensor.
 NaN handling: the normalization's NaN -> 0 (zero rows at the image border) runs under a warp vote; V and the
@@ -19,20 +21,23 @@ from swin import *
 
 THREADS = 128
 STAGES = 2        # cp.async ring depth (steps in flight = STAGES - 1)
-ALD = "cg"        # A operand load cache hint (produced by the chained FFN launch: no L1 / texture path)
-ADEPTH = 2        # k32 steps of A fragments in flight
 B_BYTES = 96 * 32             # one k32 step of the head's B tiles: [96 n][32 B] (chunk-swizzled rows)
-STEP_BYTES = B_BYTES + 64 * 32 # + the window's A tile [64 tokens][32 B] (chunk-swizzled rows, zero outside the image)
-KROWS = STAGES * STEP_BYTES    # K [64 physical][32 B] swizzled (2 KB)
-VTS = KROWS + 2048             # Vt [32 dim][64 B] swizzled (chunk ^= (dim >> 1) & 3)
-STG = VTS + 2048               # per warp 512 B output staging
-SHARED_BYTES = STG + 4 * 512
+A_BYTES = 64 * 32             # the window's A tile of one k32 step [64 tokens][32 B] (chunk-swizzled rows)
+STEP_BYTES = B_BYTES + A_BYTES
+RESIDENT_STEPS = 4            # K <= 128: the head's weights stay in shared (6 / 12 KB) instead of the ring
 
 
 def generate(C, max_regs=None):
     assert C % 32 == 0
     steps = C // 32
     stages = min(STAGES, steps)
+    resident = steps <= RESIDENT_STEPS
+    # shared map: [resident weights] A ring (or B + A ring) | K [64 physical][32 B] | Vt [32 dim][64 B] | 4 x 512 B staging
+    A_BASE, A_STRIDE = (steps * B_BYTES, A_BYTES) if resident else (B_BYTES, STEP_BYTES)
+    KROWS = A_BASE + stages * A_STRIDE if resident else stages * STEP_BYTES
+    VTS = KROWS + 2048             # Vt swizzled (chunk ^= (dim >> 1) & 3)
+    STG = VTS + 2048
+    SHARED_BYTES = STG + 4 * 512
     name = f"qkv_e4m3_K{C}"
     p = Ptx()
     params = [("u64", "pState"), ("u64", "pWqkv"), ("u64", "pPrior"), ("u64", "pAux"), ("u64", "pOut"),
@@ -69,11 +74,11 @@ def generate(C, max_regs=None):
     # A tile chunk of this thread (one 16-byte copy per step): token = tid >> 1, half = tid & 1
     aTok = p.shr32(tid, 1); aHalf = p.and32(tid, 1)
     aTokX = p.and32(aTok, 7); aTokY = p.shr32(aTok, 3)
-    aDst = p.add32(smem, p.add32(p.imm32(B_BYTES), p.add32(p.shl32(aTok, 5), p.shl32(p.xor32(aHalf, p.and32(p.shr32(aTok, 2), 1)), 4))))
+    aDst = p.add32(smem, p.add32(p.imm32(A_BASE), p.add32(p.shl32(aTok, 5), p.shl32(p.xor32(aHalf, p.and32(p.shr32(aTok, 2), 1)), 4))))
     aRowL = p.add32(l8, p.shl32(p.and32(lm, 1), 3)); aChunkL = p.shr32(lane, 4)
     aPch = p.xor32(aChunkL, p.and32(p.shr32(aRowL, 2), 1))
-    aLane = p.add32(smem, p.add32(p.imm32(B_BYTES), p.add32(p.shl32(p.add32(aRowL, p.shl32(warp, 4)), 5), p.shl32(aPch, 4))))
-    # B ring copies: 192 chunks per step, 2 per thread; chunk c: row n = c >> 1, half = c & 1, chunk ^= (n >> 2) & 1
+    aLane = p.add32(smem, p.add32(p.imm32(A_BASE), p.add32(p.shl32(p.add32(aRowL, p.shl32(warp, 4)), 5), p.shl32(aPch, 4))))
+    # B copies: 192 chunks per step, 2 per thread; chunk c: row n = c >> 1, half = c & 1, chunk ^= (n >> 2) & 1
     copies = []
     for i in range(2):
         c = p.add32(tid, i * THREADS)
@@ -132,16 +137,23 @@ def generate(C, max_regs=None):
             g2 = p.reg("pred"); p.emit(f"and.pred {g2}, {pWaitOn}, {guard};")
         sync_wait(p, P["pWait"], gm["band0"], gm["band1"], lambda b: band_expected(p, b, P["width"], rowsTotal, P["waitMul"], P["waitGroupRows"]), lane, g2, warp, error64=P["pError"])
 
-    def issue_stage(gm, stageIndex, step, guard=None):
-        # the head's weight tiles (L1-cached, constant) and the window's A tile (L2 only: produced by the chained FFN)
+    def weight_copies(gm, stageOffset, step, guard):
         for dst, srcOff, pv in copies:
-            saddr = p.add32(dst, p.imm32(stageIndex * STEP_BYTES))
+            saddr = p.add32(dst, p.imm32(stageOffset))
             gaddr = p.add64(gm["wHead"], p.widen(p.add32(srcOff, p.imm32(step * 3 * C * 32))))
             pred = pv
             if guard is not None:
                 pred = p.reg("pred"); p.emit(f"and.pred {pred}, {pv}, {guard};")
             p.emit(f"@{pred} cp.async.ca.shared.global [{saddr}], [{gaddr}], 16;")
-        saddr = p.add32(aDst, p.imm32(stageIndex * STEP_BYTES))
+
+    def issue_weights(gm, guard=None):
+        """Resident route: every k32 step of the head's weight tiles (joins the next committed copy group)."""
+        for step in range(steps): weight_copies(gm, step * B_BYTES, step, guard)
+
+    def issue_stage(gm, stageIndex, step, guard=None):
+        # the head's weight tiles (ring route only) and the window's A tile (L2 only: produced by the chained FFN)
+        if not resident: weight_copies(gm, stageIndex * STEP_BYTES, step, guard)
+        saddr = p.add32(aDst, p.imm32(stageIndex * A_STRIDE))
         gaddr = p.add64(gm["aSrc"], p.widen(p.imm32(32 * step)))
         pred = f"@{guard} " if guard is not None else ""
         p.emit(f"{pred}cp.async.cg.shared.global [{saddr}], [{gaddr}], 16, {gm['aSize']};")
@@ -162,12 +174,17 @@ def generate(C, max_regs=None):
     p.emit(f"@!{pItem} bra {endL};")
     gm0 = geometry(item)
     wait_item(gm0)
+    if resident: issue_weights(gm0)
     for j in range(stages - 1): issue_stage(gm0, j, j)
     carried = carry_regs()
     carry_assign(carried, gm0)
     sKeep = [[p.reg("b32"), p.reg("b32")] for _ in range(8)]   # the item's scores for the attention tail
     for m in range(8):
         p.emit(f"mov.b32 {sKeep[m][0]}, 0;"); p.emit(f"mov.b32 {sKeep[m][1]}, 0;")
+    # the head's prior rows and scale, reloaded only when the head changes (never, with a multiple-of-heads grid)
+    priorRegs = [[p.reg("b32"), p.reg("b32")] for _ in range(8)]
+    scaleF = p.reg("f32")
+    priorHead = p.reg("b32"); p.emit(f"mov.u32 {priorHead}, 0xffffffff;")
 
     def emit_tail(gmT):
         """softmax, P V, E4 output of the item whose scores are in sKeep and geometry in gmT (straight-line code)."""
@@ -194,8 +211,9 @@ def generate(C, max_regs=None):
         p.emit(f"@{pv} st.global.v4.b32 [{addr}], {{{r[0]}, {r[1]}, {r[2]}, {r[3]}}};")
 
     def signal_item(gmT):
-        # release the attended rows of the item: window row counter (fence + barrier + one red)
-        p.emit("fence.acq_rel.gpu;")
+        # release the attended rows of the item: window row counter (fence + barrier + one red); unchained, the
+        # barrier after the launch orders the stores and the per-item fence is skipped
+        p.emit(f"@{pSignalOn} fence.acq_rel.gpu;")
         p.emit("bar.sync 0;")
         pSig = p.reg("pred"); p.emit(f"and.pred {pSig}, {pSignalOn}, {p.setp('eq.u32', tid, 0)};")
         sigAddr = p.add64(P["pSignal"], p.widen(p.shl32(gmT["wy"], 2)))
@@ -204,15 +222,18 @@ def generate(C, max_regs=None):
     p.emit(f"{loopL}:")
     gm = carried
     head, windowX, windowY = gm["head"], gm["windowX"], gm["windowY"]
-    # prior rows of this head and the head scale: issued first
+    # prior rows of this head and the head scale (uniform branch: only when the head changed)
+    pSameHead = p.setp("eq.u32", head, priorHead)
+    priorDone = p.label("PRIOR")
+    p.emit(f"@{pSameHead} bra.uni {priorDone};")
     priorLane = p.add64(P["pPrior"], p.widen(p.add32(p.shl32(head, 13), priorRowOff)))
-    priorRegs = []
     for m in range(8):
-        c0 = p.reg("b32"); p.emit(f"ld.global.nc.b32 {c0}, [{priorLane}+{16 * m}];")
-        c1 = p.reg("b32"); p.emit(f"ld.global.nc.b32 {c1}, [{priorLane}+{1024 + 16 * m}];")
-        priorRegs.append([c0, c1])
+        p.emit(f"ld.global.nc.b32 {priorRegs[m][0]}, [{priorLane}+{16 * m}];")
+        p.emit(f"ld.global.nc.b32 {priorRegs[m][1]}, [{priorLane}+{1024 + 16 * m}];")
     scaleAddr = p.add64(P["pAux"], p.widen(p.shl32(p.add32(P["scaleWord"], head), 2)))
-    scaleF = p.reg("f32"); p.emit(f"ld.global.nc.f32 {scaleF}, [{scaleAddr}];")
+    p.emit(f"ld.global.nc.f32 {scaleF}, [{scaleAddr}];")
+    p.emit(f"mov.u32 {priorHead}, {head};")
+    p.emit(f"{priorDone}:")
     acc = [zero_tile(p) for _ in range(12)]   # q tiles 0..3, k 4..7, v 8..11
     for step in range(steps):
         stageIndex = step % stages
@@ -222,8 +243,8 @@ def generate(C, max_regs=None):
             p.emit("cp.async.commit_group;")
         p.emit(f"cp.async.wait_group {stages - 1};")
         p.emit("bar.sync 0;")
-        a = ldm4(p, p.add32(aLane, stageIndex * STEP_BYTES))
-        base = p.add32(ringB, stageIndex * STEP_BYTES)
+        a = ldm4(p, p.add32(aLane, stageIndex * A_STRIDE))
+        base = p.add32(ringB, step * B_BYTES if resident else stageIndex * STEP_BYTES)
         for i2 in range(6):
             r = ldm4(p, p.add32(base, i2 * 512))
             mma_e4(p, acc[2 * i2], a, (r[0], r[1]), acc[2 * i2])
@@ -243,15 +264,21 @@ def generate(C, max_regs=None):
             p.emit(f"st.shared.u8 [{vBase[h]}+{512 * j}], {vc};")
             p.emit(f"st.shared.u8 [{vBase[h]}+{512 * j + 64}], {vhi};")
     p.emit("bar.sync 0;")
-    # prefetch the next item: its first weight stage (the ring is free) and A fragments
+    # prefetch the next item: its first A stage (the ring is free; the resident weights only if the head changes)
     nextItem = p.add32(item, nctaid)
     pNext = p.setp("lt.u32", nextItem, P["itemCount"])
     gmN = geometry(nextItem)
     wait_item(gmN, pNext)
+    if resident:
+        pReload = p.setp("ne.u32", gmN["head"], head)
+        p.emit(f"and.pred {pReload}, {pReload}, {pNext};")
+        issue_weights(gmN, pReload)
     for j in range(stages - 1): issue_stage(gmN, j, j, pNext)
     s = []
     for m in range(8):
-        s.append([priorRegs[m][0], priorRegs[m][1]])
+        c0 = p.reg("b32"); p.emit(f"mov.b32 {c0}, {priorRegs[m][0]};")
+        c1 = p.reg("b32"); p.emit(f"mov.b32 {c1}, {priorRegs[m][1]};")
+        s.append([c0, c1])
     for m2 in range(4):
         r = ldm4(p, p.add32(kLane, m2 * 512))
         mma_e4(p, s[2 * m2], mq, (r[0], r[1]), s[2 * m2])

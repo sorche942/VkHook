@@ -266,7 +266,7 @@ def generate(K, flags, max_regs=None, stagesWanted=STAGES, ksub=1, ws=False):
             addr = p.add64(P["pOut"], p.widen(gOff))
             p.emit(f"@{ok} st.global.v4.b32 [{addr}], {{{r[0]}, {r[1]}, {r[2]}, {r[3]}}};")
     pSignalOn = p.setp("ne.u64", P["pSignal"], 0)
-    p.emit("fence.acq_rel.gpu;")
+    p.emit(f"@{pSignalOn} fence.acq_rel.gpu;")   # unchained: the barrier after the launch orders the stores
     p.emit(BARC)
     pT0 = p.reg("pred"); p.emit(f"and.pred {pT0}, {pSignalOn}, {p.setp('eq.u32', tid, 0)};")
     bIter = p.reg("b32"); p.emit(f"mov.u32 {bIter}, {bandFirst};")

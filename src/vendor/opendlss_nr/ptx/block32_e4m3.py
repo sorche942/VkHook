@@ -459,7 +459,7 @@ def generate(flags, max_regs=None):
             px = p.mad32(yo, P["width"], xo)
             addr = p.add64(P["pOut2"], p.widen(p.add32(p.shl32(px, 4), p.shl32(t, 3))))
             p.emit(f"@{pv} st.global.v2.f32 [{addr}], {{{f0}, {f1}}};")
-    p.emit("fence.acq_rel.gpu;")
+    p.emit(f"@{pSignalOn} fence.acq_rel.gpu;")   # only a chained consumer reads this window inside the launch
     p.emit("bar.sync 0;")   # K / V and staging are reused by the next window; the window's stores are released
     pSig = p.reg("pred"); p.emit(f"and.pred {pSig}, {pSignalOn}, {p.setp('eq.u32', tid, 0)};")
     sigAddr = p.add64(P["pSignal"], p.widen(p.shl32(gm["wy"], 2)))
