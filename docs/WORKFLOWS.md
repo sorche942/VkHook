@@ -145,11 +145,22 @@ python3 scripts/extract-dlss5-weights.py \
   "${XDG_CONFIG_HOME:-$HOME/.config}/VKIntox/models/dlss5"
 ```
 
-The output directory must not exist. The extractor validates the known DLL
-310.9.16.0 and `WEIGHTS_HT` resource hashes, checks every tensor's shape and
-storage, then publishes `manifest.json` and 11 stage files atomically. It extracts
-153 tensors / 71 blocks / 147,683,778 packed bytes; the smaller `CC_SMALL` resource
-is not this graph. The runtime verifies each stage's hash before uploading.
+The output directory must not exist. DLL 310.9.16.0 carries two networks of the
+same family, and `--network` selects one:
+
+| `--network` | Resource | Blocks | Tensors | Packed bytes |
+| --- | --- | ---: | ---: | ---: |
+| `small` (default) | `WEIGHTS_CC_SMALL_FP8`, the DLL's default preset | 31 | 77 | 113,887,490 |
+| `original` | `WEIGHTS_HT`, the 310.8.0 model (preset 1) | 71 | 153 | 147,683,778 |
+
+Both use the same layer types, weight layouts and kernels; the small network
+has two blocks in every encoder/decoder stage instead of four to eight (the eight
+ViT blocks are unchanged) and is about 1.8× faster. The extractor validates the
+DLL and resource hashes, checks every tensor's shape and storage, then publishes
+`manifest.json` and 11 stage files atomically. The runtime identifies the network
+by its block count, logs it (`DLSS5: loaded the small network (31 blocks)`) and
+verifies each stage's hash before uploading. To switch, extract the other network
+into its own directory and point `dlss5ModelPath` or `VKINTOX_DLSS5_MODEL` at it.
 Other DLL versions are rejected rather than guessed.
 
 ### Enable
@@ -308,12 +319,36 @@ Estimated flow is not engine velocity: disocclusions, transparency, lighting
 changes, HUD, and text remain imperfect inputs. HUD and text are processed as
 part of the final image; visual quality and temporal stability are not guaranteed.
 
-The supplied model is newer than OpenDLSS-NR's documented 310.8.0 model.
-Its tensor shapes match, but numerical/visual parity with NVIDIA's DLL has
-not been established. On an RTX 5070 Ti, the real 71-block PTX graph produced
-finite output in an X11 `vkcube` run. GPU compositing matched an independent
-CPU reconstruction exactly; alpha was unchanged, and intensity zero preserved
-all 307,200 pixels byte-for-byte at 640×480.
+Both networks were compared with NVIDIA's own DLL output from DLSSNR-AMD's
+published NGX captures (`docs/ngx-verification`, MIT): one Tomb Raider frame
+at three sizes, evaluated by `nvngx_dlssnr` on an RTX 5090 with the default
+controls and Reset. `vkintox-dlss5-bench --image` ran the same frame here;
+`original` is compared with the 310.8.0 captures (310.9.16's preset 1 gives
+byte-identical output), `small` with the 310.9.16 default preset. "Edit" is the
+output minus the input:
+
+| Network | Size | PSNR vs NVIDIA | Pixels within one 8-bit step | Edit correlation |
+| --- | --- | ---: | ---: | ---: |
+| small | 1920×1080 | 49.43 dB | 87.2% | 0.9960 |
+| small | 2560×1440 | 49.39 dB | 87.0% | 0.9962 |
+| small | 3840×2160 | 50.82 dB | 92.8% | 0.9958 |
+| original | 1920×1080 | 47.36 dB | 77.2% | 0.9959 |
+| original | 2560×1440 | 48.34 dB | 82.1% | 0.9957 |
+| original | 3840×2160 | 49.17 dB | 86.6% | 0.9955 |
+
+NVIDIA's two networks differ from each other by 34–36 dB on this frame, so the
+small port tracks its own reference, not the other model. The output is not
+bit-identical to NVIDIA's. The residual is the same size for both networks and
+for DLSSNR-AMD's independent port (45.6–50.6 dB), so it is not specific to the
+small network; its source on the input or output side of the DLL is unknown.
+Inside the graph, the small network gives the same head bit for bit under the
+barrier and counter-chain schedules, every `DLSS5VK_*` route switch, and the
+unfused GLSL reference kernels.
+
+On an RTX 5070 Ti, the real 71-block PTX graph produced finite output in an
+X11 `vkcube` run. GPU compositing matched an independent CPU reconstruction
+exactly; alpha was unchanged, and intensity zero preserved all 307,200 pixels
+byte-for-byte at 640×480.
 
 The conditional Meson test `DLSS5 device feature preservation` covers application
 feature preservation, promoted feature merging, duplicate loader nodes, input
@@ -349,17 +384,25 @@ directory and no window is needed:
 
 ```bash
 B=build-gcc/src/vendor/opendlss_nr
-build-gcc/src/vkintox-dlss5-bench --model build-gcc/dlss5-model \
+build-gcc/src/vkintox-dlss5-bench --model build-gcc/dlss5-model-small \
   --shaders "$B" --ptx "$B" --width 3840 --height 2160 --frames 40
 ```
 
-It records the graph once, resubmits it, and prints the minimum and median GPU
-time. `--profile` re-records every frame with per-launch timestamps and lists the
-minimum span per kernel and per block. `--chain 0|1` selects Vulkan barriers
-(the effect's schedule) or upstream's spinning counter chains. `--dump FILE`
-writes the network head as f32, and `--compare FILE` reports how many values
-differ from such a dump, so a PTX or scheduling change can be checked for
-bit-exact output against a previous build's `--ptx` directory.
+It records the graph once, resubmits it, and prints the network, the minimum and
+the median GPU time. `--profile` re-records every frame with per-launch timestamps
+and lists the minimum span per kernel and per block. `--chain 0|1` selects Vulkan
+barriers (the effect's schedule) or upstream's spinning counter chains.
+`--dump FILE` writes the network head as f32, and `--compare FILE` reports how
+many values differ from such a dump, so a PTX or scheduling change can be checked
+for bit-exact output against a previous build's `--ptx` directory.
+
+`--image FILE` replaces the synthetic features with a raw RGBA8 frame of
+`--width`×`--height` (`magick in.png -depth 8 rgba:in.rgba`), preprocessed with
+the default controls and noise `--seed` (0, as after a Reset). The output is
+composed as the effect composes a frame without history at intensity 1;
+`--output FILE` writes it as raw RGBA8 and `--expect FILE` reports PSNR,
+identical pixels and pixels within one 8-bit step against another raw RGBA8
+frame, such as NVIDIA's output in the comparison above.
 
 The vendored PTX generators are tuned for the RTX 5070 Ti (Blackwell, 70 SMs);
 every change only moves data or synchronization, so the head is bit-identical
@@ -372,14 +415,19 @@ to the untuned graph:
 - The fused FFN reads its residual seeds from shared tiles instead of narrow
   global loads, and C = 128 runs at `.maxnreg 64` (two workgroups per SM).
 
-Minimum of 40 frames, barrier schedule, interleaved runs of the original and
-tuned PTX on the same build:
+Best median of 40 frames over three interleaved rounds, barrier schedule, the
+untuned and tuned PTX on the same build:
 
-| Resolution | Original | Tuned | Change |
-| --- | ---: | ---: | ---: |
-| 1920×1080 | 7.02 ms | 6.40 ms | −8.9% |
-| 2560×1440 | 10.76 ms | 9.75 ms | −9.3% |
-| 3840×2160 | 23.36 ms | 20.99 ms | −10.2% |
+| Resolution | Original, untuned | Original, tuned | Small, untuned | Small, tuned | Small tuned vs original untuned |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1920×1080 | 7.32 ms | 6.51 ms | 3.82 ms | 3.58 ms | 2.05× |
+| 2560×1440 | 11.21 ms | 10.29 ms | 5.85 ms | 5.45 ms | 2.06× |
+| 3840×2160 | 24.69 ms | 22.40 ms | 13.53 ms | 12.70 ms | 1.94× |
+
+The tuning gains less on the small network (−6 to −7% against −8 to −11%)
+because the kernels it does not touch weigh more there: at 1080p the two
+full-resolution 32-channel blocks take 20% of the small network's time and the
+unchanged ViT 29%.
 
 The PTX still targets `sm_89`, so Ada GPUs run it, but the register caps were
 chosen on Blackwell; re-measure them with this tool before tuning for another GPU.

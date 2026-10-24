@@ -24,4 +24,9 @@ VKIntox vendor integration:
 - Preserves the upstream network, shader arithmetic and original license above. The PTX generators carry
   RTX 50 (Blackwell) scheduling changes (chain fences, qkv head residency, FFN skip staging, register caps) whose
   outputs are bit-identical to upstream's; see docs/WORKFLOWS.md "Network performance".
+- Generalizes the graph's hard-coded 71-block stage boundaries (NetworkLayout in nr_graph.h) so it also runs
+  the 31-block WEIGHTS_CC_SMALL_FP8 network of DLL 310.9.16 with the same kernels and arithmetic. That
+  network's block structure and its comparison captures of NVIDIA's DLL come from DLSSNR-AMD
+  (https://github.com/mochizuki0323/DLSSNR-AMD, MIT License, Copyright (c) 2026 mochizuki0323); no
+  DLSSNR-AMD source code is included.
 - NVIDIA model weights are not part of this vendored source directory.

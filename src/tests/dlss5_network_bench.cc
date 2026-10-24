@@ -1,11 +1,16 @@
 // DLSS5 network benchmark: the production PTX graph on a private device, timed with GPU timestamps.
-// No layer, no swapchain: isolates the 71-block network that dominates the effect's frame cost.
+// No layer, no swapchain: isolates the network that dominates the effect's frame cost.
 //
 //   vkintox-dlss5-bench --model DIR --shaders DIR --ptx DIR [--width W --height H --frames N]
 //                       [--chain 0|1] [--profile] [--dump head.f32] [--compare head.f32]
+//                       [--image in.rgba [--seed S] [--output out.rgba] [--expect reference.rgba]]
 //
 // The recording is made once and resubmitted, as the effect does with its secondary command buffer.
 // --dump/--compare write or check the f32 head bit for bit against an earlier run.
+// --image runs a raw RGBA8 frame of --width x --height through the proxy preprocess with NGX's default conditioning
+// (Intensity 1, Style 0, LocalTone 1, LocalStructure 1, SkinStructure -1, AutoMask on) instead of synthetic features,
+// and composes the output as the effect does for a frame without history. --output writes that RGBA8 frame;
+// --expect compares it with another implementation's RGBA8 output (e.g. NVIDIA's DLL).
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
 #include "kernels.h"
@@ -121,6 +126,42 @@ std::vector<uint8_t> readFile(const std::string& path)
     require(bool(file), "cannot read " + path);
     return {std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
 }
+
+// The effect's composite for a frame without history at intensity 1 (dlss5_composite.comp).
+uint8_t composeChannel(float head, float centred)
+{
+    const float inner = std::fmaf(head, 0.03125f, centred);
+    const float neural = std::fmin(std::fmax(inner * 8.0f + 0.5f, 0.0f), 1.0f);
+    uint16_t bits = num::f16Bits(neural);
+    if (num::f16ToF32(bits) > neural) --bits;   // truncate to the half grid
+    return static_cast<uint8_t>(std::lround(num::f16ToF32(bits) * 255.0f));
+}
+
+void compareImages(const std::vector<uint8_t>& actual, const std::vector<uint8_t>& expected, const std::string& name)
+{
+    require(actual.size() == expected.size(), name + " is not the output size");
+    const size_t pixels = actual.size() / 4;
+    size_t exact = 0, withinOne = 0;
+    int largest = 0;
+    double squared = 0, signedSum[3] = {};
+    for (size_t pixel = 0; pixel < pixels; ++pixel) {
+        int worst = 0;
+        for (int c = 0; c < 3; ++c) {
+            const int difference = int(actual[pixel * 4 + c]) - int(expected[pixel * 4 + c]);
+            worst = std::max(worst, std::abs(difference));
+            squared += double(difference) * difference;
+            signedSum[c] += difference;
+        }
+        exact += worst == 0;
+        withinOne += worst <= 1;
+        largest = std::max(largest, worst);
+    }
+    const double mse = squared / (pixels * 3.0);
+    std::printf("output vs %s: PSNR %.2f dB, mean difference %+.3f %+.3f %+.3f /255, %.2f%% pixels identical, "
+        "%.2f%% within one step, largest %d\n", name.c_str(), mse ? 10 * std::log10(255.0 * 255.0 / mse) : INFINITY,
+        signedSum[0] / pixels, signedSum[1] / pixels, signedSum[2] / pixels, 100.0 * exact / pixels,
+        100.0 * withinOne / pixels, largest);
+}
 }
 
 int main(int argc, char** argv)
@@ -131,7 +172,8 @@ int main(int argc, char** argv)
         const std::string ptx = argument(argc, argv, "--ptx", shaders);
         require(!model.empty() && !shaders.empty(),
             "usage: vkintox-dlss5-bench --model DIR --shaders DIR [--ptx DIR] [--width W --height H --frames N] "
-            "[--chain 0|1] [--profile] [--dump FILE] [--compare FILE]");
+            "[--chain 0|1] [--profile] [--dump FILE] [--compare FILE] "
+            "[--image FILE [--seed S] [--output FILE] [--expect FILE]]");
         const uint32_t width = std::stoul(argument(argc, argv, "--width", "1920"));
         const uint32_t height = std::stoul(argument(argc, argv, "--height", "1080"));
         const int frames = std::max(1, std::stoi(argument(argc, argv, "--frames", "40")));
@@ -156,10 +198,29 @@ int main(int argc, char** argv)
         nr::Graph graph(context, network, kernels, geometry, nr::Graph::Options{});
         const uint32_t fullRows = geometry.fullWidth * geometry.fullHeight;
         nr::Activation* features = graph.allocate("input features", fullRows, 16, nr::Format::F32);
-        std::vector<float> synthetic(static_cast<size_t>(fullRows) * 16);
-        for (size_t index = 0; index < synthetic.size(); ++index)
-            synthetic[index] = num::roundF16(std::sin(index * 0.0017f) * 0.125f);
-        context.upload(features->buffer, synthetic.data(), synthetic.size() * sizeof(float));
+        const std::string image = argument(argc, argv, "--image");
+        std::vector<uint8_t> source;
+        if (image.empty()) {
+            std::vector<float> synthetic(static_cast<size_t>(fullRows) * 16);
+            for (size_t index = 0; index < synthetic.size(); ++index)
+                synthetic[index] = num::roundF16(std::sin(index * 0.0017f) * 0.125f);
+            context.upload(features->buffer, synthetic.data(), synthetic.size() * sizeof(float));
+        } else {
+            source = readFile(image);
+            require(source.size() == static_cast<size_t>(width) * height * 4,
+                image + " is not a raw " + std::to_string(width) + "x" + std::to_string(height) + " RGBA8 frame");
+            std::vector<float> proxy(source.size());
+            for (size_t index = 0; index < source.size(); ++index) proxy[index] = source[index] / 255.0f;
+            vk::Buffer proxyBuffer = context.createBuffer(proxy.size() * sizeof(float), false, "proxy");
+            context.upload(proxyBuffer, proxy.data(), proxy.size() * sizeof(float));
+            const nr::Kernels::PreprocessArgs conditioning{geometry.fullWidth, geometry.fullHeight, width, height, width,
+                height, static_cast<uint32_t>(std::stoul(argument(argc, argv, "--seed", "0"))), true, 1.0f, 1.0f,
+                -1.0f, 0.0f};
+            VkCommandBuffer preprocess = context.beginCommands();
+            kernels.preprocessFromProxy(preprocess, proxyBuffer, *features, conditioning);
+            context.endAndSubmit(preprocess, true);
+            context.destroyBuffer(proxyBuffer);
+        }
 
         VkQueryPool queries = context.createTimestampPool(2);
         VkCommandPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
@@ -187,7 +248,8 @@ int main(int argc, char** argv)
             VK_CHECK(vkd.vkEndCommandBuffer(commands));
         };
         record();
-        std::printf("%ux%u (field %ux%u), %u launches, %s\n", width, height, geometry.fullWidth, geometry.fullHeight,
+        std::printf("%s network (%u blocks), %ux%u (field %ux%u), %u launches, %s\n", graph.layout().name,
+            graph.layout().blockCount(), width, height, geometry.fullWidth, geometry.fullHeight,
             kernels.dispatchCount(), graph.chained() ? "counter chaining" : "barriers");
 
         VkQueue queue = context.queue();
@@ -257,6 +319,27 @@ int main(int argc, char** argv)
             std::printf("head vs %s: %s (%zu of %zu values differ)\n", compare.c_str(),
                 differing ? "MISMATCH" : "bit-exact", differing, bytes.size() / 4);
             status = differing ? 1 : 0;
+        }
+        if (!image.empty()) {
+            const auto lanes = context.download(features->buffer, features->validBytes());
+            const float* centred = reinterpret_cast<const float*>(lanes.data());
+            const float* rgbw = reinterpret_cast<const float*>(bytes.data());
+            std::vector<uint8_t> composed(source.size());
+            for (uint32_t y = 0; y < height; ++y)
+                for (uint32_t x = 0; x < width; ++x) {
+                    const size_t pixel = static_cast<size_t>(y) * width + x;
+                    const size_t padded = static_cast<size_t>(y) * geometry.fullWidth + x;
+                    for (int c = 0; c < 3; ++c)
+                        composed[pixel * 4 + c] = composeChannel(rgbw[padded * 4 + c], centred[padded * 16 + 4 + c]);
+                    composed[pixel * 4 + 3] = source[pixel * 4 + 3];
+                }
+            const std::string output = argument(argc, argv, "--output");
+            if (!output.empty()) {
+                std::ofstream(output, std::ios::binary).write(reinterpret_cast<const char*>(composed.data()), composed.size());
+                std::printf("output written to %s\n", output.c_str());
+            }
+            const std::string expect = argument(argc, argv, "--expect");
+            if (!expect.empty()) compareImages(composed, readFile(expect), expect);
         }
         vkd.vkDestroyQueryPool(device.device, queries, nullptr);
         vkd.vkDestroyCommandPool(device.device, pool, nullptr);

@@ -1,5 +1,5 @@
-// The NR network graph: 71 blocks over a six-level encoder/decoder with a global
-// ViT bottleneck, recorded into one Vulkan command buffer.
+// The NR network graph: a six-level encoder/decoder of window-attention blocks with a global ViT bottleneck,
+// recorded into one Vulkan command buffer. NetworkLayout numbers the blocks of each network of the family.
 #pragma once
 #include <functional>
 #include <map>
@@ -35,9 +35,28 @@ FusedLayout preFusedLayout();
 FusedLayout upsampleFusedLayout(uint32_t inputChannels, uint32_t channels);
 FusedLayout postFusedLayout();
 
+// Where each stage's blocks sit in one network of the family. DLL 310.9.16 carries two: WEIGHTS_HT, the 71-block
+// 310.8.0 model, and WEIGHTS_CC_SMALL_FP8, 31 blocks. Both use the same layer types and weight layouts and differ
+// only in how many blocks each stage repeats. Block 0 is the full-resolution pre block, the last one the post block.
+struct NetworkLayout {
+  const char* name;    // "original" (WEIGHTS_HT) or "small" (WEIGHTS_CC_SMALL_FP8)
+  struct Range { int first, last; };
+  Range encoder[4];    // fused 32, 64, 128 and 256-channel stages; each last block carries the transition weights
+  Range encoder512;    // split blocks; the last carries the ViT input projection as layer 4
+  Range vit;           // 1024-channel global ViT blocks
+  int decoderInput;    // the ViT -> 512 projection, upsampled onto the encoder skip
+  Range decoder512;    // split blocks
+  Range decoder[4];    // fused 256, 128, 64 and 32-channel stages; each first block upsamples
+  int post;
+  uint32_t blockCount() const { return (uint32_t)post + 1; }
+  // The networks are told apart by their block count; any other count is refused.
+  static NetworkLayout forBlockCount(uint32_t blockCount);
+};
+
 class Graph {
  public:
-  static constexpr uint32_t kBlockCount = 71;   // blocks 0..70; the graph's stage boundaries are hard-coded
+  // The layout of the loaded model.
+  const NetworkLayout& layout() const { return layout_; }
 
   struct Options {
     bool captureBoundaries = false;  // copy every block/transition output for parity checks
@@ -55,9 +74,10 @@ class Graph {
   const Geometry& geometry() const { return geometry_; }
   // Whether consecutive launches are linked by device counters instead of barriers (docs/execution.md).
   bool chained() const { return routes_.chain || routes_.vitChain; }
-  // The stored outputs a boundary fixture can hold references for, in graph order: blocks 0-69 and the five encoder
-  // stage transitions. Block 70 feeds the head on chip; the pooled-* captures have no reference counterpart.
-  static const std::vector<std::string>& referenceBoundaryNames();
+  // The stored outputs a boundary fixture can hold references for, in graph order: every block before the post
+  // block and the five encoder stage transitions. The post block feeds the head on chip; the pooled-* captures have
+  // no reference counterpart.
+  std::vector<std::string> referenceBoundaryNames() const;
 
   Activation* allocate(const std::string& label, uint32_t rows, uint32_t channels, Format format);
 
@@ -128,6 +148,7 @@ class Graph {
   Model& model_;
   Kernels& kernels_;
   Geometry geometry_;
+  NetworkLayout layout_;
   Options options_;
   std::vector<std::unique_ptr<Activation>> activations_;
   std::map<std::string, Activation*> allocationsByKey_;

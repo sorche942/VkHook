@@ -2,13 +2,18 @@
 """Extract a user-owned DLSS NR DLL/ZIP into an OpenDLSS-NR model directory.
 
 Usage: python3 scripts/extract-dlss5-weights.py INPUT.zip OUTPUT_DIRECTORY
+                                                 [--network small|original]
 
 Only NVIDIA DLL 310.9.16.0 (CL 39025366), distributed in the 2026-10-16
 archive, is supported. No DLL code is executed, no files are downloaded, and
 no proprietary weights are included in this script. Keep extracted weights
 local; build-gcc/dlss5-model is covered by this repository's build*/ ignore.
 
-WEIGHTS_HT is a PE RCDATA resource, not compressed/encrypted model data. It
+The DLL carries two networks of the same family as PE RCDATA resources:
+WEIGHTS_CC_SMALL_FP8 (--network small, the default: 31 blocks, the DLL's
+default preset) and WEIGHTS_HT (--network original: 71 blocks, the 310.8.0
+model). They share every layer type and weight layout and differ only in how
+many blocks each stage repeats. Neither is compressed or encrypted. A resource
 starts with its u64 byte length, followed by lexically ordered tensor records:
   u64 name length; ASCII name; u64 serialized length; u64 repeated length;
   u64 payload length; u32 type (1); packed payload; u64 zero; u64 rank (1);
@@ -18,7 +23,7 @@ Payloads already contain the MMA-fragment E4M3 matrices and f16/f32 auxiliary
 values expected by OpenDLSS-NR src/nr_model.cpp and src/nr_graph.cpp. They must
 NOT be decoded, transposed, or converted to FP8 again. The eleven files group
 consecutive graph stages; tensor names, including the blend scalar and the
-eight two-byte ViT layer3 records, are preserved exactly.
+two-byte ViT layer3 records, are preserved exactly.
 """
 
 import argparse
@@ -36,22 +41,51 @@ import zipfile
 
 DLL_SIZE = 266424944
 DLL_SHA256 = "2bc19bc09a7b89dd44f73e2ac0108fcc586e2154bdd0830f242f4f040e28789f"
-RESOURCE_SIZE = 147695410
-RESOURCE_SHA256 = "836f445d06ecd2e59bb9f17b84b91c143396fd76ccda1c9dc7fe81d5edd548f4"
 VERSION = (310, 9, 16, 0)
-STAGES = (
-    ("encoder32", 0, 4),
-    ("encoder64", 5, 8),
-    ("encoder128", 9, 14),
-    ("encoder256", 15, 22),
-    ("encoder512", 23, 30),
-    ("vit1024", 31, 38),
-    ("decoder512", 39, 47),
-    ("decoder256", 48, 55),
-    ("decoder128", 56, 61),
-    ("decoder64", 62, 65),
-    ("decoder32", 66, 70),
-)
+STAGE_IDS = ("encoder32", "encoder64", "encoder128", "encoder256", "encoder512",
+             "vit1024", "decoder512", "decoder256", "decoder128", "decoder64",
+             "decoder32")
+# Blocks per stage, in STAGE_IDS order (nr::NetworkLayout::forBlockCount).
+NETWORKS = {
+    "small": {"resource": "WEIGHTS_CC_SMALL_FP8", "size": 113893343,
+              "sha256": "f743e8eb320f42bc9bdc992ee2bf51f7bb7c8688ced4ecf5ce6807ec4eef7962",
+              "blocks": (2, 2, 2, 2, 2, 8, 2, 2, 2, 2, 2)},
+    "original": {"resource": "WEIGHTS_HT", "size": 147695410,
+                 "sha256": "836f445d06ecd2e59bb9f17b84b91c143396fd76ccda1c9dc7fe81d5edd548f4",
+                 "blocks": (4, 4, 6, 8, 8, 8, 8, 8, 6, 4, 4)},
+}
+
+
+def network_layout(blocks):
+    """First and last block of every stage. Block 0 is the full-resolution pre
+    block, one block between the ViT and decoder512 projects the ViT output, and
+    the block after decoder32 is the post block."""
+    stages = {}
+    block = 1
+    for stage_id, count in zip(STAGE_IDS, blocks):
+        if stage_id == "decoder512":
+            stages["decoderInput"] = (block, block)
+            block += 1
+        stages[stage_id] = (block, block + count - 1)
+        block += count
+    stages["post"] = (block, block)
+    return stages
+
+
+def stage_files(layout):
+    """The eleven stage files: the pre block joins encoder32, the decoder input
+    joins decoder512 and the post block joins decoder32."""
+    files = []
+    for stage_id in STAGE_IDS:
+        first, last = layout[stage_id]
+        if stage_id == "encoder32":
+            first = 0
+        elif stage_id == "decoder512":
+            first = layout["decoderInput"][0]
+        elif stage_id == "decoder32":
+            last = layout["post"][0]
+        files.append((stage_id, first, last))
+    return files
 
 
 def require(condition, message):
@@ -162,38 +196,44 @@ def fused_size(channels, upsample=False, transition=False):
     return end + 16
 
 
-def expected_tensors():
+def expected_tensors(layout):
     expected = {}
 
     def add(block, layer, length, parameter="layer"):
         expected[f"block{block}.layer{layer}.{parameter}"] = length
 
+    def blocks(stage_id):
+        first, last = layout[stage_id]
+        return range(first, last + 1)
+
     add(0, 0, 21696)
-    for first, last, channels in ((1, 4, 32), (5, 8, 64),
-                                  (9, 14, 128), (15, 22, 256)):
-        for block in range(first, last + 1):
-            add(block, 0, fused_size(channels, transition=block == last))
-    for block in list(range(23, 31)) + list(range(40, 48)):
+    for stage_id, channels in (("encoder32", 32), ("encoder64", 64),
+                               ("encoder128", 128), ("encoder256", 256)):
+        for block in blocks(stage_id):
+            add(block, 0, fused_size(channels, transition=block == layout[stage_id][1]))
+    for block in list(blocks("encoder512")) + list(blocks("decoder512")):
         for layer, length in enumerate((524288, 263168, 917568, 263168)):
             add(block, layer, length)
-    add(30, 4, 512 * 1024 + 16)
-    for block in range(31, 39):
+    add(layout["encoder512"][1], 4, 512 * 1024 + 16)
+    for block in blocks("vit1024"):
         for layer, length in enumerate((4194320, 4196352, 3145856, 2, 1050624)):
             add(block, layer, length)
-    add(39, 0, 1024 * 512 + 512 * 2)
-    for first, last, channels in ((48, 55, 256), (56, 61, 128),
-                                  (62, 65, 64), (66, 69, 32)):
-        for block in range(first, last + 1):
-            add(block, 0, fused_size(channels, upsample=block == first))
-    add(70, 0, 2, "blend_scale")
-    add(70, 0, 21808)
+    add(layout["decoderInput"][0], 0, 1024 * 512 + 512 * 2)
+    for stage_id, channels in (("decoder256", 256), ("decoder128", 128),
+                               ("decoder64", 64), ("decoder32", 32)):
+        for block in blocks(stage_id):
+            add(block, 0, fused_size(channels, upsample=block == layout[stage_id][0]))
+    post = layout["post"][0]
+    add(post, 0, 2, "blend_scale")
+    add(post, 0, 21808)
     return expected
 
 
-def parse_tensors(resource):
+def parse_tensors(resource, layout):
     size, = unpack(resource, 0, "<Q")
     require(size == len(resource), "resource length header mismatch")
-    expected = expected_tensors()
+    expected = expected_tensors(layout)
+    block_count = layout["post"][0] + 1
     tensors = []
     position = 8
     previous_name = ""
@@ -221,17 +261,20 @@ def parse_tensors(resource):
                         "parameter": match[3], "resourceOffset": position,
                         "byteLength": length})
         position += length + 20
-    require(position == len(resource) and len(tensors) == len(expected) == 153,
-            "incomplete 153-tensor model")
-    require({tensor["block"] for tensor in tensors} == set(range(71)),
-            "incomplete 71-block model")
+    require(position == len(resource) and len(tensors) == len(expected),
+            f"incomplete {len(expected)}-tensor model")
+    require({tensor["block"] for tensor in tensors} == set(range(block_count)),
+            f"incomplete {block_count}-block model")
     return sorted(tensors, key=lambda tensor: (tensor["block"], tensor["layer"],
                                               tensor["parameter"]))
 
 
-def extract(source, output):
+def extract(source, output, network):
     require(not output.exists() and not output.is_symlink(),
             "output already exists; choose a new directory (existing models are never overwritten)")
+    spec = NETWORKS[network]
+    layout = network_layout(spec["blocks"])
+    stages = stage_files(layout)
     dll = load_dll(source)
     resources = pe_resources(dll)
     require((16, 1, 1033) in resources, "missing DLL version resource")
@@ -242,21 +285,24 @@ def extract(source, output):
     ms, ls = unpack(version_data, signature + 8, "<II")
     require((ms >> 16, ms & 0xFFFF, ls >> 16, ls & 0xFFFF) == VERSION,
             "unsupported DLL version")
-    key = (10, "WEIGHTS_HT", 1033)
-    require(key in resources, "missing WEIGHTS_HT RCDATA resource")
+    name = spec["resource"]
+    key = (10, name, 1033)
+    require(key in resources, f"missing {name} RCDATA resource")
     resource_offset, resource_size = resources[key]
-    require(resource_size == RESOURCE_SIZE, "unsupported WEIGHTS_HT size")
+    require(resource_size == spec["size"], f"unsupported {name} size")
     resource = memoryview(dll)[resource_offset:resource_offset + resource_size]
-    require(hashlib.sha256(resource).hexdigest() == RESOURCE_SHA256,
-            "unsupported WEIGHTS_HT SHA-256")
-    tensors = parse_tensors(resource)
+    require(hashlib.sha256(resource).hexdigest() == spec["sha256"],
+            f"unsupported {name} SHA-256")
+    tensors = parse_tensors(resource, layout)
+    block_count = layout["post"][0] + 1
     manifest = {
         "format": "OpenDLSS-NR packed E4M3 stages",
         "source": {"dllVersion": ".".join(map(str, VERSION)), "dllSha256": DLL_SHA256,
-                   "resource": "WEIGHTS_HT", "resourceLanguage": 1033,
+                   "resource": name, "resourceLanguage": 1033,
                    "resourceFileOffset": resource_offset, "resourceByteLength": resource_size,
-                   "resourceSha256": RESOURCE_SHA256},
-        "totals": {"blockCount": 71, "tensorCount": 153, "stageCount": 11,
+                   "resourceSha256": spec["sha256"]},
+        "totals": {"blockCount": block_count, "tensorCount": len(tensors),
+                   "stageCount": len(stages),
                    "packedByteLength": sum(tensor["byteLength"] for tensor in tensors)},
         "stages": [], "tensors": tensors,
     }
@@ -264,7 +310,7 @@ def extract(source, output):
     temporary = Path(tempfile.mkdtemp(prefix="." + output.name + "-", dir=output.parent))
     try:
         (temporary / "model").mkdir()
-        for stage_id, first, last in STAGES:
+        for stage_id, first, last in stages:
             filename = stage_id + ".bin"
             digest = hashlib.sha256()
             stage_offset = 0
@@ -291,10 +337,11 @@ def extract(source, output):
     finally:
         if temporary.exists():
             shutil.rmtree(temporary)
-    print(f"Extracted {len(tensors)} tensors / 71 blocks / 11 stages to {output}")
+    print(f"Extracted {len(tensors)} tensors / {block_count} blocks / {len(stages)} stages "
+          f"({network} network) to {output}")
     print(f"Packed bytes: {manifest['totals']['packedByteLength']}")
     print(f"DLL SHA-256: {DLL_SHA256}")
-    print(f"WEIGHTS_HT SHA-256: {RESOURCE_SHA256}")
+    print(f"{name} SHA-256: {spec['sha256']}")
     print(f"Manifest SHA-256: {hashlib.sha256(encoded).hexdigest()}")
     for stage in manifest["stages"]:
         print(f"  {stage['id']}: {stage['packedByteLength']} bytes  {stage['sha256']}")
@@ -305,9 +352,12 @@ def main():
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("input", type=Path, help="user-supplied nvngx_dlssnr DLL or ZIP")
     parser.add_argument("output", type=Path, help="new model directory (must not already exist)")
+    parser.add_argument("--network", choices=sorted(NETWORKS), default="small",
+                        help="small: WEIGHTS_CC_SMALL_FP8, 31 blocks (default); "
+                             "original: WEIGHTS_HT, 71 blocks")
     args = parser.parse_args()
     try:
-        extract(args.input, args.output)
+        extract(args.input, args.output, args.network)
     except (OSError, ValueError, struct.error, zipfile.BadZipFile,
             NotImplementedError, RuntimeError) as error:
         parser.exit(1, f"error: {error}\n")
