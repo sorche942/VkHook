@@ -158,8 +158,9 @@ has two blocks in every encoder/decoder stage instead of four to eight (the eigh
 ViT blocks are unchanged) and is about 1.8× faster. The extractor validates the
 DLL and resource hashes, checks every tensor's shape and storage, then publishes
 `manifest.json` and 11 stage files atomically. The runtime identifies the network
-by its block count, logs it (`DLSS5: loaded the small network (31 blocks)`) and
-verifies each stage's hash before uploading. To switch, extract the other network
+by its block count, logs it with the activation memory placed for the current
+resolution (`DLSS5: loaded the small network (31 blocks, 478 MiB of activations)`)
+and verifies each stage's hash before uploading. To switch, extract the other network
 into its own directory and point `dlss5ModelPath` or `VKINTOX_DLSS5_MODEL` at it.
 Other DLL versions are rejected rather than guessed.
 
@@ -388,8 +389,9 @@ build-gcc/src/vkintox-dlss5-bench --model build-gcc/dlss5-model-small \
   --shaders "$B" --ptx "$B" --width 3840 --height 2160 --frames 40
 ```
 
-It records the graph once, resubmits it, and prints the network, the minimum and
-the median GPU time. `--profile` re-records every frame with per-launch timestamps
+It records the graph once, resubmits it, and prints the network, its pooled
+activation memory (see "Video memory" below), and the minimum and median GPU
+time. `--profile` re-records every frame with per-launch timestamps
 and lists the minimum span per kernel and per block. `--chain 0|1` selects Vulkan
 barriers (the effect's schedule) or upstream's spinning counter chains.
 `--dump FILE` writes the network head as f32, and `--compare FILE` reports how
@@ -433,6 +435,48 @@ The PTX still targets `sm_89`, so Ada GPUs run it, but the register caps were
 chosen on Blackwell; re-measure them with this tool before tuning for another GPU.
 Absolute times on this GPU vary by up to ~10% between processes, so compare
 builds with interleaved runs.
+
+### Video memory
+
+At 3840×2160 the small network's 82 tensors, input features included, took
+2.9 GiB as one allocation each; 980 MiB of that was allocated but never used by
+the default PTX routes. The graph constructor now records the network once into
+a command buffer that is never submitted, learns which barrier-separated launches
+use each tensor, and binds tensors whose launch intervals never overlap to the
+same range of one allocation (64 KiB aligned, largest first). Unused tensors get
+no memory. Every later recording is checked against that plan and throws before
+recording a tensor outside its placed interval. The head stays valid after the
+recording; the caller's 16-channel F32 input features (510 MiB at 4K) keep their
+own memory. Only the debug capture options keep one allocation per tensor.
+
+Peak process memory of `vkintox-dlss5-bench` (weights, network and input
+features; no swapchain, history or optical-flow images), RTX 5070 Ti, 30 frames:
+
+| Network | Resolution | Pooled activations | Before | After |
+| --- | --- | ---: | ---: | ---: |
+| small | 1920×1080 | 126 MiB | 1192 MiB | 669 MiB |
+| small | 2560×1440 | 215 MiB | 1754 MiB | 862 MiB |
+| small | 3840×2160 | 478 MiB | 3418 MiB | 1443 MiB |
+| original | 1920×1080 | 126 MiB | 1270 MiB | 745 MiB |
+| original | 2560×1440 | 215 MiB | 1832 MiB | 938 MiB |
+| original | 3840×2160 | 478 MiB | 3496 MiB | 1519 MiB |
+
+With the effect and temporal history in an X11 `vkcube` at 3840×2028, peak
+process memory fell from 4872 to 2980 MiB. The head stayed bit-identical
+(`--compare`) at six resolutions from 1280×720 to 3840×2160, after 1 to 20
+frames, with `--chain 1`, under each `DLSS5VK_*` route switch, and for both
+networks. Interleaved 4K runs showed no GPU time change beyond noise.
+
+This addresses a CONTROL (DX12, vkd3d-proton) crash at 3840×2160 on the 16 GiB
+card. That game alone already exceeded VRAM: vkd3d logged system-memory
+fallbacks even without VKIntox. With DLSS5 adding about 3.9 GB, the session ended
+after 52 minutes. The NVIDIA DRM driver could no longer allocate the compositor's
+Xwayland buffers (`Failed to allocate NVKMS memory for GEM object`), and the game
+exited without an exception. A 2 h 17 min session without DLSS5 had no such errors.
+
+If an effect's auxiliary submission (DLSS5 optical flow) or the frame submission
+waiting on it fails, VKIntox logs `VKIntox panic: …` with the `VkResult` and turns
+effects off until restart. It no longer fails every later present silently.
 
 ## user-local native installation
 

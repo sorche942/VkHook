@@ -3883,13 +3883,16 @@ namespace VKIntox
             submitInfo.pSignalSemaphores    = &logicalSwapchain->semaphores[index];
 
             VkResult vr = VK_SUCCESS;
+            // Set once an effect's auxiliary submissions (DLSS5 optical flow) feed this
+            // submission through their own semaphores: a failed submit strands them.
+            bool auxiliaryQueued = false;
             {
                 std::unique_lock opticalLock(logicalDevice->dlss5OpticalFlowQueueMutex, std::defer_lock);
                 if (logicalDevice->dlss5OpticalFlowQueue) opticalLock.lock();
                 // serialized with the destroy hooks and the drain: between this
                 // check and the submit the render thread must not be able to
                 // retire the generation these buffers reference
-                scoped_lock submitLock(globalLock);
+                std::unique_lock submitLock(globalLock);
 
                 // a depth-generation change leaves the recorded buffers pointing
                 // at dying resources; submit nothing until the rebuild re-records
@@ -3902,11 +3905,13 @@ namespace VKIntox
 
                 if (presentEffectSnapshot)
                 {
+                    const VkSemaphore* applicationWaits = submitInfo.pWaitSemaphores;
                     for (auto& effect : logicalSwapchain->effects)
                     {
                         vr = effect->prepareSubmission(index, frameSerial, submitInfo);
                         if (vr != VK_SUCCESS) break;
                     }
+                    auxiliaryQueued = submitInfo.pWaitSemaphores != applicationWaits;
                     // Auxiliary submissions may already have consumed the app's
                     // waits. Never attempt an unsynchronized passthrough on failure.
                     if (vr != VK_SUCCESS)
@@ -3918,6 +3923,14 @@ namespace VKIntox
                             logicalDevice->vkd.QueueWaitIdle(logicalDevice->dlss5OpticalFlowQueue);
                         }
                         reportDeviceLostDiagnostics(logicalDevice, logicalDevice->queue, "effect auxiliary submit", vr);
+                        // A failed preparation is terminal for the effect (DLSS5's
+                        // optical-flow semaphores cannot resume): stop the effects
+                        // instead of failing every later present.
+                        submitLock.unlock();
+                        if (opticalLock.owns_lock()) opticalLock.unlock();
+                        panicLayer(logicalDevice, vr == VK_ERROR_DEVICE_LOST
+                            ? std::string("Vulkan device lost during effect auxiliary submit")
+                            : "effect auxiliary submit failed (VkResult " + std::to_string(vr) + ")");
                         return vr;
                     }
                 }
@@ -3966,6 +3979,9 @@ namespace VKIntox
                 reportDeviceLostDiagnostics(logicalDevice, logicalDevice->queue, "vkQueueSubmit(effect)", vr);
                 if (vr == VK_ERROR_DEVICE_LOST)
                     panicLayer(logicalDevice, "Vulkan device lost during effect submit");
+                else if (auxiliaryQueued)
+                    panicLayer(logicalDevice, "effect submit failed after its auxiliary work was queued (VkResult "
+                        + std::to_string(vr) + ")");
                 return vr;
             }
 

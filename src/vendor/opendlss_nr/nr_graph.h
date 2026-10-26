@@ -53,6 +53,12 @@ struct NetworkLayout {
   static NetworkLayout forBlockCount(uint32_t blockCount);
 };
 
+// Activation memory: the constructor records the network once into a scratch command buffer that is never
+// submitted, learning the interval of barrier-separated launches in which each activation is used, then binds all
+// of them into one allocation where activations whose intervals never overlap share memory. record() rejects any
+// use outside that plan. Of the recorded tensors only head() outlives the recording; allocate() calls made after
+// construction (the caller's input features) get memory of their own. The capture options, whose copies are read
+// after the frame, keep every activation in its own allocation.
 class Graph {
  public:
   // The layout of the loaded model.
@@ -78,6 +84,8 @@ class Graph {
   // block and the five encoder stage transitions. The post block feeds the head on chip; the pooled-* captures have
   // no reference counterpart.
   std::vector<std::string> referenceBoundaryNames() const;
+  // Bytes of the allocation shared by the recorded activations (0 when the capture options keep them separate).
+  VkDeviceSize pooledBytes() const { return pooledBytes_; }
 
   Activation* allocate(const std::string& label, uint32_t rows, uint32_t channels, Format format);
 
@@ -143,6 +151,22 @@ class Graph {
                         Activation* rawOutput, bool firstInStage = true, bool lastInStage = true);
   void encodeVit(VkCommandBuffer commands, Activation& state, uint32_t tokens);
   void capture(VkCommandBuffer commands, const std::string& name, const Activation& source);
+  void recordNetwork(VkCommandBuffer commands, const Activation& inputFeatures);
+
+  // Activation placement (see the class comment). `first`/`last` bound the launch intervals that use the buffer;
+  // an activation the routes never use keeps first > last and stays unbound.
+  struct Placement {
+    uint32_t first = UINT32_MAX, last = 0;
+    VkMemoryRequirements requirements{};
+    VkDeviceSize offset = 0;
+  };
+  class LifetimeObserver;
+  void placeActivations();
+  void releaseActivations() noexcept;
+  std::map<VkBuffer, Placement> placements_;
+  bool probing_ = false;   // allocate() leaves new activations unbound for placement
+  VkDeviceMemory pool_ = VK_NULL_HANDLE;
+  VkDeviceSize pooledBytes_ = 0;
 
   vk::Context& context_;
   Model& model_;

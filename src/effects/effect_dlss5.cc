@@ -223,7 +223,8 @@ namespace VKIntox
             updateFrame(index);
         }
         Logger::info("DLSS5: loaded the " + std::string(s.graph->layout().name) + " network ("
-                     + std::to_string(s.model->blockCount()) + " blocks), PTX neural rendering at "
+                     + std::to_string(s.model->blockCount()) + " blocks, "
+                     + std::to_string(s.graph->pooledBytes() >> 20) + " MiB of activations), PTX neural rendering at "
                      + std::to_string(extent.width) + "x" + std::to_string(extent.height)
                      + (s.flow ? " (SDR, bidirectional NVIDIA hardware optical flow)" : " (SDR, no temporal history)"));
     }

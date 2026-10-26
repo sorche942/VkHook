@@ -248,9 +248,10 @@ int main(int argc, char** argv)
             VK_CHECK(vkd.vkEndCommandBuffer(commands));
         };
         record();
-        std::printf("%s network (%u blocks), %ux%u (field %ux%u), %u launches, %s\n", graph.layout().name,
-            graph.layout().blockCount(), width, height, geometry.fullWidth, geometry.fullHeight,
-            kernels.dispatchCount(), graph.chained() ? "counter chaining" : "barriers");
+        std::printf("%s network (%u blocks), %ux%u (field %ux%u), %u launches, %s, %llu MiB of pooled activations\n",
+            graph.layout().name, graph.layout().blockCount(), width, height, geometry.fullWidth, geometry.fullHeight,
+            kernels.dispatchCount(), graph.chained() ? "counter chaining" : "barriers",
+            (unsigned long long)(graph.pooledBytes() >> 20));
 
         VkQueue queue = context.queue();
         VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};

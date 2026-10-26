@@ -161,10 +161,10 @@ uint32_t Context::findMemoryType(uint32_t typeBits, VkMemoryPropertyFlags requir
   throw std::runtime_error("no suitable memory type");
 }
 
-Buffer Context::createBuffer(VkDeviceSize size, bool hostVisible, const char* label, VkBufferUsageFlags extra) {
+Buffer Context::createUnboundBuffer(VkDeviceSize size, const char* label, VkMemoryRequirements& requirements,
+                                    VkBufferUsageFlags extra) {
   Buffer result;
   result.size = std::max<VkDeviceSize>(size, 16);
-  result.hostVisible = hostVisible;
   result.label = label;
   VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
   info.size = result.size;
@@ -172,19 +172,31 @@ Buffer Context::createBuffer(VkDeviceSize size, bool hostVisible, const char* la
                VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | extra;
   info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
   VK_CHECK(vkCreateBuffer(device_, &info, nullptr, &result.buffer));
-  VkMemoryRequirements requirements;
   vkGetBufferMemoryRequirements(device_, result.buffer, &requirements);
+  return result;
+}
+
+VkDeviceMemory Context::allocateMemory(VkDeviceSize size, uint32_t memoryType) {
   VkMemoryAllocateFlagsInfo allocateFlags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
   allocateFlags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
   VkMemoryAllocateInfo allocateInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
   allocateInfo.pNext = &allocateFlags;
-  allocateInfo.allocationSize = requirements.size;
+  allocateInfo.allocationSize = size;
+  allocateInfo.memoryTypeIndex = memoryType;
+  VkDeviceMemory memory = VK_NULL_HANDLE;
+  VK_CHECK(vkAllocateMemory(device_, &allocateInfo, nullptr, &memory));
+  return memory;
+}
+
+Buffer Context::createBuffer(VkDeviceSize size, bool hostVisible, const char* label, VkBufferUsageFlags extra) {
+  VkMemoryRequirements requirements;
+  Buffer result = createUnboundBuffer(size, label, requirements, extra);
+  result.hostVisible = hostVisible;
   try {
-  allocateInfo.memoryTypeIndex = findMemoryType(
-      requirements.memoryTypeBits,
-      hostVisible ? (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
-                  : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    VK_CHECK(vkAllocateMemory(device_, &allocateInfo, nullptr, &result.memory));
+    result.memory = allocateMemory(requirements.size, findMemoryType(
+        requirements.memoryTypeBits,
+        hostVisible ? (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+                    : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT));
     VK_CHECK(vkBindBufferMemory(device_, result.buffer, result.memory, 0));
     if (hostVisible) VK_CHECK(vkMapMemory(device_, result.memory, 0, VK_WHOLE_SIZE, 0, &result.mapped));
   } catch (...) {
@@ -192,6 +204,18 @@ Buffer Context::createBuffer(VkDeviceSize size, bool hostVisible, const char* la
     throw;
   }
   return result;
+}
+
+VkDeviceMemory Context::allocateDeviceMemory(VkDeviceSize size, uint32_t memoryTypeBits) {
+  return allocateMemory(size, findMemoryType(memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT));
+}
+
+void Context::bindBuffer(const Buffer& buffer, VkDeviceMemory memory, VkDeviceSize offset) {
+  VK_CHECK(vkBindBufferMemory(device_, buffer.buffer, memory, offset));
+}
+
+void Context::freeMemory(VkDeviceMemory memory) {
+  if (memory) vkFreeMemory(device_, memory, nullptr);
 }
 
 void Context::destroyBuffer(Buffer& buffer) {
@@ -341,6 +365,15 @@ void Context::destroyPipeline(Pipeline& pipeline) {
 VkDescriptorSet Context::allocateSet(const Buffer* const bindings[kGenericBindings],
                                      const VkDeviceSize offsets[kGenericBindings],
                                      const VkDeviceSize ranges[kGenericBindings]) {
+  VkDescriptorBufferInfo infos[kGenericBindings];
+  for (uint32_t index = 0; index < kGenericBindings; ++index) {
+    const Buffer* buffer = bindings[index] ? bindings[index] : &dummy_;
+    if (bindings[index] && observer_) buffer = &observer_->use(*buffer);
+    // A stand-in has its own extent; the requested window belongs to the buffer it replaces.
+    const bool window = !bindings[index] || buffer == bindings[index];
+    infos[index] = {buffer->buffer, window && offsets ? offsets[index] : 0,
+                    window && ranges && ranges[index] ? ranges[index] : VK_WHOLE_SIZE};
+  }
   VkDescriptorSetAllocateInfo allocateInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
   allocateInfo.descriptorPool = descriptorPool_;
   allocateInfo.descriptorSetCount = 1;
@@ -359,12 +392,8 @@ VkDescriptorSet Context::allocateSet(const Buffer* const bindings[kGenericBindin
     result = vkAllocateDescriptorSets(device_, &allocateInfo, &set);
   }
   VK_CHECK(result);
-  VkDescriptorBufferInfo infos[kGenericBindings];
   VkWriteDescriptorSet writes[kGenericBindings];
   for (uint32_t index = 0; index < kGenericBindings; ++index) {
-    const Buffer* buffer = bindings[index] ? bindings[index] : &dummy_;
-    infos[index] = {buffer->buffer, offsets ? offsets[index] : 0,
-                    ranges && ranges[index] ? ranges[index] : VK_WHOLE_SIZE};
     writes[index] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     writes[index].dstSet = set;
     writes[index].dstBinding = index;
@@ -422,6 +451,10 @@ void Context::endAndSubmit(VkCommandBuffer commands, bool wait) {
   }
 }
 
+void Context::freeCommands(VkCommandBuffer commands) {
+  vkFreeCommandBuffers(device_, commandPool_, 1, &commands);
+}
+
 void Context::computeBarrier(VkCommandBuffer commands) {
   // Compute -> compute only. Including the transfer stages here made NVIDIA flush
   // caches between every dispatch (tens of microseconds per barrier once L2 is dirty).
@@ -434,6 +467,7 @@ void Context::computeBarrier(VkCommandBuffer commands) {
   dependency.memoryBarrierCount = 1;
   dependency.pMemoryBarriers = &barrier;
   vkCmdPipelineBarrier2(commands, &dependency);
+  if (observer_) observer_->barrier();
 }
 
 // Captures and uploads only.
@@ -448,6 +482,7 @@ void Context::transferBarrier(VkCommandBuffer commands) {
   dependency.memoryBarrierCount = 1;
   dependency.pMemoryBarriers = &barrier;
   vkCmdPipelineBarrier2(commands, &dependency);
+  if (observer_) observer_->barrier();
 }
 
 VkQueryPool Context::createTimestampPool(uint32_t count) {
@@ -475,7 +510,7 @@ namespace vk {
 
 VkDeviceAddress Context::deviceAddress(const Buffer& buffer) const {
   VkBufferDeviceAddressInfo info{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
-  info.buffer = buffer.buffer;
+  info.buffer = (observer_ ? observer_->use(buffer) : buffer).buffer;
   return vkGetBufferDeviceAddress(device_, &info);
 }
 

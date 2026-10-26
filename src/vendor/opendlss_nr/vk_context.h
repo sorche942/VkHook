@@ -54,6 +54,19 @@ struct Pipeline {
   const char* label = "";
 };
 
+// Sees, in recording order, every buffer whose device address or descriptor a recording takes and every barrier
+// between its launches (nr::Graph learns and checks activation lifetimes with it).
+class BufferUseObserver {
+ public:
+  // Returns the buffer to record in place of `buffer`: itself, or a bound stand-in when the recording is never
+  // submitted and `buffer` has no memory yet. May throw to stop the recording before the driver sees `buffer`.
+  virtual const Buffer& use(const Buffer& buffer) = 0;
+  virtual void barrier() = 0;
+
+ protected:
+  ~BufferUseObserver() = default;
+};
+
 // Required Vulkan 1.3 features and extensions. Merge true fields into the application's
 // existing feature chain (do not append duplicate sTypes). This self-linked object is not copyable.
 struct DeviceRequirements {
@@ -115,6 +128,13 @@ class Context : private Dispatch {
   Buffer createBuffer(VkDeviceSize size, bool hostVisible, const char* label,
                       VkBufferUsageFlags extra = 0);
   void destroyBuffer(Buffer& buffer);
+  // Suballocation: the caller binds unbound buffers into memory from allocateDeviceMemory. A buffer bound this way
+  // does not own its memory (destroyBuffer leaves it); the caller frees it after destroying those buffers.
+  Buffer createUnboundBuffer(VkDeviceSize size, const char* label, VkMemoryRequirements& requirements,
+                             VkBufferUsageFlags extra = 0);
+  VkDeviceMemory allocateDeviceMemory(VkDeviceSize size, uint32_t memoryTypeBits);
+  void bindBuffer(const Buffer& buffer, VkDeviceMemory memory, VkDeviceSize offset);
+  void freeMemory(VkDeviceMemory memory);
   // Upload through a staging buffer and wait for completion.
   void upload(const Buffer& target, const void* data, VkDeviceSize size, VkDeviceSize offset = 0);
   void fillZero(const Buffer& target);
@@ -141,8 +161,11 @@ class Context : private Dispatch {
   // Commands --------------------------------------------------------------------
   VkCommandBuffer beginCommands();
   void endAndSubmit(VkCommandBuffer commands, bool wait = true);
+  void freeCommands(VkCommandBuffer commands);   // a beginCommands() buffer that is not pending, e.g. never submitted
   void waitIdle() { VK_CHECK(vkQueueWaitIdle(queue_)); }
   void computeBarrier(VkCommandBuffer commands);   // compute -> compute
+  // Reports deviceAddress/allocateSet buffers and the barriers to `observer` until reset to nullptr.
+  void setBufferUseObserver(BufferUseObserver* observer) { observer_ = observer; }
   // VK_NV_cuda_kernel_launch: PTX modules launched from the command buffer on buffer device addresses.
   VkDeviceAddress deviceAddress(const Buffer& buffer) const;
   VkCudaModuleNV createCudaModule(const std::string& ptx);
@@ -161,6 +184,7 @@ class Context : private Dispatch {
 
  private:
   uint32_t findMemoryType(uint32_t typeBits, VkMemoryPropertyFlags required);
+  VkDeviceMemory allocateMemory(VkDeviceSize size, uint32_t memoryType);
   VkInstance instance_ = VK_NULL_HANDLE;
   VkPhysicalDevice physical_ = VK_NULL_HANDLE;
   VkDevice device_ = VK_NULL_HANDLE;
@@ -178,6 +202,7 @@ class Context : private Dispatch {
   uint32_t maxSharedMemory_ = 0;
   uint32_t smCount_ = 0;   // streaming multiprocessors (co-residency bound of spinning grids)
   bool captureStatistics_ = false;
+  BufferUseObserver* observer_ = nullptr;
   std::string deviceName_;
   void initCommon();   // properties, memory types, command pool, layouts, pools, staging
   void destroyResources() noexcept;

@@ -20,7 +20,48 @@ void windowPhase(uint32_t index, uint32_t& shiftX, uint32_t& shiftY) {
   shiftX = phases[index & 3][0];
   shiftY = phases[index & 3][1];
 }
+
+// Dedicated allocations start on at least 64 KiB boundaries. Placed activations keep that alignment, so no kernel
+// sees a less aligned base address than it did with one allocation per activation.
+constexpr VkDeviceSize kPlacementAlignment = 64 << 10;
+VkDeviceSize alignOffset(VkDeviceSize offset, VkDeviceSize alignment) {
+  return (offset + alignment - 1) / alignment * alignment;
+}
 }  // namespace
+
+// Follows one recording through the context's buffer uses. Probing, it widens each activation's lifetime to the
+// current interval of launches between two barriers and records the dummy binding in place of the still unbound
+// buffer. Afterwards it rejects a use outside the planned lifetime before the driver sees the buffer.
+class Graph::LifetimeObserver final : public vk::BufferUseObserver {
+ public:
+  LifetimeObserver(Graph& graph, bool probing) : graph_(graph), probing_(probing) {
+    graph_.context_.setBufferUseObserver(this);
+  }
+  ~LifetimeObserver() { graph_.context_.setBufferUseObserver(nullptr); }
+  LifetimeObserver(const LifetimeObserver&) = delete;
+  LifetimeObserver& operator=(const LifetimeObserver&) = delete;
+
+  const vk::Buffer& use(const vk::Buffer& buffer) override {
+    const auto found = graph_.placements_.find(buffer.buffer);
+    if (found == graph_.placements_.end()) return buffer;
+    Placement& placement = found->second;
+    if (probing_) {
+      placement.first = std::min(placement.first, interval_);
+      placement.last = std::max(placement.last, interval_);
+      return graph_.context_.dummyBuffer();
+    }
+    if (interval_ < placement.first || interval_ > placement.last)
+      throw std::runtime_error(std::string("activation ") + buffer.label +
+                               " used outside the lifetime its memory was placed for");
+    return buffer;
+  }
+  void barrier() override { ++interval_; }
+
+ private:
+  Graph& graph_;
+  const bool probing_;
+  uint32_t interval_ = 0;
+};
 
 // Every level halves its input and rounds the result up to 4; the decoder doubles the chain back up. A
 // dimension therefore needs enough headroom for all of those halvings to be exact, which is what the padded
@@ -184,10 +225,89 @@ Graph::Graph(vk::Context& context, Model& model, Kernels& kernels, const Geometr
             geometry_.fullHeight, tallestRow, Kernels::kSyncCountersPerRegion);
     routes_.chain = routes_.vitChain = false;
   }
+  if (!options_.captureBoundaries && !options_.captureIntermediates) {
+    try {
+      placeActivations();
+    } catch (...) {
+      releaseActivations();
+      throw;
+    }
+  }
 }
 
-Graph::~Graph() {
+Graph::~Graph() { releaseActivations(); }
+
+void Graph::releaseActivations() noexcept {
   for (auto& activation : activations_) context_.destroyBuffer(activation->buffer);
+  context_.freeMemory(pool_);
+  pool_ = VK_NULL_HANDLE;
+}
+
+void Graph::placeActivations() {
+  // The probe records against an unbound stand-in for the caller's input features.
+  const uint32_t fullRows = geometry_.fullWidth * geometry_.fullHeight;
+  Activation features;
+  features.format = Format::F32;
+  features.rows = fullRows;
+  features.channels = 16;
+  features.allocRows = alignRows(fullRows);
+  features.label = "input features";
+  VkMemoryRequirements unused;
+  features.buffer = context_.createUnboundBuffer((VkDeviceSize)features.allocRows * 16 * formatBytes(Format::F32),
+                                                 features.label.c_str(), unused);
+  placements_[features.buffer.buffer] = {};
+  VkCommandBuffer scratch = VK_NULL_HANDLE;
+  auto endProbe = [&] {
+    probing_ = false;
+    if (scratch) context_.freeCommands(scratch);
+    placements_.erase(features.buffer.buffer);
+    context_.destroyBuffer(features.buffer);
+    usedThisRecord_.clear();   // the caller's later allocate("input features") is not a duplicate
+  };
+  try {
+    probing_ = true;
+    scratch = context_.beginCommands();
+    LifetimeObserver probe(*this, true);
+    recordNetwork(scratch, features);
+  } catch (...) {
+    endProbe();
+    throw;
+  }
+  endProbe();
+  placements_.at(head_->buffer.buffer).last = UINT32_MAX;   // read after the recorded commands
+
+  // Largest first, each at the lowest offset clear of every placed activation whose lifetime overlaps its own.
+  std::vector<std::pair<const vk::Buffer*, Placement*>> order;
+  uint32_t memoryTypeBits = ~0u;
+  for (const auto& activation : activations_) {
+    Placement& placement = placements_.at(activation->buffer.buffer);
+    if (placement.first > placement.last) continue;
+    order.emplace_back(&activation->buffer, &placement);
+    memoryTypeBits &= placement.requirements.memoryTypeBits;
+  }
+  std::stable_sort(order.begin(), order.end(), [](const auto& a, const auto& b) {
+    return a.second->requirements.size > b.second->requirements.size;
+  });
+  std::vector<const Placement*> placed, overlapping;
+  for (const auto& [buffer, placement] : order) {
+    overlapping.clear();
+    for (const Placement* other : placed)
+      if (other->first <= placement->last && placement->first <= other->last) overlapping.push_back(other);
+    std::sort(overlapping.begin(), overlapping.end(),
+              [](const Placement* a, const Placement* b) { return a->offset < b->offset; });
+    const VkDeviceSize alignment = std::max(placement->requirements.alignment, kPlacementAlignment);
+    const VkDeviceSize size = placement->requirements.size;
+    VkDeviceSize offset = 0;
+    for (const Placement* other : overlapping) {
+      if (alignOffset(offset, alignment) + size <= other->offset) break;
+      offset = std::max(offset, other->offset + other->requirements.size);
+    }
+    placement->offset = alignOffset(offset, alignment);
+    pooledBytes_ = std::max(pooledBytes_, placement->offset + size);
+    placed.push_back(placement);
+  }
+  pool_ = context_.allocateDeviceMemory(pooledBytes_, memoryTypeBits);
+  for (const auto& [buffer, placement] : order) context_.bindBuffer(*buffer, pool_, placement->offset);
 }
 
 Activation* Graph::allocate(const std::string& label, uint32_t rows, uint32_t channels, Format format) {
@@ -208,8 +328,14 @@ Activation* Graph::allocate(const std::string& label, uint32_t rows, uint32_t ch
   VkDeviceSize bytes = (VkDeviceSize)activation->allocRows * channels * formatBytes(format);
   activations_.push_back(std::move(activation));
   Activation& owned = *activations_.back();
-  owned.buffer = context_.createBuffer(bytes, false, owned.label.c_str());
-  context_.fillZero(owned.buffer);
+  if (probing_) {
+    VkMemoryRequirements requirements;
+    owned.buffer = context_.createUnboundBuffer(bytes, owned.label.c_str(), requirements);
+    placements_[owned.buffer.buffer].requirements = requirements;
+  } else {
+    owned.buffer = context_.createBuffer(bytes, false, owned.label.c_str());
+    context_.fillZero(owned.buffer);
+  }
   allocationsByKey_[key] = activations_.back().get();
   return activations_.back().get();
 }
@@ -686,6 +812,15 @@ void Graph::encodeVit(VkCommandBuffer commands, Activation& state, uint32_t toke
 }
 
 void Graph::record(VkCommandBuffer commands, const Activation& inputFeatures) {
+  if (!pool_) {
+    recordNetwork(commands, inputFeatures);
+    return;
+  }
+  LifetimeObserver check(*this, false);
+  recordNetwork(commands, inputFeatures);
+}
+
+void Graph::recordNetwork(VkCommandBuffer commands, const Activation& inputFeatures) {
   kernels_.resetDispatchCount();
   kernels_.resetSync(commands);   // chaining and split-K tile counters
   const Geometry& g = geometry_;

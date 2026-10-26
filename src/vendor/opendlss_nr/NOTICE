@@ -29,4 +29,7 @@ VKIntox vendor integration:
   network's block structure and its comparison captures of NVIDIA's DLL come from DLSSNR-AMD
   (https://github.com/mochizuki0323/DLSSNR-AMD, MIT License, Copyright (c) 2026 mochizuki0323); no
   DLSSNR-AMD source code is included.
+- Places the graph's activations by lifetime: the constructor records the network once without submitting it,
+  and activations whose barrier intervals never overlap share one allocation (Graph::placeActivations,
+  vk::BufferUseObserver). Outputs are bit-identical; see docs/WORKFLOWS.md "Video memory".
 - NVIDIA model weights are not part of this vendored source directory.
