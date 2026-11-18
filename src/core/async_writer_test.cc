@@ -12,7 +12,7 @@
 #include <thread>
 #include <vector>
 
-using VKIntox::AsyncWriter;
+using VkHook::AsyncWriter;
 
 namespace
 {

@@ -15,7 +15,7 @@
 #include "vendor/imgui/imgui.h"
 #include "overlay/ui_theme.hh"
 
-namespace VKIntox
+namespace VkHook
 {
     // ---- Effect search -------------------------------------------------------
     //
@@ -265,11 +265,11 @@ namespace VKIntox
                         packages.insert(package);
                 }
                 addEffectsPackages.assign(packages.begin(), packages.end());
-                // VKIntox's own shaders lead the tab row; the rest stay alphabetical
+                // VkHook's own shaders lead the tab row; the rest stay alphabetical
                 std::sort(addEffectsPackages.begin(), addEffectsPackages.end(),
                           [](const std::string& a, const std::string& b) {
-                              if ((a == "VKIntox") != (b == "VKIntox"))
-                                  return a == "VKIntox";
+                              if ((a == "VkHook") != (b == "VkHook"))
+                                  return a == "VkHook";
                               return a < b;
                           });
             }
@@ -525,4 +525,4 @@ namespace VKIntox
         ImGui::EndDisabled();
     }
 
-} // namespace VKIntox
+} // namespace VkHook

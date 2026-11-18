@@ -12,7 +12,7 @@
 #include <cstdlib>
 #include <vector>
 
-namespace VKIntox
+namespace VkHook
 {
     namespace
     {
@@ -537,4 +537,4 @@ namespace VKIntox
         }
         g_pumping = false;
     }
-} // namespace VKIntox
+} // namespace VkHook

@@ -11,7 +11,7 @@
 
 #include "logical_device.hh"
 
-namespace VKIntox
+namespace VkHook
 {
     void createBuffer(LogicalDevice*        logicalDevice,
                       VkDeviceSize          size,

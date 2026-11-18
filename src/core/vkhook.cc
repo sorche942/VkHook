@@ -1,5 +1,5 @@
 #include "vulkan_include.hh"
-#include "vkintox_internal.hh"
+#include "vkhook_internal.hh"
 
 #include <mutex>
 #include <map>
@@ -65,7 +65,7 @@
 #include "imgui_overlay.hh"
 #include "effects/effect_registry.hh"
 #include "effects/dlss5_config.hh"
-#ifdef VKINTOX_DLSS5
+#ifdef VKHOOK_DLSS5
 #include "effects/effect_dlss5.hh"
 #include "render/dlss5_device.hh"
 #endif
@@ -82,7 +82,7 @@
 #include "vulkan/vulkan_xlib.h"
 #include "vulkan/vulkan_xcb.h"
 
-#define VKINTOX_LAYER_NAME "VK_LAYER_VKINTOX_post_processing"
+#define VKHOOK_LAYER_NAME "VK_LAYER_VKHOOK_post_processing"
 
 #if defined(__GNUC__) && __GNUC__ >= 4
 #define VK_SHADE_EXPORT __attribute__((visibility("default")))
@@ -90,7 +90,7 @@
 #error "Unsupported platform!"
 #endif
 
-namespace VKIntox
+namespace VkHook
 {
 
     namespace
@@ -115,7 +115,7 @@ namespace VKIntox
         return g_depthCaptureLatched;
     }
 
-    std::shared_ptr<Config> baseConfig = nullptr;  // Always VKIntox.conf
+    std::shared_ptr<Config> baseConfig = nullptr;  // Always VkHook.conf
     std::shared_ptr<Config> config = nullptr;      // Current config (base + overlay)
     EffectRegistry effectRegistry;                   // Single source of truth for effect configs
 
@@ -136,7 +136,7 @@ namespace VKIntox
     std::mutex globalLock;
     using scoped_lock = std::lock_guard<std::mutex>;
 
-    // DepthRetryState and depthRetryStates live in vkintox_internal.hh, since
+    // DepthRetryState and depthRetryStates live in vkhook_internal.hh, since
     // the depth subsystem is what arms and polls the retries.
     std::unordered_map<LogicalDevice*, DepthRetryState> depthRetryStates;
 
@@ -218,7 +218,7 @@ namespace VKIntox
 
     static bool getMutableSwapchainEnvOverride(bool& hasOverride, bool defaultValue)
     {
-        const char* value = std::getenv("VKINTOX_ENABLE_MUTABLE_SWAPCHAIN");
+        const char* value = std::getenv("VKHOOK_ENABLE_MUTABLE_SWAPCHAIN");
         if (value == nullptr)
         {
             hasOverride = false;
@@ -231,7 +231,7 @@ namespace VKIntox
 
     static bool isSwapchainDiagEnabled()
     {
-        const char* value = std::getenv("VKINTOX_DIAG_SWAPCHAIN");
+        const char* value = std::getenv("VKHOOK_DIAG_SWAPCHAIN");
         if (value == nullptr)
             return false;
         return parseBoolEnvValue(value, false);
@@ -239,20 +239,20 @@ namespace VKIntox
 
     static bool isGpuCrashDiagEnabled()
     {
-        const char* value = std::getenv("VKINTOX_GPU_CRASH_DIAGNOSTICS");
+        const char* value = std::getenv("VKHOOK_GPU_CRASH_DIAGNOSTICS");
         if (value == nullptr)
             return false;
         return parseBoolEnvValue(value, false);
     }
 
-    // Smoke-test hook: VKINTOX_SMOKE_DEPTH_REFRESH=<ms> drops the depth
+    // Smoke-test hook: VKHOOK_SMOKE_DEPTH_REFRESH=<ms> drops the depth
     // selection on that interval, exactly what the Advanced tab's refresh does,
     // so a run covers the rebuild path while the queue is loaded. Off unless set.
     static void maybeForceSmokeDepthRefresh(LogicalDevice* logicalDevice)
     {
         static const int intervalMs = []
         {
-            const char* value = std::getenv("VKINTOX_SMOKE_DEPTH_REFRESH");
+            const char* value = std::getenv("VKHOOK_SMOKE_DEPTH_REFRESH");
             if (value == nullptr)
                 return 0;
             try
@@ -286,10 +286,10 @@ namespace VKIntox
         Logger::debug("smoke hook: forced depth re-detect");
     }
 
-#ifdef VKINTOX_DEBUG
+#ifdef VKHOOK_DEBUG
     static bool isDepthCopyDumpEnabled()
     {
-        const char* value = std::getenv("VKINTOX_DEBUG_DUMP_DEPTH_COPY");
+        const char* value = std::getenv("VKHOOK_DEBUG_DUMP_DEPTH_COPY");
         if (value == nullptr)
             return false;
         return parseBoolEnvValue(value, false);
@@ -324,7 +324,7 @@ namespace VKIntox
     }
 
     // Developer-only debug helper: dumps the depth-resolve image to
-    // /tmp/vkintox-depth-copy-<i>.f32 so we can inspect what the layer is
+    // /tmp/vkhook-depth-copy-<i>.f32 so we can inspect what the layer is
     // feeding into effects. Compiled out of release builds — it does a
     // synchronous QueueWaitIdle + MapMemory on the present path.
     static void maybeDumpDepthResolveImage(LogicalDevice* logicalDevice, LogicalSwapchain* logicalSwapchain, uint32_t imageIndex, VkQueue queue)
@@ -493,7 +493,7 @@ namespace VKIntox
                      + " sample(center)=" + std::to_string(sampleAt(centerX, centerY))
                      + " sample(last,last)=" + std::to_string(sampleAt(extent.width - 1, extent.height - 1)));
 
-        const std::string dumpPath = "/tmp/vkintox-depth-copy-" + std::to_string(imageIndex) + ".f32";
+        const std::string dumpPath = "/tmp/vkhook-depth-copy-" + std::to_string(imageIndex) + ".f32";
         {
             std::ofstream dump(dumpPath, std::ios::binary | std::ios::trunc);
             dump.write(reinterpret_cast<const char*>(values), static_cast<std::streamsize>(dumpSize));
@@ -653,7 +653,7 @@ namespace VKIntox
         const char* sigName = (sig == SIGFPE) ? "SIGFPE"
                             : (sig == SIGABRT) ? "SIGABRT"
                             : (sig == SIGSEGV) ? "SIGSEGV" : "SIGNAL";
-        constexpr const char* prefix = "\nVKIntox: caught ";
+        constexpr const char* prefix = "\nVkHook: caught ";
         (void)write(2, prefix, strlen(prefix));
         (void)write(2, sigName, strlen(sigName));
         constexpr const char* mid = " — backtrace:\n";
@@ -691,7 +691,7 @@ namespace VKIntox
     // until the device is destroyed (i.e. until the user restarts the game).
     void panicLayer(LogicalDevice* logicalDevice, const std::string& reason)
     {
-        Logger::err("VKIntox panic: " + reason);
+        Logger::err("VkHook panic: " + reason);
         if (logicalDevice)
         {
             // A panic means we are about to stop touching Vulkan, so anything still
@@ -712,7 +712,7 @@ namespace VKIntox
             if (logicalDevice->imguiOverlay)
                 logicalDevice->imguiOverlay->pushToast(
                     LogLevel::Error,
-                    "VKIntox disabled itself to keep the game alive.\nReason: " + reason +
+                    "VkHook disabled itself to keep the game alive.\nReason: " + reason +
                     "\nEffects are off until you restart the game.");
         }
     }
@@ -890,7 +890,7 @@ namespace VKIntox
                     std::string effectName;
 
                     // Resolve imported preset techniques to an existing
-                    // VKIntox instance by exact technique name. Fall back to
+                    // VkHook instance by exact technique name. Fall back to
                     // the configured shader filename only when the preset
                     // uses a name that does not correspond to a configured
                     // instance; never expand one file to every instance.
@@ -942,7 +942,7 @@ namespace VKIntox
         activeShaderProfilePath = path;
     }
 
-    // Initialize configs: base (VKIntox.conf) + current (from game profile / env / default)
+    // Initialize configs: base (VkHook.conf) + current (from game profile / env / default)
     void initConfigs()
     {
         std::call_once(initConfigsOnceFlag, []()
@@ -968,20 +968,20 @@ namespace VKIntox
             // command recording, so a mid-frame re-arm is off the table
             latchDepthCaptureSetting();
 
-            // Load base config (VKIntox.conf) - used for paths, effect definitions
+            // Load base config (VkHook.conf) - used for paths, effect definitions
             baseConfig = std::make_shared<Config>();
 
             // Detect the game executable
             detectedGameName = ConfigSerializer::detectGameName();
 
             // Determine current config path (priority order):
-            // 1. VKINTOX_CONFIG_FILE env var (explicit override)
+            // 1. VKHOOK_CONFIG_FILE env var (explicit override)
             // 2. Per-game profile (auto-created if needed)
             // 3. Legacy default_config file
-            // 4. Base VKIntox.conf
+            // 4. Base VkHook.conf
             std::string currentConfigPath;
 
-            const char* envConfig = std::getenv("VKINTOX_CONFIG_FILE");
+            const char* envConfig = std::getenv("VKHOOK_CONFIG_FILE");
             if (envConfig && *envConfig)
             {
                 currentConfigPath = envConfig;
@@ -1104,7 +1104,7 @@ namespace VKIntox
             knownEffects.insert(name);
         }
 
-        // Also load effect definitions from the base config file (VKIntox.conf)
+        // Also load effect definitions from the base config file (VkHook.conf)
         if (baseConfig && baseConfig->getConfigFilePath() != config->getConfigFilePath())
         {
             auto defaultEffects = baseConfig->getEffectDefinitions();
@@ -1331,7 +1331,7 @@ namespace VKIntox
             {
                 try
                 {
-#ifdef VKINTOX_DLSS5
+#ifdef VKHOOK_DLSS5
                     const std::vector<VkImage> motionSources(logicalSwapchain->fakeImages.begin(),
                         logicalSwapchain->fakeImages.begin() + logicalSwapchain->imageCount);
                     logicalSwapchain->effects.push_back(std::make_shared<Dlss5Effect>(
@@ -1583,7 +1583,7 @@ namespace VKIntox
         return vr;
     }
 
-    VkResult VKAPI_CALL VKIntox_CreateInstance(const VkInstanceCreateInfo*  pCreateInfo,
+    VkResult VKAPI_CALL VkHook_CreateInstance(const VkInstanceCreateInfo*  pCreateInfo,
                                                 const VkAllocationCallbacks* pAllocator,
                                                 VkInstance*                  pInstance)
     {
@@ -1634,7 +1634,7 @@ namespace VKIntox
             appInfo.apiVersion         = VK_API_VERSION_1_1;
         }
 
-#ifdef VKINTOX_DLSS5
+#ifdef VKHOOK_DLSS5
         auto enumerateVersion = reinterpret_cast<PFN_vkEnumerateInstanceVersion>(gpa(VK_NULL_HANDLE, "vkEnumerateInstanceVersion"));
         uint32_t loaderVersion = VK_API_VERSION_1_0;
         if (enumerateVersion && enumerateVersion(&loaderVersion) == VK_SUCCESS && loaderVersion >= VK_API_VERSION_1_3)
@@ -1666,7 +1666,7 @@ namespace VKIntox
         return ret;
     }
 
-    void VKAPI_CALL VKIntox_DestroyInstance(VkInstance instance, const VkAllocationCallbacks* pAllocator)
+    void VKAPI_CALL VkHook_DestroyInstance(VkInstance instance, const VkAllocationCallbacks* pAllocator)
     {
         if (!instance)
             return;
@@ -1692,7 +1692,7 @@ namespace VKIntox
         instanceVersionMap.erase(GetKey(instance));
     }
 
-    VkResult VKAPI_CALL VKIntox_CreateDevice(VkPhysicalDevice             physicalDevice,
+    VkResult VKAPI_CALL VkHook_CreateDevice(VkPhysicalDevice             physicalDevice,
                                               const VkDeviceCreateInfo*    pCreateInfo,
                                               const VkAllocationCallbacks* pAllocator,
                                               VkDevice*                    pDevice)
@@ -1788,7 +1788,7 @@ namespace VKIntox
         }
         else if (hasMutableEnvOverride)
         {
-            Logger::info(std::string("Mutable swapchain device extension set via VKINTOX_ENABLE_MUTABLE_SWAPCHAIN=") + (mutableRequested ? "1" : "0"));
+            Logger::info(std::string("Mutable swapchain device extension set via VKHOOK_ENABLE_MUTABLE_SWAPCHAIN=") + (mutableRequested ? "1" : "0"));
         }
         if (deviceProps.apiVersion < VK_API_VERSION_1_2 || instanceVersionMap[GetKey(physicalDevice)] < VK_API_VERSION_1_2)
         {
@@ -1810,7 +1810,7 @@ namespace VKIntox
             }
             else
             {
-                Logger::warn("VKINTOX_GPU_CRASH_DIAGNOSTICS=1 but VK_NV_device_diagnostic_checkpoints is not supported by this device");
+                Logger::warn("VKHOOK_GPU_CRASH_DIAGNOSTICS=1 but VK_NV_device_diagnostic_checkpoints is not supported by this device");
             }
 
             if (supportsNvDiagnosticsConfigExt)
@@ -1820,7 +1820,7 @@ namespace VKIntox
             }
             else
             {
-                Logger::warn("VKINTOX_GPU_CRASH_DIAGNOSTICS=1 but VK_NV_device_diagnostics_config is not supported by this device");
+                Logger::warn("VKHOOK_GPU_CRASH_DIAGNOSTICS=1 but VK_NV_device_diagnostics_config is not supported by this device");
             }
 
             if (supportsDeviceFaultExt)
@@ -1830,7 +1830,7 @@ namespace VKIntox
             }
             else
             {
-                Logger::warn("VKINTOX_GPU_CRASH_DIAGNOSTICS=1 but VK_EXT_device_fault is not supported by this device");
+                Logger::warn("VKHOOK_GPU_CRASH_DIAGNOSTICS=1 but VK_EXT_device_fault is not supported by this device");
             }
         }
         modifiedCreateInfo.ppEnabledExtensionNames = enabledExtensionNames.data();
@@ -1899,7 +1899,7 @@ namespace VKIntox
         bool dlss5Supported = false;
         std::string dlss5UnavailableReason = "DLSS5 backend not built";
         uint32_t opticalFlowFamily = VK_QUEUE_FAMILY_IGNORED;
-#ifdef VKINTOX_DLSS5
+#ifdef VKHOOK_DLSS5
         Dlss5DeviceFeatures dlss5Features;
         const auto opticalQueue = selectDlss5OpticalQueue(queueProperties, *pCreateInfo);
         opticalFlowFamily = opticalQueue.family;
@@ -2080,7 +2080,7 @@ namespace VKIntox
 
         if (!logicalDevice->queue)
         {
-            Logger::err("Did not find a graphics queue! VKIntox requires a graphics-capable queue.");
+            Logger::err("Did not find a graphics queue! VkHook requires a graphics-capable queue.");
             // Still register the device so destruction works, but effects won't function
         }
 
@@ -2089,7 +2089,7 @@ namespace VKIntox
         return VK_SUCCESS;
     }
 
-    void VKAPI_CALL VKIntox_DestroyDevice(VkDevice device, const VkAllocationCallbacks* pAllocator)
+    void VKAPI_CALL VkHook_DestroyDevice(VkDevice device, const VkAllocationCallbacks* pAllocator)
     {
         if (!device)
             return;
@@ -2197,7 +2197,7 @@ namespace VKIntox
         return VkExtent2D{0, 0};
     }
 
-    VKAPI_ATTR VkResult VKAPI_CALL VKIntox_CreateSwapchainKHR(VkDevice                        device,
+    VKAPI_ATTR VkResult VKAPI_CALL VkHook_CreateSwapchainKHR(VkDevice                        device,
                                                                const VkSwapchainCreateInfoKHR* pCreateInfo,
                                                                const VkAllocationCallbacks*    pAllocator,
                                                                VkSwapchainKHR*                 swapchain)
@@ -2225,7 +2225,7 @@ namespace VKIntox
         bool useMutableFormat = getMutableSwapchainEnvOverride(hasMutableEnvOverride, logicalDevice->supportsMutableFormat);
         if (useMutableFormat && !logicalDevice->supportsMutableFormat)
         {
-            Logger::warn("Mutable swapchain forced on via VKINTOX_ENABLE_MUTABLE_SWAPCHAIN, but device does not support it. Falling back to disabled.");
+            Logger::warn("Mutable swapchain forced on via VKHOOK_ENABLE_MUTABLE_SWAPCHAIN, but device does not support it. Falling back to disabled.");
             useMutableFormat = false;
         }
         else if (useMutableFormat &&
@@ -2236,12 +2236,12 @@ namespace VKIntox
         }
         else if (hasMutableEnvOverride)
         {
-            Logger::info(std::string("Mutable swapchain explicitly set via VKINTOX_ENABLE_MUTABLE_SWAPCHAIN=") + (useMutableFormat ? "1" : "0"));
+            Logger::info(std::string("Mutable swapchain explicitly set via VKHOOK_ENABLE_MUTABLE_SWAPCHAIN=") + (useMutableFormat ? "1" : "0"));
         }
 
         if (useMutableFormat)
         {
-            // Keep application-requested usage bits and add the ones VKIntox needs.
+            // Keep application-requested usage bits and add the ones VkHook needs.
             modifiedCreateInfo.imageUsage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
                                              ; // mutable path renders final pass directly into swapchain
             modifiedCreateInfo.flags |= VK_SWAPCHAIN_CREATE_MUTABLE_FORMAT_BIT_KHR;
@@ -2266,7 +2266,7 @@ namespace VKIntox
         if (isSwapchainDiagEnabled())
         {
             std::fprintf(stderr,
-                         "VKIntox diag: CreateSwapchainKHR mutable=%d reqUsage=0x%x finalUsage=0x%x reqFlags=0x%x finalFlags=0x%x format=%u extent=%ux%u minImages=%u\n",
+                         "VkHook diag: CreateSwapchainKHR mutable=%d reqUsage=0x%x finalUsage=0x%x reqFlags=0x%x finalFlags=0x%x format=%u extent=%ux%u minImages=%u\n",
                          useMutableFormat ? 1 : 0,
                          static_cast<unsigned int>(pCreateInfo->imageUsage),
                          static_cast<unsigned int>(modifiedCreateInfo.imageUsage),
@@ -2350,7 +2350,7 @@ namespace VKIntox
         return result;
     }
 
-    VKAPI_ATTR VkResult VKAPI_CALL VKIntox_GetSwapchainImagesKHR(VkDevice       device,
+    VKAPI_ATTR VkResult VKAPI_CALL VkHook_GetSwapchainImagesKHR(VkDevice       device,
                                                                   VkSwapchainKHR swapchain,
                                                                   uint32_t*      pCount,
                                                                   VkImage*       swapchainImages)
@@ -2393,7 +2393,7 @@ namespace VKIntox
         if (isSwapchainDiagEnabled())
         {
             std::fprintf(stderr,
-                         "VKIntox diag: GetSwapchainImagesKHR count-query result=%d count=%u\n",
+                         "VkHook diag: GetSwapchainImagesKHR count-query result=%d count=%u\n",
                          static_cast<int>(getCountResult),
                          static_cast<unsigned int>(realImageCount));
         }
@@ -2414,7 +2414,7 @@ namespace VKIntox
         if (isSwapchainDiagEnabled())
         {
             std::fprintf(stderr,
-                         "VKIntox diag: GetSwapchainImagesKHR fetch result=%d fetched=%u\n",
+                         "VkHook diag: GetSwapchainImagesKHR fetch result=%d fetched=%u\n",
                          static_cast<int>(getImagesResult),
                          static_cast<unsigned int>(fetchedImageCount));
         }
@@ -2666,7 +2666,7 @@ namespace VKIntox
     // destroy queue, which must never happen with globalLock held. The lock
     // order is globalLock -> depthCopy, so nothing in withRing() touches
     // globalLock-backed state; storage is prepared before and published after.
-    VKAPI_ATTR VkResult VKAPI_CALL VKIntox_QueueSubmit(VkQueue queue,
+    VKAPI_ATTR VkResult VKAPI_CALL VkHook_QueueSubmit(VkQueue queue,
                                                        uint32_t submitCount,
                                                        const VkSubmitInfo* pSubmits,
                                                        VkFence fence)
@@ -3053,7 +3053,7 @@ namespace VKIntox
     // These calls also touch VkQueue host state. In particular, waiting while
     // holding globalLock would block another thread from submitting its signals.
 #define OPTICAL_QUEUE_CALL(Result, Name, Parameters, Arguments, Failure) \
-    VKAPI_ATTR Result VKAPI_CALL VKIntox_##Name Parameters { \
+    VKAPI_ATTR Result VKAPI_CALL VkHook_##Name Parameters { \
         auto device = queueCallDevice(queue); \
         if (!device) return Failure; \
         std::unique_lock lock(device->dlss5OpticalFlowQueueMutex, std::defer_lock); \
@@ -3077,7 +3077,7 @@ namespace VKIntox
     OPTICAL_QUEUE_CALL(void, QueueEndDebugUtilsLabelEXT, (VkQueue queue), (queue), )
 #undef OPTICAL_QUEUE_CALL
 
-    VKAPI_ATTR VkResult VKAPI_CALL VKIntox_DeviceWaitIdle(VkDevice handle)
+    VKAPI_ATTR VkResult VKAPI_CALL VkHook_DeviceWaitIdle(VkDevice handle)
     {
         auto device = queueCallDevice(handle);
         if (!device) return VK_ERROR_DEVICE_LOST;
@@ -3088,7 +3088,7 @@ namespace VKIntox
 
     static PFN_vkVoidFunction opticalQueueIntercept(const char* name)
     {
-#define OPTICAL_QUEUE_PROC(Name) if (!std::strcmp(name, "vk" #Name)) return reinterpret_cast<PFN_vkVoidFunction>(&VKIntox_##Name)
+#define OPTICAL_QUEUE_PROC(Name) if (!std::strcmp(name, "vk" #Name)) return reinterpret_cast<PFN_vkVoidFunction>(&VkHook_##Name)
         OPTICAL_QUEUE_PROC(QueueSubmit2);
         OPTICAL_QUEUE_PROC(QueueSubmit2KHR);
         OPTICAL_QUEUE_PROC(QueueBindSparse);
@@ -3101,7 +3101,7 @@ namespace VKIntox
         return nullptr;
     }
 
-    VKAPI_ATTR VkResult VKAPI_CALL VKIntox_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPresentInfo)
+    VKAPI_ATTR VkResult VKAPI_CALL VkHook_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPresentInfo)
     {
         uint64_t frameSerial = 0;
         // Soft-disable fast path: panicLayer() has flipped this bit. The layer
@@ -3996,7 +3996,7 @@ namespace VKIntox
         return presentResult;
     }
 
-    VKAPI_ATTR void VKAPI_CALL VKIntox_DestroySwapchainKHR(VkDevice device, VkSwapchainKHR swapchain, const VkAllocationCallbacks* pAllocator)
+    VKAPI_ATTR void VKAPI_CALL VkHook_DestroySwapchainKHR(VkDevice device, VkSwapchainKHR swapchain, const VkAllocationCallbacks* pAllocator)
     {
         if (!swapchain)
             return;
@@ -4016,7 +4016,7 @@ namespace VKIntox
             devIt->second->vkd.DestroySwapchainKHR(device, swapchain, pAllocator);
     }
 
-    VKAPI_ATTR VkResult VKAPI_CALL VKIntox_CreateRenderPass(VkDevice device,
+    VKAPI_ATTR VkResult VKAPI_CALL VkHook_CreateRenderPass(VkDevice device,
                                                             const VkRenderPassCreateInfo* pCreateInfo,
                                                             const VkAllocationCallbacks* pAllocator,
                                                             VkRenderPass* pRenderPass)
@@ -4026,7 +4026,7 @@ namespace VKIntox
         if (logicalDevice == nullptr)
             return VK_ERROR_DEVICE_LOST;
         VkResult vr;
-        if (!VKIntox::depthCaptureActive() || !pCreateInfo || pCreateInfo->attachmentCount == 0)
+        if (!VkHook::depthCaptureActive() || !pCreateInfo || pCreateInfo->attachmentCount == 0)
         {
             vr = logicalDevice->vkd.CreateRenderPass(device, pCreateInfo, pAllocator, pRenderPass);
             if (vr == VK_SUCCESS && pRenderPass)
@@ -4087,7 +4087,7 @@ namespace VKIntox
         return vr;
     }
 
-    VKAPI_ATTR VkResult VKAPI_CALL VKIntox_CreateRenderPass2(VkDevice device,
+    VKAPI_ATTR VkResult VKAPI_CALL VkHook_CreateRenderPass2(VkDevice device,
                                                              const VkRenderPassCreateInfo2* pCreateInfo,
                                                              const VkAllocationCallbacks* pAllocator,
                                                              VkRenderPass* pRenderPass)
@@ -4097,7 +4097,7 @@ namespace VKIntox
         if (logicalDevice == nullptr)
             return VK_ERROR_DEVICE_LOST;
         VkResult vr;
-        if (!VKIntox::depthCaptureActive() || !pCreateInfo || pCreateInfo->attachmentCount == 0)
+        if (!VkHook::depthCaptureActive() || !pCreateInfo || pCreateInfo->attachmentCount == 0)
         {
             vr = logicalDevice->vkd.CreateRenderPass2(device, pCreateInfo, pAllocator, pRenderPass);
             if (vr == VK_SUCCESS && pRenderPass)
@@ -4158,7 +4158,7 @@ namespace VKIntox
         return vr;
     }
 
-    VKAPI_ATTR VkResult VKAPI_CALL VKIntox_CreateRenderPass2KHR(VkDevice device,
+    VKAPI_ATTR VkResult VKAPI_CALL VkHook_CreateRenderPass2KHR(VkDevice device,
                                                                 const VkRenderPassCreateInfo2* pCreateInfo,
                                                                 const VkAllocationCallbacks* pAllocator,
                                                                 VkRenderPass* pRenderPass)
@@ -4168,7 +4168,7 @@ namespace VKIntox
         if (logicalDevice == nullptr)
             return VK_ERROR_DEVICE_LOST;
         VkResult vr;
-        if (!VKIntox::depthCaptureActive() || !pCreateInfo || pCreateInfo->attachmentCount == 0)
+        if (!VkHook::depthCaptureActive() || !pCreateInfo || pCreateInfo->attachmentCount == 0)
         {
             vr = logicalDevice->vkd.CreateRenderPass2KHR(device, pCreateInfo, pAllocator, pRenderPass);
             if (vr == VK_SUCCESS && pRenderPass)
@@ -4229,7 +4229,7 @@ namespace VKIntox
         return vr;
     }
 
-    VKAPI_ATTR void VKAPI_CALL VKIntox_DestroyRenderPass(VkDevice device, VkRenderPass renderPass, const VkAllocationCallbacks* pAllocator)
+    VKAPI_ATTR void VKAPI_CALL VkHook_DestroyRenderPass(VkDevice device, VkRenderPass renderPass, const VkAllocationCallbacks* pAllocator)
     {
         scoped_lock l(globalLock);
         renderPassDepthFinalLayouts.erase(renderPass);
@@ -4240,12 +4240,12 @@ namespace VKIntox
             devIt->second->vkd.DestroyRenderPass(device, renderPass, pAllocator);
     }
 
-    VKAPI_ATTR VkResult VKAPI_CALL VKIntox_CreateImage(VkDevice                     device,
+    VKAPI_ATTR VkResult VKAPI_CALL VkHook_CreateImage(VkDevice                     device,
                                                        const VkImageCreateInfo*     pCreateInfo,
                                                        const VkAllocationCallbacks* pAllocator,
                                                        VkImage*                     pImage)
     {
-        if (!VKIntox::depthCaptureActive())
+        if (!VkHook::depthCaptureActive())
         {
             scoped_lock l(globalLock);
             LogicalDevice* logicalDevice = deviceMap[GetKey(device)].get();
@@ -4317,9 +4317,9 @@ namespace VKIntox
         }
     }
 
-    VKAPI_ATTR VkResult VKAPI_CALL VKIntox_BindImageMemory(VkDevice device, VkImage image, VkDeviceMemory memory, VkDeviceSize memoryOffset)
+    VKAPI_ATTR VkResult VKAPI_CALL VkHook_BindImageMemory(VkDevice device, VkImage image, VkDeviceMemory memory, VkDeviceSize memoryOffset)
     {
-        if (!VKIntox::depthCaptureActive())
+        if (!VkHook::depthCaptureActive())
         {
             scoped_lock l(globalLock);
             LogicalDevice* logicalDevice = deviceMap[GetKey(device)].get();
@@ -4339,12 +4339,12 @@ namespace VKIntox
         return logicalDevice->vkd.BindImageMemory(device, image, memory, memoryOffset);
     }
 
-    VKAPI_ATTR VkResult VKAPI_CALL VKIntox_CreateImageView(VkDevice device,
+    VKAPI_ATTR VkResult VKAPI_CALL VkHook_CreateImageView(VkDevice device,
                                                            const VkImageViewCreateInfo* pCreateInfo,
                                                            const VkAllocationCallbacks* pAllocator,
                                                            VkImageView* view)
     {
-        if (!VKIntox::depthCaptureActive())
+        if (!VkHook::depthCaptureActive())
         {
             scoped_lock l(globalLock);
             LogicalDevice* logicalDevice = deviceMap[GetKey(device)].get();
@@ -4443,12 +4443,12 @@ namespace VKIntox
                          + std::to_string(timeoutMs) + "ms; destroying depth handles anyway");
     }
 
-    VKAPI_ATTR void VKAPI_CALL VKIntox_DestroyImageView(VkDevice device, VkImageView imageView, const VkAllocationCallbacks* pAllocator)
+    VKAPI_ATTR void VKAPI_CALL VkHook_DestroyImageView(VkDevice device, VkImageView imageView, const VkAllocationCallbacks* pAllocator)
     {
         if (!imageView)
             return;
 
-        if (!VKIntox::depthCaptureActive())
+        if (!VkHook::depthCaptureActive())
         {
             scoped_lock l(globalLock);
             LogicalDevice* logicalDevice = deviceMap[GetKey(device)].get();
@@ -4505,12 +4505,12 @@ namespace VKIntox
         logicalDevice->vkd.DestroyImageView(device, imageView, pAllocator);
     }
 
-    VKAPI_ATTR VkResult VKAPI_CALL VKIntox_CreateFramebuffer(VkDevice device,
+    VKAPI_ATTR VkResult VKAPI_CALL VkHook_CreateFramebuffer(VkDevice device,
                                                              const VkFramebufferCreateInfo* pCreateInfo,
                                                              const VkAllocationCallbacks* pAllocator,
                                                              VkFramebuffer* pFramebuffer)
     {
-        if (!VKIntox::depthCaptureActive())
+        if (!VkHook::depthCaptureActive())
         {
             scoped_lock l(globalLock);
             LogicalDevice* logicalDevice = deviceMap[GetKey(device)].get();
@@ -4560,12 +4560,12 @@ namespace VKIntox
         return result;
     }
 
-    VKAPI_ATTR void VKAPI_CALL VKIntox_DestroyFramebuffer(VkDevice device, VkFramebuffer framebuffer, const VkAllocationCallbacks* pAllocator)
+    VKAPI_ATTR void VKAPI_CALL VkHook_DestroyFramebuffer(VkDevice device, VkFramebuffer framebuffer, const VkAllocationCallbacks* pAllocator)
     {
         if (!framebuffer)
             return;
 
-        if (!VKIntox::depthCaptureActive())
+        if (!VkHook::depthCaptureActive())
         {
             scoped_lock l(globalLock);
             LogicalDevice* logicalDevice = deviceMap[GetKey(device)].get();
@@ -4585,11 +4585,11 @@ namespace VKIntox
         logicalDevice->vkd.DestroyFramebuffer(device, framebuffer, pAllocator);
     }
 
-    VKAPI_ATTR void VKAPI_CALL VKIntox_CmdBeginRenderPass(VkCommandBuffer commandBuffer,
+    VKAPI_ATTR void VKAPI_CALL VkHook_CmdBeginRenderPass(VkCommandBuffer commandBuffer,
                                                           const VkRenderPassBeginInfo* pRenderPassBegin,
                                                           VkSubpassContents contents)
     {
-        if (!VKIntox::depthCaptureActive())
+        if (!VkHook::depthCaptureActive())
         {
             scoped_lock l(globalLock);
             auto devIt = deviceMap.find(GetKey(commandBuffer));
@@ -4621,11 +4621,11 @@ namespace VKIntox
             logicalDevice->vkd.CmdBeginRenderPass(commandBuffer, pRenderPassBegin, contents);
     }
 
-    VKAPI_ATTR void VKAPI_CALL VKIntox_CmdBeginRenderPass2(VkCommandBuffer commandBuffer,
+    VKAPI_ATTR void VKAPI_CALL VkHook_CmdBeginRenderPass2(VkCommandBuffer commandBuffer,
                                                            const VkRenderPassBeginInfo* pRenderPassBegin,
                                                            const VkSubpassBeginInfo* pSubpassBeginInfo)
     {
-        if (!VKIntox::depthCaptureActive())
+        if (!VkHook::depthCaptureActive())
         {
             scoped_lock l(globalLock);
             auto devIt = deviceMap.find(GetKey(commandBuffer));
@@ -4657,11 +4657,11 @@ namespace VKIntox
             logicalDevice->vkd.CmdBeginRenderPass2(commandBuffer, pRenderPassBegin, pSubpassBeginInfo);
     }
 
-    VKAPI_ATTR void VKAPI_CALL VKIntox_CmdBeginRenderPass2KHR(VkCommandBuffer commandBuffer,
+    VKAPI_ATTR void VKAPI_CALL VkHook_CmdBeginRenderPass2KHR(VkCommandBuffer commandBuffer,
                                                               const VkRenderPassBeginInfo* pRenderPassBegin,
                                                               const VkSubpassBeginInfo* pSubpassBeginInfo)
     {
-        if (!VKIntox::depthCaptureActive())
+        if (!VkHook::depthCaptureActive())
         {
             scoped_lock l(globalLock);
             auto devIt = deviceMap.find(GetKey(commandBuffer));
@@ -4708,9 +4708,9 @@ namespace VKIntox
                                depthFinalLayout);
     }
 
-    VKAPI_ATTR void VKAPI_CALL VKIntox_CmdBeginRendering(VkCommandBuffer commandBuffer, const VkRenderingInfo* pRenderingInfo)
+    VKAPI_ATTR void VKAPI_CALL VkHook_CmdBeginRendering(VkCommandBuffer commandBuffer, const VkRenderingInfo* pRenderingInfo)
     {
-        if (!VKIntox::depthCaptureActive())
+        if (!VkHook::depthCaptureActive())
         {
             scoped_lock l(globalLock);
             auto devIt = deviceMap.find(GetKey(commandBuffer));
@@ -4766,9 +4766,9 @@ namespace VKIntox
         }
     }
 
-    VKAPI_ATTR void VKAPI_CALL VKIntox_CmdBeginRenderingKHR(VkCommandBuffer commandBuffer, const VkRenderingInfo* pRenderingInfo)
+    VKAPI_ATTR void VKAPI_CALL VkHook_CmdBeginRenderingKHR(VkCommandBuffer commandBuffer, const VkRenderingInfo* pRenderingInfo)
     {
-        if (!VKIntox::depthCaptureActive())
+        if (!VkHook::depthCaptureActive())
         {
             scoped_lock l(globalLock);
             auto devIt = deviceMap.find(GetKey(commandBuffer));
@@ -4824,9 +4824,9 @@ namespace VKIntox
         }
     }
 
-    VKAPI_ATTR void VKAPI_CALL VKIntox_CmdEndRenderPass(VkCommandBuffer commandBuffer)
+    VKAPI_ATTR void VKAPI_CALL VkHook_CmdEndRenderPass(VkCommandBuffer commandBuffer)
     {
-        if (!VKIntox::depthCaptureActive())
+        if (!VkHook::depthCaptureActive())
         {
             scoped_lock l(globalLock);
             auto devIt = deviceMap.find(GetKey(commandBuffer));
@@ -4880,9 +4880,9 @@ namespace VKIntox
         }
     }
 
-    VKAPI_ATTR void VKAPI_CALL VKIntox_CmdEndRenderPass2(VkCommandBuffer commandBuffer, const VkSubpassEndInfo* pSubpassEndInfo)
+    VKAPI_ATTR void VKAPI_CALL VkHook_CmdEndRenderPass2(VkCommandBuffer commandBuffer, const VkSubpassEndInfo* pSubpassEndInfo)
     {
-        if (!VKIntox::depthCaptureActive())
+        if (!VkHook::depthCaptureActive())
         {
             scoped_lock l(globalLock);
             auto devIt = deviceMap.find(GetKey(commandBuffer));
@@ -4934,9 +4934,9 @@ namespace VKIntox
         }
     }
 
-    VKAPI_ATTR void VKAPI_CALL VKIntox_CmdEndRenderPass2KHR(VkCommandBuffer commandBuffer, const VkSubpassEndInfo* pSubpassEndInfo)
+    VKAPI_ATTR void VKAPI_CALL VkHook_CmdEndRenderPass2KHR(VkCommandBuffer commandBuffer, const VkSubpassEndInfo* pSubpassEndInfo)
     {
-        if (!VKIntox::depthCaptureActive())
+        if (!VkHook::depthCaptureActive())
         {
             scoped_lock l(globalLock);
             auto devIt = deviceMap.find(GetKey(commandBuffer));
@@ -4988,9 +4988,9 @@ namespace VKIntox
         }
     }
 
-    VKAPI_ATTR void VKAPI_CALL VKIntox_CmdEndRendering(VkCommandBuffer commandBuffer)
+    VKAPI_ATTR void VKAPI_CALL VkHook_CmdEndRendering(VkCommandBuffer commandBuffer)
     {
-        if (!VKIntox::depthCaptureActive())
+        if (!VkHook::depthCaptureActive())
         {
             scoped_lock l(globalLock);
             auto devIt = deviceMap.find(GetKey(commandBuffer));
@@ -5042,9 +5042,9 @@ namespace VKIntox
         }
     }
 
-    VKAPI_ATTR void VKAPI_CALL VKIntox_CmdEndRenderingKHR(VkCommandBuffer commandBuffer)
+    VKAPI_ATTR void VKAPI_CALL VkHook_CmdEndRenderingKHR(VkCommandBuffer commandBuffer)
     {
-        if (!VKIntox::depthCaptureActive())
+        if (!VkHook::depthCaptureActive())
         {
             scoped_lock l(globalLock);
             auto devIt = deviceMap.find(GetKey(commandBuffer));
@@ -5096,7 +5096,7 @@ namespace VKIntox
         }
     }
 
-    VKAPI_ATTR void VKAPI_CALL VKIntox_CmdCopyImage(VkCommandBuffer commandBuffer,
+    VKAPI_ATTR void VKAPI_CALL VkHook_CmdCopyImage(VkCommandBuffer commandBuffer,
                                                     VkImage srcImage,
                                                     VkImageLayout srcImageLayout,
                                                     VkImage dstImage,
@@ -5104,7 +5104,7 @@ namespace VKIntox
                                                     uint32_t regionCount,
                                                     const VkImageCopy* pRegions)
     {
-        if (!VKIntox::depthCaptureActive())
+        if (!VkHook::depthCaptureActive())
         {
             scoped_lock l(globalLock);
             auto devIt = deviceMap.find(GetKey(commandBuffer));
@@ -5129,11 +5129,11 @@ namespace VKIntox
         }
     }
 
-    VKAPI_ATTR void VKAPI_CALL VKIntox_CmdExecuteCommands(VkCommandBuffer commandBuffer,
+    VKAPI_ATTR void VKAPI_CALL VkHook_CmdExecuteCommands(VkCommandBuffer commandBuffer,
                                                           uint32_t commandBufferCount,
                                                           const VkCommandBuffer* pCommandBuffers)
     {
-        if (!VKIntox::depthCaptureActive())
+        if (!VkHook::depthCaptureActive())
         {
             scoped_lock l(globalLock);
             auto devIt = deviceMap.find(GetKey(commandBuffer));
@@ -5157,7 +5157,7 @@ namespace VKIntox
             logicalDevice->vkd.CmdExecuteCommands(commandBuffer, commandBufferCount, pCommandBuffers);
     }
 
-    VKAPI_ATTR void VKAPI_CALL VKIntox_CmdBlitImage(VkCommandBuffer commandBuffer,
+    VKAPI_ATTR void VKAPI_CALL VkHook_CmdBlitImage(VkCommandBuffer commandBuffer,
                                                     VkImage srcImage,
                                                     VkImageLayout srcImageLayout,
                                                     VkImage dstImage,
@@ -5166,7 +5166,7 @@ namespace VKIntox
                                                     const VkImageBlit* pRegions,
                                                     VkFilter filter)
     {
-        if (!VKIntox::depthCaptureActive())
+        if (!VkHook::depthCaptureActive())
         {
             scoped_lock l(globalLock);
             auto devIt = deviceMap.find(GetKey(commandBuffer));
@@ -5194,14 +5194,14 @@ namespace VKIntox
     // ReShade-style depth preservation for out-of-render-pass depth clears.
     // If the app calls vkCmdClearDepthStencilImage on a tracked depth image,
     // record a snapshot BEFORE the clear.
-    VKAPI_ATTR void VKAPI_CALL VKIntox_CmdClearDepthStencilImage(VkCommandBuffer commandBuffer,
+    VKAPI_ATTR void VKAPI_CALL VkHook_CmdClearDepthStencilImage(VkCommandBuffer commandBuffer,
                                                                  VkImage image,
                                                                  VkImageLayout imageLayout,
                                                                  const VkClearDepthStencilValue* pDepthStencil,
                                                                  uint32_t rangeCount,
                                                                  const VkImageSubresourceRange* pRanges)
     {
-        if (!VKIntox::depthCaptureActive())
+        if (!VkHook::depthCaptureActive())
         {
             scoped_lock l(globalLock);
             auto devIt = deviceMap.find(GetKey(commandBuffer));
@@ -5231,13 +5231,13 @@ namespace VKIntox
         logicalDevice->vkd.CmdClearDepthStencilImage(commandBuffer, image, imageLayout, pDepthStencil, rangeCount, pRanges);
     }
 
-    VKAPI_ATTR void VKAPI_CALL VKIntox_CmdDraw(VkCommandBuffer commandBuffer,
+    VKAPI_ATTR void VKAPI_CALL VkHook_CmdDraw(VkCommandBuffer commandBuffer,
                                                uint32_t vertexCount,
                                                uint32_t instanceCount,
                                                uint32_t firstVertex,
                                                uint32_t firstInstance)
     {
-        if (!VKIntox::depthCaptureActive())
+        if (!VkHook::depthCaptureActive())
         {
             scoped_lock l(globalLock);
             auto devIt = deviceMap.find(GetKey(commandBuffer));
@@ -5261,14 +5261,14 @@ namespace VKIntox
             logicalDevice->vkd.CmdDraw(commandBuffer, vertexCount, instanceCount, firstVertex, firstInstance);
     }
 
-    VKAPI_ATTR void VKAPI_CALL VKIntox_CmdDrawIndexed(VkCommandBuffer commandBuffer,
+    VKAPI_ATTR void VKAPI_CALL VkHook_CmdDrawIndexed(VkCommandBuffer commandBuffer,
                                                       uint32_t indexCount,
                                                       uint32_t instanceCount,
                                                       uint32_t firstIndex,
                                                       int32_t vertexOffset,
                                                       uint32_t firstInstance)
     {
-        if (!VKIntox::depthCaptureActive())
+        if (!VkHook::depthCaptureActive())
         {
             scoped_lock l(globalLock);
             auto devIt = deviceMap.find(GetKey(commandBuffer));
@@ -5292,13 +5292,13 @@ namespace VKIntox
             logicalDevice->vkd.CmdDrawIndexed(commandBuffer, indexCount, instanceCount, firstIndex, vertexOffset, firstInstance);
     }
 
-    VKAPI_ATTR void VKAPI_CALL VKIntox_CmdDrawIndirect(VkCommandBuffer commandBuffer,
+    VKAPI_ATTR void VKAPI_CALL VkHook_CmdDrawIndirect(VkCommandBuffer commandBuffer,
                                                        VkBuffer buffer,
                                                        VkDeviceSize offset,
                                                        uint32_t drawCount,
                                                        uint32_t stride)
     {
-        if (!VKIntox::depthCaptureActive())
+        if (!VkHook::depthCaptureActive())
         {
             scoped_lock l(globalLock);
             auto devIt = deviceMap.find(GetKey(commandBuffer));
@@ -5322,13 +5322,13 @@ namespace VKIntox
             logicalDevice->vkd.CmdDrawIndirect(commandBuffer, buffer, offset, drawCount, stride);
     }
 
-    VKAPI_ATTR void VKAPI_CALL VKIntox_CmdDrawIndexedIndirect(VkCommandBuffer commandBuffer,
+    VKAPI_ATTR void VKAPI_CALL VkHook_CmdDrawIndexedIndirect(VkCommandBuffer commandBuffer,
                                                               VkBuffer buffer,
                                                               VkDeviceSize offset,
                                                               uint32_t drawCount,
                                                               uint32_t stride)
     {
-        if (!VKIntox::depthCaptureActive())
+        if (!VkHook::depthCaptureActive())
         {
             scoped_lock l(globalLock);
             auto devIt = deviceMap.find(GetKey(commandBuffer));
@@ -5352,7 +5352,7 @@ namespace VKIntox
             logicalDevice->vkd.CmdDrawIndexedIndirect(commandBuffer, buffer, offset, drawCount, stride);
     }
 
-    VKAPI_ATTR void VKAPI_CALL VKIntox_CmdDrawIndirectCount(VkCommandBuffer commandBuffer,
+    VKAPI_ATTR void VKAPI_CALL VkHook_CmdDrawIndirectCount(VkCommandBuffer commandBuffer,
                                                             VkBuffer buffer,
                                                             VkDeviceSize offset,
                                                             VkBuffer countBuffer,
@@ -5360,7 +5360,7 @@ namespace VKIntox
                                                             uint32_t maxDrawCount,
                                                             uint32_t stride)
     {
-        if (!VKIntox::depthCaptureActive())
+        if (!VkHook::depthCaptureActive())
         {
             scoped_lock l(globalLock);
             auto devIt = deviceMap.find(GetKey(commandBuffer));
@@ -5384,7 +5384,7 @@ namespace VKIntox
             logicalDevice->vkd.CmdDrawIndirectCount(commandBuffer, buffer, offset, countBuffer, countBufferOffset, maxDrawCount, stride);
     }
 
-    VKAPI_ATTR void VKAPI_CALL VKIntox_CmdDrawIndirectCountKHR(VkCommandBuffer commandBuffer,
+    VKAPI_ATTR void VKAPI_CALL VkHook_CmdDrawIndirectCountKHR(VkCommandBuffer commandBuffer,
                                                                VkBuffer buffer,
                                                                VkDeviceSize offset,
                                                                VkBuffer countBuffer,
@@ -5392,7 +5392,7 @@ namespace VKIntox
                                                                uint32_t maxDrawCount,
                                                                uint32_t stride)
     {
-        if (!VKIntox::depthCaptureActive())
+        if (!VkHook::depthCaptureActive())
         {
             scoped_lock l(globalLock);
             auto devIt = deviceMap.find(GetKey(commandBuffer));
@@ -5416,7 +5416,7 @@ namespace VKIntox
             logicalDevice->vkd.CmdDrawIndirectCountKHR(commandBuffer, buffer, offset, countBuffer, countBufferOffset, maxDrawCount, stride);
     }
 
-    VKAPI_ATTR void VKAPI_CALL VKIntox_CmdDrawIndexedIndirectCount(VkCommandBuffer commandBuffer,
+    VKAPI_ATTR void VKAPI_CALL VkHook_CmdDrawIndexedIndirectCount(VkCommandBuffer commandBuffer,
                                                                    VkBuffer buffer,
                                                                    VkDeviceSize offset,
                                                                    VkBuffer countBuffer,
@@ -5424,7 +5424,7 @@ namespace VKIntox
                                                                    uint32_t maxDrawCount,
                                                                    uint32_t stride)
     {
-        if (!VKIntox::depthCaptureActive())
+        if (!VkHook::depthCaptureActive())
         {
             scoped_lock l(globalLock);
             auto devIt = deviceMap.find(GetKey(commandBuffer));
@@ -5448,7 +5448,7 @@ namespace VKIntox
             logicalDevice->vkd.CmdDrawIndexedIndirectCount(commandBuffer, buffer, offset, countBuffer, countBufferOffset, maxDrawCount, stride);
     }
 
-    VKAPI_ATTR void VKAPI_CALL VKIntox_CmdDrawIndexedIndirectCountKHR(VkCommandBuffer commandBuffer,
+    VKAPI_ATTR void VKAPI_CALL VkHook_CmdDrawIndexedIndirectCountKHR(VkCommandBuffer commandBuffer,
                                                                       VkBuffer buffer,
                                                                       VkDeviceSize offset,
                                                                       VkBuffer countBuffer,
@@ -5456,7 +5456,7 @@ namespace VKIntox
                                                                       uint32_t maxDrawCount,
                                                                       uint32_t stride)
     {
-        if (!VKIntox::depthCaptureActive())
+        if (!VkHook::depthCaptureActive())
         {
             scoped_lock l(globalLock);
             auto devIt = deviceMap.find(GetKey(commandBuffer));
@@ -5480,7 +5480,7 @@ namespace VKIntox
             logicalDevice->vkd.CmdDrawIndexedIndirectCountKHR(commandBuffer, buffer, offset, countBuffer, countBufferOffset, maxDrawCount, stride);
     }
 
-    VKAPI_ATTR VkResult VKAPI_CALL VKIntox_BeginCommandBuffer(VkCommandBuffer commandBuffer,
+    VKAPI_ATTR VkResult VKAPI_CALL VkHook_BeginCommandBuffer(VkCommandBuffer commandBuffer,
                                                               const VkCommandBufferBeginInfo* pBeginInfo)
     {
         scoped_lock l(globalLock);
@@ -5501,7 +5501,7 @@ namespace VKIntox
             // real driver's implementation, not back to us).
             //
             // In practice, this code path is extremely rare because
-            // VKIntox_GetDeviceProcAddr only returns our interceptors for
+            // VkHook_GetDeviceProcAddr only returns our interceptors for
             // devices we created (via the deviceMap lookup at line 4744-4748).
             return VK_SUCCESS;
         }
@@ -5514,7 +5514,7 @@ namespace VKIntox
         return logicalDevice->vkd.BeginCommandBuffer(commandBuffer, pBeginInfo);
     }
 
-    VKAPI_ATTR void VKAPI_CALL VKIntox_FreeCommandBuffers(VkDevice device,
+    VKAPI_ATTR void VKAPI_CALL VkHook_FreeCommandBuffers(VkDevice device,
                                                           VkCommandPool commandPool,
                                                           uint32_t commandBufferCount,
                                                           const VkCommandBuffer* pCommandBuffers)
@@ -5539,7 +5539,7 @@ namespace VKIntox
         logicalDevice->vkd.FreeCommandBuffers(device, commandPool, commandBufferCount, pCommandBuffers);
     }
 
-    VKAPI_ATTR void VKAPI_CALL VKIntox_DestroyImage(VkDevice device, VkImage image, const VkAllocationCallbacks* pAllocator)
+    VKAPI_ATTR void VKAPI_CALL VkHook_DestroyImage(VkDevice device, VkImage image, const VkAllocationCallbacks* pAllocator)
     {
         if (!image)
             return;
@@ -5626,7 +5626,7 @@ namespace VKIntox
     ///////////////////////////////////////////////////////////////////////////////////////////
     // Wayland surface interception — capture wl_display for input
 
-    VKAPI_ATTR VkResult VKAPI_CALL VKIntox_CreateWaylandSurfaceKHR(
+    VKAPI_ATTR VkResult VKAPI_CALL VkHook_CreateWaylandSurfaceKHR(
         VkInstance                              instance,
         const VkWaylandSurfaceCreateInfoKHR*    pCreateInfo,
         const VkAllocationCallbacks*            pAllocator,
@@ -5652,7 +5652,7 @@ namespace VKIntox
         return nextFunc(instance, pCreateInfo, pAllocator, pSurface);
     }
 
-    VKAPI_ATTR VkResult VKAPI_CALL VKIntox_CreateXlibSurfaceKHR(
+    VKAPI_ATTR VkResult VKAPI_CALL VkHook_CreateXlibSurfaceKHR(
         VkInstance                           instance,
         const VkXlibSurfaceCreateInfoKHR*    pCreateInfo,
         const VkAllocationCallbacks*         pAllocator,
@@ -5673,7 +5673,7 @@ namespace VKIntox
         return nextFunc(instance, pCreateInfo, pAllocator, pSurface);
     }
 
-    VKAPI_ATTR VkResult VKAPI_CALL VKIntox_CreateXcbSurfaceKHR(
+    VKAPI_ATTR VkResult VKAPI_CALL VkHook_CreateXcbSurfaceKHR(
         VkInstance                          instance,
         const VkXcbSurfaceCreateInfoKHR*    pCreateInfo,
         const VkAllocationCallbacks*        pAllocator,
@@ -5697,14 +5697,14 @@ namespace VKIntox
     ///////////////////////////////////////////////////////////////////////////////////////////
     // Enumeration function
 
-    VkResult VKAPI_CALL VKIntox_EnumerateInstanceLayerProperties(uint32_t* pPropertyCount, VkLayerProperties* pProperties)
+    VkResult VKAPI_CALL VkHook_EnumerateInstanceLayerProperties(uint32_t* pPropertyCount, VkLayerProperties* pProperties)
     {
         if (pPropertyCount)
             *pPropertyCount = 1;
 
         if (pProperties)
         {
-            std::strcpy(pProperties->layerName, VKINTOX_LAYER_NAME);
+            std::strcpy(pProperties->layerName, VKHOOK_LAYER_NAME);
             std::strcpy(pProperties->description, "a post processing layer");
             pProperties->implementationVersion = 1;
             pProperties->specVersion           = VK_MAKE_VERSION(1, 2, 0);
@@ -5713,18 +5713,18 @@ namespace VKIntox
         return VK_SUCCESS;
     }
 
-    VkResult VKAPI_CALL VKIntox_EnumerateDeviceLayerProperties(VkPhysicalDevice   /* physicalDevice */,
+    VkResult VKAPI_CALL VkHook_EnumerateDeviceLayerProperties(VkPhysicalDevice   /* physicalDevice */,
                                                                 uint32_t*          pPropertyCount,
                                                                 VkLayerProperties* pProperties)
     {
-        return VKIntox_EnumerateInstanceLayerProperties(pPropertyCount, pProperties);
+        return VkHook_EnumerateInstanceLayerProperties(pPropertyCount, pProperties);
     }
 
-    VkResult VKAPI_CALL VKIntox_EnumerateInstanceExtensionProperties(const char*            pLayerName,
+    VkResult VKAPI_CALL VkHook_EnumerateInstanceExtensionProperties(const char*            pLayerName,
                                                                       uint32_t*              pPropertyCount,
                                                                       VkExtensionProperties* /* pProperties */)
     {
-        if (pLayerName == NULL || std::strcmp(pLayerName, VKINTOX_LAYER_NAME))
+        if (pLayerName == NULL || std::strcmp(pLayerName, VKHOOK_LAYER_NAME))
         {
             return VK_ERROR_LAYER_NOT_PRESENT;
         }
@@ -5737,13 +5737,13 @@ namespace VKIntox
         return VK_SUCCESS;
     }
 
-    VkResult VKAPI_CALL VKIntox_EnumerateDeviceExtensionProperties(VkPhysicalDevice       physicalDevice,
+    VkResult VKAPI_CALL VkHook_EnumerateDeviceExtensionProperties(VkPhysicalDevice       physicalDevice,
                                                                     const char*            pLayerName,
                                                                     uint32_t*              pPropertyCount,
                                                                     VkExtensionProperties* pProperties)
     {
         // pass through any queries that aren't to us
-        if (pLayerName == NULL || std::strcmp(pLayerName, VKINTOX_LAYER_NAME))
+        if (pLayerName == NULL || std::strcmp(pLayerName, VKHOOK_LAYER_NAME))
         {
             if (physicalDevice == VK_NULL_HANDLE)
             {
@@ -5766,13 +5766,13 @@ namespace VKIntox
         return VK_SUCCESS;
     }
 
-} // namespace VKIntox
+} // namespace VkHook
 
 extern "C"
 { // these are the entry points for the layer, so they need to be c-linkeable
 
-    VK_SHADE_EXPORT PFN_vkVoidFunction VKAPI_CALL VKIntox_GetDeviceProcAddr(VkDevice device, const char* pName);
-    VK_SHADE_EXPORT PFN_vkVoidFunction VKAPI_CALL VKIntox_GetInstanceProcAddr(VkInstance instance, const char* pName);
+    VK_SHADE_EXPORT PFN_vkVoidFunction VKAPI_CALL VkHook_GetDeviceProcAddr(VkDevice device, const char* pName);
+    VK_SHADE_EXPORT PFN_vkVoidFunction VKAPI_CALL VkHook_GetInstanceProcAddr(VkInstance instance, const char* pName);
 
     static PFN_vkGetInstanceProcAddr getNextInstanceProcAddr()
     {
@@ -5786,17 +5786,17 @@ extern "C"
 
 #define GETPROCADDR(func) \
     if (!std::strcmp(pName, "vk" #func)) \
-        return (PFN_vkVoidFunction) &VKIntox::VKIntox_##func;
+        return (PFN_vkVoidFunction) &VkHook::VkHook_##func;
     /*
     Return our funktions for the funktions we want to intercept
-    the macro takes the name and returns our VKIntox_##func, if the name is equal
+    the macro takes the name and returns our VkHook_##func, if the name is equal
     */
 
     // vkGetDeviceProcAddr needs to behave like vkGetInstanceProcAddr thanks to some games
 #define INTERCEPT_CALLS \
     /* instance chain functions we intercept */ \
     if (!std::strcmp(pName, "vkGetInstanceProcAddr")) \
-        return (PFN_vkVoidFunction) &VKIntox_GetInstanceProcAddr; \
+        return (PFN_vkVoidFunction) &VkHook_GetInstanceProcAddr; \
     GETPROCADDR(EnumerateInstanceLayerProperties); \
     GETPROCADDR(EnumerateInstanceExtensionProperties); \
     GETPROCADDR(CreateInstance); \
@@ -5807,7 +5807,7 @@ extern "C"
 \
     /* device chain functions we intercept*/ \
     if (!std::strcmp(pName, "vkGetDeviceProcAddr")) \
-        return (PFN_vkVoidFunction) &VKIntox_GetDeviceProcAddr; \
+        return (PFN_vkVoidFunction) &VkHook_GetDeviceProcAddr; \
     GETPROCADDR(EnumerateDeviceLayerProperties); \
     GETPROCADDR(EnumerateDeviceExtensionProperties); \
     GETPROCADDR(CreateDevice); \
@@ -5854,16 +5854,16 @@ extern "C"
     GETPROCADDR(CmdDrawIndexedIndirectCount); \
     GETPROCADDR(CmdDrawIndexedIndirectCountKHR); \
 
-    VK_SHADE_EXPORT PFN_vkVoidFunction VKAPI_CALL VKIntox_GetDeviceProcAddr(VkDevice device, const char* pName)
+    VK_SHADE_EXPORT PFN_vkVoidFunction VKAPI_CALL VkHook_GetDeviceProcAddr(VkDevice device, const char* pName)
     {
-        VKIntox::initConfigs();
-        if (auto optical = VKIntox::opticalQueueIntercept(pName))
+        VkHook::initConfigs();
+        if (auto optical = VkHook::opticalQueueIntercept(pName))
         {
             if (!device) return nullptr;
-            VKIntox::scoped_lock lock(VKIntox::globalLock);
-            auto found = VKIntox::deviceMap.find(VKIntox::GetKey(device));
+            VkHook::scoped_lock lock(VkHook::globalLock);
+            auto found = VkHook::deviceMap.find(VkHook::GetKey(device));
             // Preserve null for unsupported/disabled extension entry points.
-            if (found == VKIntox::deviceMap.end()
+            if (found == VkHook::deviceMap.end()
                 || !found->second->vkd.GetDeviceProcAddr(device, pName)) return nullptr;
             return optical;
         }
@@ -5877,9 +5877,9 @@ extern "C"
         }
 
         {
-            VKIntox::scoped_lock l(VKIntox::globalLock);
-            auto it = VKIntox::deviceMap.find(VKIntox::GetKey(device));
-            if (it != VKIntox::deviceMap.end() && it->second && it->second->vkd.GetDeviceProcAddr)
+            VkHook::scoped_lock l(VkHook::globalLock);
+            auto it = VkHook::deviceMap.find(VkHook::GetKey(device));
+            if (it != VkHook::deviceMap.end() && it->second && it->second->vkd.GetDeviceProcAddr)
                 return it->second->vkd.GetDeviceProcAddr(device, pName);
         }
 
@@ -5887,15 +5887,15 @@ extern "C"
         return next ? next(device, pName) : nullptr;
     }
 
-    VK_SHADE_EXPORT PFN_vkVoidFunction VKAPI_CALL VKIntox_GetInstanceProcAddr(VkInstance instance, const char* pName)
+    VK_SHADE_EXPORT PFN_vkVoidFunction VKAPI_CALL VkHook_GetInstanceProcAddr(VkInstance instance, const char* pName)
     {
-        VKIntox::initConfigs();
-        if (auto optical = VKIntox::opticalQueueIntercept(pName))
+        VkHook::initConfigs();
+        if (auto optical = VkHook::opticalQueueIntercept(pName))
         {
             if (!instance) return nullptr;
-            VKIntox::scoped_lock lock(VKIntox::globalLock);
-            auto found = VKIntox::instanceDispatchMap.find(VKIntox::GetKey(instance));
-            if (found == VKIntox::instanceDispatchMap.end()
+            VkHook::scoped_lock lock(VkHook::globalLock);
+            auto found = VkHook::instanceDispatchMap.find(VkHook::GetKey(instance));
+            if (found == VkHook::instanceDispatchMap.end()
                 || !found->second.GetInstanceProcAddr(instance, pName)) return nullptr;
             return optical;
         }
@@ -5909,9 +5909,9 @@ extern "C"
         }
 
         {
-            VKIntox::scoped_lock l(VKIntox::globalLock);
-            auto it = VKIntox::instanceDispatchMap.find(VKIntox::GetKey(instance));
-            if (it != VKIntox::instanceDispatchMap.end() && it->second.GetInstanceProcAddr)
+            VkHook::scoped_lock l(VkHook::globalLock);
+            auto it = VkHook::instanceDispatchMap.find(VkHook::GetKey(instance));
+            if (it != VkHook::instanceDispatchMap.end() && it->second.GetInstanceProcAddr)
                 return it->second.GetInstanceProcAddr(instance, pName);
         }
 

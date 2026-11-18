@@ -8,7 +8,7 @@
 #include "logical_device.hh"
 
 #include "effects/effect.hh"
-namespace VKIntox
+namespace VkHook
 {
     struct LogicalSwapchain;
 
@@ -16,7 +16,7 @@ namespace VKIntox
 
     void writeCommandBuffers(LogicalDevice*                                 logicalDevice,
                              LogicalSwapchain*                              logicalSwapchain,
-                             const std::vector<std::shared_ptr<VKIntox::Effect>>& effects,
+                             const std::vector<std::shared_ptr<VkHook::Effect>>& effects,
                              const std::vector<VkCommandBuffer>&             commandBuffers,
                              const DepthState&                              depthState,
                              uint32_t                                       imageIndex = UINT32_MAX);
@@ -30,6 +30,6 @@ namespace VKIntox
                                     const DepthState&         depthState);
 
     std::vector<VkSemaphore> createSemaphores(LogicalDevice* logicalDevice, uint32_t count);
-} // namespace VKIntox
+} // namespace VkHook
 
 #endif // COMMAND_BUFFER_HPP_INCLUDED

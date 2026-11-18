@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <type_traits>
 
-namespace VKIntox
+namespace VkHook
 {
     // Scalar std430 layout shared with shaders/glsl/dlss5_common.glsl.
     struct Dlss5Parameters

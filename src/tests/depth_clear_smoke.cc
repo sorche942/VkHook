@@ -78,7 +78,7 @@ int main(int argc, char** argv)
         if (!display) throw std::runtime_error("XOpenDisplay failed");
         Window window = XCreateSimpleWindow(display, DefaultRootWindow(display),
                                             0, 0, width, height, 0, 0, 0);
-        XStoreName(display, window, "VKIntox depth clear regression");
+        XStoreName(display, window, "VkHook depth clear regression");
         XMapRaised(display, window);
         XSync(display, False);
         std::printf("WINDOW=%lu\n", window);
@@ -86,7 +86,7 @@ int main(int argc, char** argv)
 
         const char* instanceExtensions[] = {VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_XLIB_SURFACE_EXTENSION_NAME};
         VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
-        app.pApplicationName = "VKIntox depth clear regression";
+        app.pApplicationName = "VkHook depth clear regression";
         app.apiVersion = VK_API_VERSION_1_3;
         VkInstanceCreateInfo instanceInfo{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
         instanceInfo.pApplicationInfo = &app;

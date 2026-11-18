@@ -1,7 +1,7 @@
-#ifndef VKINTOX_INTERNAL_HPP_INCLUDED
-#define VKINTOX_INTERNAL_HPP_INCLUDED
+#ifndef VKHOOK_INTERNAL_HPP_INCLUDED
+#define VKHOOK_INTERNAL_HPP_INCLUDED
 
-// Shared between vkintox.cc and vkintox_depth.cc. Not a public header: this is
+// Shared between vkhook.cc and vkhook_depth.cc. Not a public header: this is
 // the seam between the layer's Vulkan interceptors and its depth subsystem, and
 // nothing outside src/core should include it.
 
@@ -17,9 +17,9 @@
 #include <string>
 #include <cstdint>
 
-namespace VKIntox
+namespace VkHook
 {
-    // Defined in vkintox.cc. The depth subsystem walks the swapchain map to find
+    // Defined in vkhook.cc. The depth subsystem walks the swapchain map to find
     // the swapchains it has to record snapshots into, and takes the same lock the
     // interceptors take, so both need the one instance rather than two.
     extern std::unordered_map<VkSwapchainKHR, std::shared_ptr<LogicalSwapchain>> swapchainMap;
@@ -38,18 +38,18 @@ namespace VKIntox
     extern std::unordered_map<LogicalDevice*, DepthRetryState> depthRetryStates;
     using scoped_lock = std::lock_guard<std::mutex>;
 
-    // Moved here from vkintox.cc because the depth subsystem is what schedules
+    // Moved here from vkhook.cc because the depth subsystem is what schedules
     // the retries. constexpr implies inline, so exactly one definition exists
     // no matter how many translation units include this.
     inline constexpr auto DEPTH_RETRY_DELAY = std::chrono::seconds(5);
     inline constexpr auto DEPTH_REBUILD_POLL_DELAY = std::chrono::milliseconds(100);
 
-    // ---- shared with vkintox.cc, called from the depth subsystem ----
+    // ---- shared with vkhook.cc, called from the depth subsystem ----
     std::string formatHexU64(uint64_t value);
     void reportDeviceLostDiagnostics(LogicalDevice* logicalDevice, VkQueue queue, const char* context, VkResult result);
     void panicLayer(LogicalDevice* logicalDevice, const std::string& reason);
 
-    // ---- depth subsystem, defined in vkintox_depth.cc ----
+    // ---- depth subsystem, defined in vkhook_depth.cc ----
     //
     // Generated from the definitions rather than typed, so overloads and
     // templates both survive. Default arguments live here and not on the
@@ -69,7 +69,7 @@ namespace VKIntox
                                                         const LogicalSwapchain* logicalSwapchain,
                                                         DepthState& candidate);
 // Definition, not just a declaration. This is a template instantiated in
-    // vkintox.cc with lambdas written there, and a template defined in a different
+    // vkhook.cc with lambdas written there, and a template defined in a different
     // translation unit cannot be instantiated with a type that has no linkage,
     // so the body has to travel with the declaration.
     template <typename Predicate>
@@ -168,6 +168,6 @@ namespace VKIntox
         LogicalSwapchain* logicalSwapchain,
         const DepthState& depth);
 
-} // namespace VKIntox
+} // namespace VkHook
 
-#endif // VKINTOX_INTERNAL_HPP_INCLUDED
+#endif // VKHOOK_INTERNAL_HPP_INCLUDED

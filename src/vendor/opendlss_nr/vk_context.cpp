@@ -431,7 +431,7 @@ VkCommandBuffer Context::beginCommands() {
   VkCommandBuffer commands;
   VK_CHECK(vkAllocateCommandBuffers(device_, &allocateInfo, &commands));
   // Layer-owned dispatchable objects must carry the borrowed device's loader
-  // dispatch table, just like command buffers allocated by VKIntox itself.
+  // dispatch table, just like command buffers allocated by VkHook itself.
   *reinterpret_cast<void**>(commands) = *reinterpret_cast<void**>(device_);
   VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
   beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;

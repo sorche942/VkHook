@@ -29,19 +29,19 @@
 #include "overlay/ui_theme.hh"
 #include "vendor/imgui/backends/imgui_impl_vulkan.h"
 
-namespace VKIntox
+namespace VkHook
 {
 
-    // No-op dummy for Vulkan functions ImGui requests but VKIntox doesn't intercept.
+    // No-op dummy for Vulkan functions ImGui requests but VkHook doesn't intercept.
     // ImGui's LoadFunctions treats nullptr returns as failures, so we need a valid pointer.
     static void VKAPI_CALL dummyVulkanFunc() {}
 
-    // Function loader using VKIntox's dispatch tables
+    // Function loader using VkHook's dispatch tables
     static PFN_vkVoidFunction imguiVulkanLoaderDummy(const char* function_name, void* user_data)
     {
         LogicalDevice* device = static_cast<LogicalDevice*>(user_data);
 
-        // Device functions from VKIntox's dispatch table
+        // Device functions from VkHook's dispatch table
         #define CHECK_FUNC(name) if (strcmp(function_name, "vk" #name) == 0) return (PFN_vkVoidFunction)device->vkd.name
 
         CHECK_FUNC(AllocateCommandBuffers);
@@ -114,7 +114,7 @@ namespace VKIntox
             return (PFN_vkVoidFunction)device->vkd.GetDeviceProcAddr(device->device, "vkGetFenceStatus");
         #undef CHECK_FUNC
 
-        // Instance functions from VKIntox's dispatch
+        // Instance functions from VkHook's dispatch
         #define CHECK_IFUNC(name) if (strcmp(function_name, "vk" #name) == 0) return (PFN_vkVoidFunction)device->vki.name
         CHECK_IFUNC(GetPhysicalDeviceMemoryProperties);
         CHECK_IFUNC(GetPhysicalDeviceProperties);
@@ -342,7 +342,7 @@ namespace VKIntox
                                     ImGuiCond_Always, ImVec2(1.0f, 0.0f));
             ImGui::SetNextWindowSize(ImVec2(toastWidth, 0.0f));
             char label[48];
-            snprintf(label, sizeof(label), "##vkintoxToast%zu", i);
+            snprintf(label, sizeof(label), "##vkhookToast%zu", i);
             if (ImGui::Begin(label, nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize
                     | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing
                     | ImGuiWindowFlags_NoInputs))
@@ -637,7 +637,7 @@ namespace VKIntox
 
     void ImGuiOverlay::initVulkanBackend(VkFormat swapchainFormat, uint32_t imageCount)
     {
-        // Load Vulkan functions for ImGui using VKIntox's dispatch tables
+        // Load Vulkan functions for ImGui using VkHook's dispatch tables
         bool loaded = ImGui_ImplVulkan_LoadFunctions(VK_API_VERSION_1_3, imguiVulkanLoaderDummy, logicalDevice);
         if (!loaded)
         {
@@ -1084,7 +1084,7 @@ namespace VKIntox
         sampleDiagnostics();
 
         bool windowOpen = true;
-        if (ImGui::Begin("VKIntox", &windowOpen,
+        if (ImGui::Begin("VkHook", &windowOpen,
                          ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse))
         {
             const ImVec2 position = ImGui::GetWindowPos();
@@ -1210,4 +1210,4 @@ namespace VKIntox
             if (f != VK_NULL_HANDLE) out.push_back(f);
     }
 
-} // namespace VKIntox
+} // namespace VkHook

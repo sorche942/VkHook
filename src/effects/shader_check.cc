@@ -72,14 +72,14 @@ int main(int argc, char** argv)
     if (effectName.empty())
         effectName = std::filesystem::path(shaderPath).stem().string();
 
-    VKIntox::ShaderTestResult result;
+    VkHook::ShaderTestResult result;
     if (includePaths.empty())
     {
-        result = VKIntox::testShaderCompilation(effectName, shaderPath);
+        result = VkHook::testShaderCompilation(effectName, shaderPath);
     }
     else
     {
-        result = VKIntox::testShaderCompilation(effectName, shaderPath, includePaths);
+        result = VkHook::testShaderCompilation(effectName, shaderPath, includePaths);
     }
 
     std::cout << "effect: " << result.effectName << "\n";

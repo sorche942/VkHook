@@ -4,7 +4,7 @@
 
 #include <X11/Xlib.h>
 
-namespace VKIntox
+namespace VkHook
 {
     static float scrollAccumulator = 0.0f;
 
@@ -78,4 +78,4 @@ namespace VKIntox
         scrollAccumulator = 0.0f;
         return state;
     }
-} // namespace VKIntox
+} // namespace VkHook

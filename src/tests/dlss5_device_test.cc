@@ -4,7 +4,7 @@
 #include <iostream>
 #include <set>
 #include <stdexcept>
-using namespace VKIntox;
+using namespace VkHook;
 static void require(bool value, const char* message) { if (!value) throw std::runtime_error(message); }
 static bool flowSupported = false;
 static void VKAPI_CALL available(VkPhysicalDevice, VkPhysicalDeviceFeatures2* features) {

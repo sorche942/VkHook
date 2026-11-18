@@ -11,7 +11,7 @@
 
 #include "logical_device.hh"
 
-namespace VKIntox
+namespace VkHook
 {
     // Returns a matching sRGB format to a UNORM format if it exist, else returns format
     VkFormat convertToSRGB(VkFormat format);
@@ -33,6 +33,6 @@ namespace VKIntox
     bool isDepthFormat(VkFormat format);
 
     bool isStencilFormat(VkFormat format);
-} // namespace VKIntox
+} // namespace VkHook
 
 #endif // FORMAT_HPP_INCLUDED

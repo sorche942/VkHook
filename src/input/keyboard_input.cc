@@ -6,7 +6,7 @@
 #include "keyboard_input_wayland.hh"
 #include "keyboard_input_x11.hh"
 
-namespace VKIntox
+namespace VkHook
 {
     static void warnUnsupportedKeyboardOnce(const char* message)
     {
@@ -56,4 +56,4 @@ namespace VKIntox
         warnUnsupportedKeyboardOnce("unsupported Vulkan surface: keyboard polling disabled; returning default state");
         return KeyboardState();
     }
-} // namespace VKIntox
+} // namespace VkHook

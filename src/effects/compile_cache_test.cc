@@ -11,8 +11,8 @@
 #include <thread>
 #include <vector>
 
-using VKIntox::CompileCache;
-using VKIntox::hashBytes;
+using VkHook::CompileCache;
+using VkHook::hashBytes;
 
 namespace
 {

@@ -1,13 +1,13 @@
-project('VKIntox', ['c', 'cpp'], meson_version: '>=1.3.0', default_options: ['c_std=c11', 'cpp_std=c++2a'])
+project('VkHook', ['c', 'cpp'], meson_version: '>=1.3.0', default_options: ['c_std=c11', 'cpp_std=c++2a'])
 
 cpp = meson.get_compiler('cpp')
 
-VKIntox_include_path = ''
+VkHook_include_path = ''
 
 lib_dir = get_option('libdir')
 
-if get_option('append_libdir_vkintox')
-    lib_dir = join_paths(lib_dir, 'vkintox')
+if get_option('append_libdir_vkhook')
+    lib_dir = join_paths(lib_dir, 'vkhook')
 endif
 
 if get_option('with_so')
@@ -28,5 +28,5 @@ install_data(
     'assets/font/LICENSE-GoogleSansFlex-OFL.txt',
     'src/vendor/reshade/LICENSE.md',
     'src/vendor/imgui/LICENSE.txt',
-    install_dir : get_option('datadir') / 'licenses' / 'vkintox',
+    install_dir : get_option('datadir') / 'licenses' / 'vkhook',
 )

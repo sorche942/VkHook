@@ -11,7 +11,7 @@
 #include <string>
 #include <unordered_map>
 
-namespace VKIntox
+namespace VkHook
 {
     static std::string typedCharsAccumulator;
     static std::string lastKeyNameAccumulator;
@@ -162,4 +162,4 @@ namespace VKIntox
 
         return state;
     }
-} // namespace VKIntox
+} // namespace VkHook

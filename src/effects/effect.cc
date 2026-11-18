@@ -1,6 +1,6 @@
 #include "effect.hh"
 
-namespace VKIntox
+namespace VkHook
 {
 
 }

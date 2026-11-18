@@ -6,7 +6,7 @@
 
 #define FORVKFUNC(func) PFN_vk##func func = nullptr;
 
-namespace VKIntox
+namespace VkHook
 {
 
     struct InstanceDispatch
@@ -22,6 +22,6 @@ namespace VKIntox
     void fillDispatchTableInstance(VkInstance instance, PFN_vkGetInstanceProcAddr gipa, InstanceDispatch* table);
     void fillDispatchTableDevice(VkDevice device, PFN_vkGetDeviceProcAddr gdpa, DeviceDispatch* table);
 
-} // namespace VKIntox
+} // namespace VkHook
 
 #undef FORVKFUNC

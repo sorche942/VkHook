@@ -2,7 +2,7 @@
 
 #include <cstdint>
 
-namespace VKIntox
+namespace VkHook
 {
     // Keeps a foreign window commit out of an in-flight present. Mesa's WSI
     // sets linux-drm-syncobj points inside its present call, and a commit from
@@ -36,4 +36,4 @@ namespace VKIntox
         void setWaitBudgetForTests(uint64_t microseconds);
         void resetForTests();
     }
-} // namespace VKIntox
+} // namespace VkHook

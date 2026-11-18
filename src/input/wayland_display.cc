@@ -5,7 +5,7 @@
 #include <atomic>
 #include <string>
 
-namespace VKIntox
+namespace VkHook
 {
     static std::atomic<int> surfaceKind{static_cast<int>(SurfaceKind::Unknown)};
     static std::atomic<wl_display*> waylandDisplay{nullptr};
@@ -76,4 +76,4 @@ namespace VKIntox
     {
         return x11Window.load(std::memory_order_acquire);
     }
-} // namespace VKIntox
+} // namespace VkHook

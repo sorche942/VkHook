@@ -7,7 +7,7 @@
 #include <cstdio>
 #include <thread>
 
-using namespace VKIntox::WaylandSyncobjGate;
+using namespace VkHook::WaylandSyncobjGate;
 using Clock = std::chrono::steady_clock;
 
 namespace

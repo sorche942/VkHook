@@ -8,7 +8,7 @@
 
 #include "params/effect_param.hh"
 
-namespace VKIntox
+namespace VkHook
 {
     enum class EffectType
     {
@@ -41,6 +41,6 @@ namespace VKIntox
         bool hasFailed() const { return !compileError.empty(); }
     };
 
-} // namespace VKIntox
+} // namespace VkHook
 
 #endif // EFFECT_CONFIG_HPP_INCLUDED

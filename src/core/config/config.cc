@@ -5,28 +5,28 @@
 #include <locale>
 #include <array>
 
-namespace VKIntox
+namespace VkHook
 {
     Config::Config()
     {
-        // Find VKIntox.conf in standard locations
+        // Find VkHook.conf in standard locations
         const char* homeEnv = std::getenv("HOME");
         std::string homePath = homeEnv ? homeEnv : "/tmp";
 
         const char* tmpHomeEnv     = std::getenv("XDG_DATA_HOME");
-        std::string userConfigFile = tmpHomeEnv ? std::string(tmpHomeEnv) + "/VKIntox/VKIntox.conf"
-                                                : homePath + "/.local/share/VKIntox/VKIntox.conf";
+        std::string userConfigFile = tmpHomeEnv ? std::string(tmpHomeEnv) + "/VkHook/VkHook.conf"
+                                                : homePath + "/.local/share/VkHook/VkHook.conf";
 
         const char* tmpConfigEnv      = std::getenv("XDG_CONFIG_HOME");
-        std::string userXdgConfigFile = tmpConfigEnv ? std::string(tmpConfigEnv) + "/VKIntox/VKIntox.conf"
-                                                     : homePath + "/.config/VKIntox/VKIntox.conf";
+        std::string userXdgConfigFile = tmpConfigEnv ? std::string(tmpConfigEnv) + "/VkHook/VkHook.conf"
+                                                     : homePath + "/.config/VkHook/VkHook.conf";
 
         const std::array<std::string, 5> configPaths = {
             userXdgConfigFile,
             userConfigFile,
-            std::string(SYSCONFDIR) + "/VKIntox.conf",
-            std::string(SYSCONFDIR) + "/VKIntox/VKIntox.conf",
-            std::string(DATADIR) + "/VKIntox/VKIntox.conf",
+            std::string(SYSCONFDIR) + "/VkHook.conf",
+            std::string(SYSCONFDIR) + "/VkHook/VkHook.conf",
+            std::string(DATADIR) + "/VkHook/VkHook.conf",
         };
 
         for (const auto& path : configPaths)
@@ -42,7 +42,7 @@ namespace VKIntox
             }
         }
 
-        Logger::err("no VKIntox.conf found");
+        Logger::err("no VkHook.conf found");
     }
 
     Config::Config(const std::string& path)
@@ -334,4 +334,4 @@ namespace VKIntox
         return effects;
     }
 
-} // namespace VKIntox
+} // namespace VkHook

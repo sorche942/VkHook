@@ -4,7 +4,7 @@ opendlss_nr_glslang = find_program('glslang', 'glslangValidator')
 opendlss_nr_include = include_directories('.')
 opendlss_nr_build_shader_dir = meson.current_build_dir()
 opendlss_nr_build_ptx_dir = meson.current_build_dir()
-opendlss_nr_data_dir = get_option('prefix') / get_option('datadir') / 'vkintox' / 'dlss5'
+opendlss_nr_data_dir = get_option('prefix') / get_option('datadir') / 'vkhook' / 'dlss5'
 opendlss_nr_install_shader_dir = opendlss_nr_data_dir / 'shaders'
 opendlss_nr_install_ptx_dir = opendlss_nr_data_dir / 'ptx'
 opendlss_nr_assets = []
@@ -71,4 +71,4 @@ opendlss_nr_dep = declare_dependency(
     include_directories : opendlss_nr_include,
     compile_args : ['-DVK_ENABLE_BETA_EXTENSIONS'],
 )
-install_data('LICENSE', 'NOTICE', install_dir : get_option('datadir') / 'licenses' / 'vkintox' / 'opendlss_nr')
+install_data('LICENSE', 'NOTICE', install_dir : get_option('datadir') / 'licenses' / 'vkhook' / 'opendlss_nr')

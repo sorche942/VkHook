@@ -10,7 +10,7 @@
 
 #include "vendor/imgui/imgui.h"
 
-namespace VKIntox
+namespace VkHook
 {
     void ImGuiOverlay::renderSettingsView(const KeyboardState& keyboard)
     {
@@ -199,4 +199,4 @@ namespace VKIntox
     }
 
 
-} // namespace VKIntox
+} // namespace VkHook

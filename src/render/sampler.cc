@@ -1,6 +1,6 @@
 #include "sampler.hh"
 
-namespace VKIntox
+namespace VkHook
 {
     VkSampler createSampler(LogicalDevice* logicalDevice)
     {
@@ -124,4 +124,4 @@ namespace VKIntox
                 return;
         }
     }
-} // namespace VKIntox
+} // namespace VkHook

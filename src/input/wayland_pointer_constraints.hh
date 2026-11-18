@@ -1,6 +1,6 @@
 #pragma once
 
-namespace VKIntox
+namespace VkHook
 {
     // Initialize pointer constraints from the Wayland registry.
     // Requires initWaylandInputCommon() to have been called first.
@@ -17,4 +17,4 @@ namespace VKIntox
     // Clean up pointer constraints resources.
     void cleanupPointerConstraints();
 
-} // namespace VKIntox
+} // namespace VkHook

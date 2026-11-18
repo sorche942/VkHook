@@ -3,7 +3,7 @@
 
 #include "vulkan_include.hh"
 
-namespace VKIntox
+namespace VkHook
 {
     struct DepthState
     {
@@ -23,6 +23,6 @@ namespace VKIntox
         // discard.
         bool transient = false;
     };
-} // namespace VKIntox
+} // namespace VkHook
 
 #endif // DEPTH_STATE_HPP_INCLUDED

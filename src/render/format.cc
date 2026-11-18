@@ -1,6 +1,6 @@
 #include "format.hh"
 
-namespace VKIntox
+namespace VkHook
 {
     VkFormat convertToSRGB(VkFormat format)
     {
@@ -144,4 +144,4 @@ namespace VKIntox
             default: return false;
         }
     }
-} // namespace VKIntox
+} // namespace VkHook

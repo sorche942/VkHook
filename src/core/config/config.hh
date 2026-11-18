@@ -12,12 +12,12 @@
 
 #include "vulkan_include.hh"
 
-namespace VKIntox
+namespace VkHook
 {
     class Config
     {
     public:
-        Config();  // Finds and loads VKIntox.conf
+        Config();  // Finds and loads VkHook.conf
         Config(const std::string& path);  // Loads specific config file
         Config(const Config& other);
 
@@ -111,6 +111,6 @@ namespace VKIntox
         void parseOverride(const std::string& value, std::string& result);
         void parseOverride(const std::string& value, std::vector<std::string>& result);
     };
-} // namespace VKIntox
+} // namespace VkHook
 
 #endif // CONFIG_HPP_INCLUDED

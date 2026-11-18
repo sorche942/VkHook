@@ -8,7 +8,7 @@
 
 #include <sstream>
 
-namespace VKIntox
+namespace VkHook
 {
     Logger Logger::s_instance;
 
@@ -105,7 +105,7 @@ namespace VKIntox
         if (level >= minLevel)
         {
             static std::array<const char*, 5> s_prefixes = {
-                {"VKIntox trace: ", "VKIntox debug: ", "VKIntox info:  ", "VKIntox warn:  ", "VKIntox err:   "}};
+                {"VkHook trace: ", "VkHook debug: ", "VkHook info:  ", "VkHook warn:  ", "VkHook err:   "}};
 
             const char* prefix = s_prefixes.at(static_cast<uint32_t>(level));
 
@@ -182,7 +182,7 @@ namespace VKIntox
             {"none", LogLevel::None},
         }};
 
-        const char* envVar = getenv("VKINTOX_LOG_LEVEL");
+        const char* envVar = getenv("VKHOOK_LOG_LEVEL");
 
         const std::string logLevelStr = envVar ? envVar : "";
 
@@ -197,7 +197,7 @@ namespace VKIntox
 
     std::string Logger::getFileName()
     {
-        const char* envVar = getenv("VKINTOX_LOG_FILE");
+        const char* envVar = getenv("VKHOOK_LOG_FILE");
 
         std::string filename = envVar ? envVar : "";
 
@@ -206,9 +206,9 @@ namespace VKIntox
             const char* configHome = getenv("XDG_CONFIG_HOME");
             const char* home = getenv("HOME");
             if (configHome && *configHome)
-                filename = std::string(configHome) + "/VKIntox/vkintox.log";
+                filename = std::string(configHome) + "/VkHook/vkhook.log";
             else if (home && *home)
-                filename = std::string(home) + "/.config/VKIntox/vkintox.log";
+                filename = std::string(home) + "/.config/VkHook/vkhook.log";
             else
                 filename = "stderr";
         }
@@ -216,4 +216,4 @@ namespace VKIntox
         return filename;
     }
 
-} // namespace VKIntox
+} // namespace VkHook

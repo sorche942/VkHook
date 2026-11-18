@@ -13,11 +13,11 @@
 #include <chrono>
 #include <mutex>
 
-namespace VKIntox
+namespace VkHook
 {
     struct LogicalSwapchain;  // Forward declaration
 
-    // Global lock guarding all layer state (defined in vkintox.cpp). Shared with
+    // Global lock guarding all layer state (defined in vkhook.cpp). Shared with
     // the overlay so it can read LogicalDevice state for the Advanced tab.
     extern std::mutex globalLock;
 
@@ -191,6 +191,6 @@ namespace VKIntox
         // re-enable effects after a panic.
         std::atomic<bool> softDisabled{false};
     };
-} // namespace VKIntox
+} // namespace VkHook
 
 #endif // LOGICAL_DEVICE_HPP_INCLUDED

@@ -14,7 +14,7 @@
 
 #include "vendor/imgui/imgui.h"
 
-namespace VKIntox
+namespace VkHook
 {
     void ImGuiOverlay::startShaderTest()
     {
@@ -248,10 +248,10 @@ namespace VKIntox
         renderGroup("Safe shaders", safe, "Compiled successfully and need no depth buffer.", UI::Success());
     }
 
-} // namespace VKIntox
+} // namespace VkHook
 
 // Expose renderShaderTestResults for use by view_shader_manager.cpp
-namespace VKIntox
+namespace VkHook
 {
     void renderShaderTestResultsUI(
         const std::vector<std::tuple<std::string, std::string, bool, std::string>>& results,

@@ -8,7 +8,7 @@
 
 #include <stdexcept>
 
-namespace VKIntox
+namespace VkHook
 {
     namespace
     {

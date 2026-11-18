@@ -4,7 +4,7 @@
 #include <cstdio>
 #include <string>
 
-namespace VKIntox
+namespace VkHook
 {
     // Robust int vector (ivec2/3/4) field editor with custom value input via right-click
     class IntVecFieldEditor : public FieldEditor
@@ -174,4 +174,4 @@ namespace VKIntox
 
     REGISTER_FIELD_EDITOR(ParamType::IntVec, IntVecFieldEditor)
 
-} // namespace VKIntox
+} // namespace VkHook

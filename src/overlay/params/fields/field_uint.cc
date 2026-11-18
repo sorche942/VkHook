@@ -4,7 +4,7 @@
 #include <cstdio>
 #include <string>
 
-namespace VKIntox
+namespace VkHook
 {
     // Robust unsigned int field editor with custom value input via right-click
     class UintFieldEditor : public FieldEditor
@@ -124,4 +124,4 @@ namespace VKIntox
 
     REGISTER_FIELD_EDITOR(ParamType::Uint, UintFieldEditor)
 
-} // namespace VKIntox
+} // namespace VkHook

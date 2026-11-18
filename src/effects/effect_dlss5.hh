@@ -3,7 +3,7 @@
 #include <memory>
 #include <string>
 
-namespace VKIntox
+namespace VkHook
 {
     struct LogicalDevice;
     class Config;

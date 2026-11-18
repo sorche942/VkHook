@@ -26,7 +26,7 @@ namespace
 
 int main()
 {
-    const char* override = std::getenv("VKINTOX_TEST_WAYLAND_LIB");
+    const char* override = std::getenv("VKHOOK_TEST_WAYLAND_LIB");
     void* handle = override ? dlopen(override, RTLD_NOW | RTLD_LOCAL)
                             : dlopen("libwayland-client.so.0", RTLD_NOW | RTLD_LOCAL);
     if (!handle)
@@ -37,7 +37,7 @@ int main()
 
     void* slot = nullptr;
     void* real = nullptr;
-    check(VKIntox::waylandMarshalSlotForTests(&slot, &real), "marshal GOT slot located without faulting");
+    check(VkHook::waylandMarshalSlotForTests(&slot, &real), "marshal GOT slot located without faulting");
     if (!slot)
     {
         std::printf("%d failure(s)\n", failures ? failures : 1);

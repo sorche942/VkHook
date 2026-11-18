@@ -3,9 +3,9 @@
 // A held key must be released into the game on entry and restored on exit.
 //
 // It synthesises real input on the developer's display, so it only runs with
-// VKINTOX_X11_INPUT_TEST=1 set; otherwise it reports SKIP (exit 77).
+// VKHOOK_X11_INPUT_TEST=1 set; otherwise it reports SKIP (exit 77).
 //
-// usage: vkintox-x11-input-handoff-tests <path to libvkintox.so>
+// usage: vkhook-x11-input-handoff-tests <path to libvkhook.so>
 
 #include <X11/Xlib.h>
 #include <X11/keysym.h>
@@ -22,7 +22,7 @@ typedef void (*SetWindowFn)(unsigned long);
 typedef void (*SetRectsFn)(const void*, int);
 typedef void (*SetBoolFn)(bool);
 typedef void (*SetPosFn)(float, float);
-typedef VKIntox::MouseState (*GetMouseFn)();
+typedef VkHook::MouseState (*GetMouseFn)();
 
 struct InputRect { float x, y, width, height; };
 
@@ -57,9 +57,9 @@ static const char* grabStatus(Display* probe, Window w, int keyboard)
 
 int main(int argc, char** argv)
 {
-    if (getenv("VKINTOX_X11_INPUT_TEST") == nullptr)
+    if (getenv("VKHOOK_X11_INPUT_TEST") == nullptr)
     {
-        printf("skipped: set VKINTOX_X11_INPUT_TEST=1 to run (it synthesises real input)\n");
+        printf("skipped: set VKHOOK_X11_INPUT_TEST=1 to run (it synthesises real input)\n");
         return 77;
     }
     if (XOpenDisplay(NULL) == nullptr)
@@ -68,18 +68,18 @@ int main(int argc, char** argv)
         return 77;
     }
 
-    const char* libPath = argc > 1 ? argv[1] : "build/src/libvkintox.so";
+    const char* libPath = argc > 1 ? argv[1] : "build/src/libvkhook.so";
     void* lib = dlopen(libPath, RTLD_NOW);
     if (!lib) { printf("dlopen failed: %s\n", dlerror()); return 1; }
 
-    InitFn        initInputBlocker        = (InitFn) dlsym(lib, "_ZN7VKIntox16initInputBlockerEb");
-    SetWindowFn   setX11Window            = (SetWindowFn) dlsym(lib, "_ZN7VKIntox12setX11WindowEm");
-    SetRectsFn    setInputRects           = (SetRectsFn) dlsym(lib, "_ZN7VKIntox13setInputRectsEPKNS_9InputRectEi");
-    SetBoolFn     setInputBlocked         = (SetBoolFn) dlsym(lib, "_ZN7VKIntox15setInputBlockedEb");
-    SetBoolFn     setInputInteractive     = (SetBoolFn) dlsym(lib, "_ZN7VKIntox19setInputInteractiveEb");
-    SetBoolFn     setOverlayWantsKeyboard = (SetBoolFn) dlsym(lib, "_ZN7VKIntox23setOverlayWantsKeyboardEb");
-    SetPosFn      updatePointerPosition   = (SetPosFn) dlsym(lib, "_ZN7VKIntox21updatePointerPositionEff");
-    GetMouseFn getMouseState = (GetMouseFn) dlsym(lib, "_ZN7VKIntox16getMouseStateX11Ev");
+    InitFn        initInputBlocker        = (InitFn) dlsym(lib, "_ZN6VkHook16initInputBlockerEb");
+    SetWindowFn   setX11Window            = (SetWindowFn) dlsym(lib, "_ZN6VkHook12setX11WindowEm");
+    SetRectsFn    setInputRects           = (SetRectsFn) dlsym(lib, "_ZN6VkHook13setInputRectsEPKNS_9InputRectEi");
+    SetBoolFn     setInputBlocked         = (SetBoolFn) dlsym(lib, "_ZN6VkHook15setInputBlockedEb");
+    SetBoolFn     setInputInteractive     = (SetBoolFn) dlsym(lib, "_ZN6VkHook19setInputInteractiveEb");
+    SetBoolFn     setOverlayWantsKeyboard = (SetBoolFn) dlsym(lib, "_ZN6VkHook23setOverlayWantsKeyboardEb");
+    SetPosFn      updatePointerPosition   = (SetPosFn) dlsym(lib, "_ZN6VkHook21updatePointerPositionEff");
+    GetMouseFn getMouseState = (GetMouseFn) dlsym(lib, "_ZN6VkHook16getMouseStateX11Ev");
     if (!initInputBlocker || !setX11Window || !setInputRects || !setInputBlocked
         || !setInputInteractive || !setOverlayWantsKeyboard || !updatePointerPosition || !getMouseState)
     {
@@ -94,7 +94,7 @@ int main(int argc, char** argv)
     const Window root = DefaultRootWindow(game);
     const Window win = XCreateSimpleWindow(game, root, 90, 90, 380, 260, 0, 0, 0x101820);
     XSelectInput(game, win, KeyPressMask | KeyReleaseMask | FocusChangeMask | StructureNotifyMask);
-    XStoreName(game, win, "vkintox input test");
+    XStoreName(game, win, "vkhook input test");
     XMapWindow(game, win);
     XSync(game, False);
     usleep(300000);

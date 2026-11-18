@@ -1,13 +1,13 @@
-#ifndef VKINTOX_RESHADE_DEPTH_MACROS_HPP_INCLUDED
-#define VKINTOX_RESHADE_DEPTH_MACROS_HPP_INCLUDED
+#ifndef VKHOOK_RESHADE_DEPTH_MACROS_HPP_INCLUDED
+#define VKHOOK_RESHADE_DEPTH_MACROS_HPP_INCLUDED
 
 #include "reshade/effect_preprocessor.hh"
 
-namespace VKIntox
+namespace VkHook
 {
     // Add ReShade preprocessor macros for depth buffer handling.
     // These macros tell ReShade effects how to interpret the depth values
-    // that VKIntox passes to them. Proper configuration is critical for
+    // that VkHook passes to them. Proper configuration is critical for
     // flawless depth-based effect rendering (DOF, SSAO, etc.)
     //
     // invert/flip/flop are runtime resolve state, not macros; encoding them
@@ -112,10 +112,10 @@ namespace VKIntox
 
         // Mix stage depth map flag
         // 0 = don't mix, 1 = blend with existing depth
-        // For VKIntox's resolved depth, we always provide clean depth
+        // For VkHook's resolved depth, we always provide clean depth
         pp.add_macro_definition("RESHADE_MIX_STAGE_DEPTH_MAP", "0");
     }
 
-} // namespace VKIntox
+} // namespace VkHook
 
-#endif // VKINTOX_RESHADE_DEPTH_MACROS_HPP_INCLUDED
+#endif // VKHOOK_RESHADE_DEPTH_MACROS_HPP_INCLUDED

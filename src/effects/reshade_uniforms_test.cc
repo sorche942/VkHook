@@ -19,7 +19,7 @@ int main()
         source.name = "source";
         source.value.string_data = "framecount";
         info.annotations.push_back(source);
-        VKIntox::FrameCountUniform uniform(info);
+        VkHook::FrameCountUniform uniform(info);
         std::array<uint32_t, 3> buffer{0x12345678u, 0, 0x87654321u};
         for (uint32_t frame = 0; frame < 130; ++frame) {
             uniform.update(buffer.data());

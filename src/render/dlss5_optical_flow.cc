@@ -4,7 +4,7 @@
 #include <array>
 #include <limits>
 
-namespace VKIntox
+namespace VkHook
 {
     namespace
     {

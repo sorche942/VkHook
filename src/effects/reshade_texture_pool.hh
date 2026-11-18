@@ -7,7 +7,7 @@
 #include <string>
 #include <unordered_map>
 
-namespace VKIntox
+namespace VkHook
 {
     struct LogicalDevice;
 

@@ -3,7 +3,7 @@
 
 #include <cstdint>
 
-namespace VKIntox
+namespace VkHook
 {
     struct MouseState
     {
@@ -17,6 +17,6 @@ namespace VKIntox
 
     MouseState getMouseState();
 
-} // namespace VKIntox
+} // namespace VkHook
 
 #endif // MOUSE_INPUT_HPP_INCLUDED

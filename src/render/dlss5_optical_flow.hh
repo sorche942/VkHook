@@ -3,7 +3,7 @@
 #include "vk_context.h"
 #include <memory>
 
-namespace VKIntox
+namespace VkHook
 {
     // Borrows the context and optical queue. The caller serializes submissions and
     // retires all work (including partial failed prepares) before destruction.

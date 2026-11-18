@@ -16,7 +16,7 @@
 #include <sys/mman.h>
 #include <unordered_set>
 
-namespace VKIntox
+namespace VkHook
 {
     // Keyboard-specific state (seat/queue come from wayland_input_common)
     static wl_keyboard* wlKeyboard = nullptr;
@@ -375,4 +375,4 @@ namespace VKIntox
 
         return state;
     }
-} // namespace VKIntox
+} // namespace VkHook

@@ -1,7 +1,7 @@
 #include "../field_editor.hh"
 #include "../../../vendor/imgui/imgui.h"
 
-namespace VKIntox
+namespace VkHook
 {
     class BoolFieldEditor : public FieldEditor
     {
@@ -25,4 +25,4 @@ namespace VKIntox
 
     REGISTER_FIELD_EDITOR(ParamType::Bool, BoolFieldEditor)
 
-} // namespace VKIntox
+} // namespace VkHook

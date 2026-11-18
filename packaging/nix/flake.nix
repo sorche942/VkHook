@@ -1,5 +1,5 @@
 {
-      description = "VKIntox — Vulkan post-processing layer with in-game UI (Wayland + X11)";
+      description = "VkHook — Vulkan post-processing layer with in-game UI (Wayland + X11)";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -26,10 +26,10 @@
           pkgs = import nixpkgs { localSystem.system = system; };
         in
         {
-          default = self.packages.${system}.vkintox;
+          default = self.packages.${system}.vkhook;
 
-          vkintox = pkgs.stdenv.mkDerivation {
-            pname = "vkintox";
+          vkhook = pkgs.stdenv.mkDerivation {
+            pname = "vkhook";
             version = "0.1.0-unstable-${self.shortRev or "dirty"}";
 
             src = self;
@@ -57,27 +57,18 @@
             mesonBuildType = "release";
 
             mesonFlags = [
-              "-Dappend_libdir_vkintox=false"
+              "-Dappend_libdir_vkhook=false"
               "--sysconfdir=/etc"
             ];
-
-            postInstall = ''
-              # vkintox-run wrapper: sets ENABLE_VKINTOX.
-              mkdir -p "$out/bin"
-              substitute ${./../../scripts/vkintox-run.sh} "$out/bin/vkintox-run" \
-                --subst-var out
-              chmod +x "$out/bin/vkintox-run"
-            '';
 
             meta = with pkgs.lib; {
               description = "Vulkan post-processing layer with real-time overlay UI (Wayland + X11)";
               license = licenses.zlib;
               platforms = [ "x86_64-linux" ];
-              mainProgram = "vkintox-run";
             };
           };
 
-          vkintox-debug = self.packages.${system}.vkintox.overrideAttrs {
+          vkhook-debug = self.packages.${system}.vkhook.overrideAttrs {
             mesonBuildType = "debug";
           };
         }
@@ -110,7 +101,7 @@
       );
 
       overlays.default = final: _prev: {
-        inherit (self.packages.${final.stdenv.hostPlatform.system}) vkintox;
+        inherit (self.packages.${final.stdenv.hostPlatform.system}) vkhook;
       };
     };
 }

@@ -20,7 +20,7 @@
 #include "settings_manager.hh"
 #include "logger.hh"
 
-namespace VKIntox
+namespace VkHook
 {
     class Effect;
     class EffectRegistry;
@@ -29,7 +29,7 @@ namespace VKIntox
     {
         std::vector<std::string> disabledEffects;       // Effects that are unchecked (in list but not rendered)
         std::vector<std::string> currentConfigEffects;  // ReShade effects from current config (e.g., tunic.conf)
-        std::vector<std::string> defaultConfigEffects;  // ReShade effects from default VKIntox.conf (no duplicates)
+        std::vector<std::string> defaultConfigEffects;  // ReShade effects from default VkHook.conf (no duplicates)
         std::map<std::string, std::string> effectPaths; // Effect name -> file path (for reshade effects)
         std::string configPath;
         std::string configName;  // Just the filename (e.g., "tunic.conf")
@@ -132,7 +132,7 @@ namespace VKIntox
         // Set the effect registry (single source of truth for enabled states)
         void setEffectRegistry(EffectRegistry* registry) { effectRegistry = registry; }
 
-        // Set game/profile info for auto-save (called from vkintox.cpp after detection)
+        // Set game/profile info for auto-save (called from vkhook.cpp after detection)
         void setGameProfile(const std::string& gameName, const std::string& profileName, const std::string& profilePath)
         {
             activeGameName = gameName;
@@ -172,7 +172,7 @@ namespace VKIntox
 
         VkCommandBuffer recordFrame(uint32_t imageIndex, VkImageView imageView, uint32_t width, uint32_t height);
 
-        // Get fence for command buffer synchronization (used by vkintox.cpp submit)
+        // Get fence for command buffer synchronization (used by vkhook.cpp submit)
         VkFence getCommandBufferFence(uint32_t imageIndex) const
         {
             return (imageIndex < commandBufferFences.size()) ? commandBufferFences[imageIndex] : VK_NULL_HANDLE;
@@ -289,8 +289,8 @@ namespace VKIntox
 
         // UI state for settings view
         int listeningForKey = 0;  // 0=none, 1=toggle, 2=reload, 3=overlay
-        bool settingsSaved = false;  // True when settings saved, cleared by vkintox.cpp
-        bool shaderPathsChanged = false;  // True when shader manager saved, cleared by vkintox.cpp
+        bool settingsSaved = false;  // True when settings saved, cleared by vkhook.cpp
+        bool shaderPathsChanged = false;  // True when shader manager saved, cleared by vkhook.cpp
 
         // Non-interactive top-right notifications. They render even when
         // the main overlay is hidden, so fatal errors stay visible.
@@ -343,6 +343,6 @@ namespace VKIntox
             std::vector<ConfigParam>& disabledEffectParams);
     };
 
-} // namespace VKIntox
+} // namespace VkHook
 
 #endif // IMGUI_OVERLAY_HPP_INCLUDED

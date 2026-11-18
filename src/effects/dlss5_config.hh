@@ -6,7 +6,7 @@
 #include "config.hh"
 #include "effect_config.hh"
 
-namespace VKIntox
+namespace VkHook
 {
     inline bool isDlss5Name(std::string name)
     {

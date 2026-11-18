@@ -11,7 +11,7 @@
 
 #include "logical_device.hh"
 
-namespace VKIntox
+namespace VkHook
 {
     uint32_t findMemoryTypeIndex(LogicalDevice* logicalDevice, uint32_t typeFilter, VkMemoryPropertyFlags properties);
 }

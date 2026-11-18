@@ -39,13 +39,13 @@ picks it up automatically, and the smoke test will keep testing whichever
 version was copied in. Refresh deliberately:
 
 ```bash
-cp ~/.config/VKIntox/reshade/packages/Shaders/{DisplayDepth.fx,ReShade.fxh,DisplayDepth_L10N.fxh} src/tests/fixtures/
+cp ~/.config/VkHook/reshade/packages/Shaders/{DisplayDepth.fx,ReShade.fxh,DisplayDepth_L10N.fxh} src/tests/fixtures/
 ```
 
 then confirm it still compiles and still reports depth usage:
 
 ```bash
-build/src/vkintox-shader-check --include src/tests/fixtures src/tests/fixtures/DisplayDepth.fx
+build/src/vkhook-shader-check --include src/tests/fixtures src/tests/fixtures/DisplayDepth.fx
 ```
 
 `success: true` and `usesDepth: true` are both required. A fixture that stops

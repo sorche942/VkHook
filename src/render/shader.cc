@@ -3,7 +3,7 @@
 #include <array>
 #include <filesystem>
 
-namespace VKIntox
+namespace VkHook
 {
     void createShaderModule(LogicalDevice* logicalDevice, const std::vector<char>& code, VkShaderModule* shaderModule)
     {
@@ -32,4 +32,4 @@ namespace VKIntox
         VkResult result = logicalDevice->vkd.CreateShaderModule(logicalDevice->device, &shaderCreateInfo, nullptr, shaderModule);
         ASSERT_VULKAN(result);
     }
-} // namespace VKIntox
+} // namespace VkHook

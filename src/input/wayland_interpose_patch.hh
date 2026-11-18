@@ -1,6 +1,6 @@
 #pragma once
 
-namespace VKIntox
+namespace VkHook
 {
     // Redirect libwayland's internal marshal entry (the jump slot behind
     // wl_proxy_marshal_flags) at our array-flags wrapper so every caller's
@@ -17,4 +17,4 @@ namespace VKIntox
     // Test hook: locate the jump slot without redirecting it. Returns false
     // when no loaded object carries the relocation.
     bool waylandMarshalSlotForTests(void** slotOut, void** realOut);
-} // namespace VKIntox
+} // namespace VkHook

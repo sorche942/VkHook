@@ -25,7 +25,7 @@
 #include "reshade/effect_codegen.hh"
 #include "reshade/effect_preprocessor.hh"
 
-namespace VKIntox
+namespace VkHook
 {
     class ReshadeEffect : public Effect
     {
@@ -152,6 +152,6 @@ namespace VKIntox
         VkBlendOp     convertReshadeBlendOp(reshadefx::pass_blend_op blendOp);
         VkBlendFactor convertReshadeBlendFactor(reshadefx::pass_blend_func blendFactor);
     };
-} // namespace VKIntox
+} // namespace VkHook
 
 #endif // EFFECT_RESHADE_HPP_INCLUDED

@@ -8,7 +8,7 @@
 #include <mutex>
 #include <vector>
 
-namespace VKIntox
+namespace VkHook
 {
     // Destruction order for owned handles, earliest first.
     //
@@ -139,6 +139,6 @@ namespace VKIntox
     void recordSubmittedBatch(LogicalDevice* logicalDevice, const char* kind, uint32_t imageIndex,
                               VkSemaphore waitSemaphore, VkSemaphore signalSemaphore, VkFence fence);
 
-} // namespace VKIntox
+} // namespace VkHook
 
 #endif // VK_HANDLE_HPP_INCLUDED

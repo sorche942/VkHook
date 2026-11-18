@@ -5,7 +5,7 @@
 #include <stdexcept>
 #include "vk_context.h"
 
-namespace VKIntox
+namespace VkHook
 {
     namespace
     {

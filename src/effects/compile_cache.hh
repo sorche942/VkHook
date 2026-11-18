@@ -7,7 +7,7 @@
 #include <mutex>
 #include <unordered_map>
 
-namespace VKIntox
+namespace VkHook
 {
     // FNV-1a. Stable across runs and platforms, which matters because the key
     // has to mean the same thing on the next reload as it did when the entry
@@ -106,6 +106,6 @@ namespace VKIntox
         std::unordered_map<Key, Value, KeyHash> m_entries;
         std::deque<Key> m_order;
     };
-} // namespace VKIntox
+} // namespace VkHook
 
 #endif // COMPILE_CACHE_HPP_INCLUDED

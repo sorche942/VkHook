@@ -3,7 +3,7 @@
 #include "vendor/imgui/imgui.h"
 #include "logger.hh"
 
-namespace VKIntox::UI
+namespace VkHook::UI
 {
     inline ImVec4 Primary() { return ImGui::GetStyleColorVec4(ImGuiCol_CheckMark); }
     inline ImVec4 Secondary() { return ImGui::GetStyleColorVec4(ImGuiCol_SliderGrab); }

@@ -886,7 +886,7 @@ private:
                                 if (_use_local_size_id)
                                 {
                                         const auto create_local_size_spec_constant = [this, &func](char axis, uint32_t default_value) -> id {
-                                                const std::string name = std::string("__vkintox_local_size_") + axis + "_" + func.unique_name;
+                                                const std::string name = std::string("__vkhook_local_size_") + axis + "_" + func.unique_name;
 
                                                 reshadefx::constant constant_value = {};
                                                 constant_value.as_uint[0] = default_value;

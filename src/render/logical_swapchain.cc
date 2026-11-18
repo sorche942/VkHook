@@ -2,7 +2,7 @@
 
 #include "vk_handle.hh"
 
-namespace VKIntox
+namespace VkHook
 {
     void destroyDepthResolveResources(LogicalSwapchain* logicalSwapchain);
 
@@ -101,4 +101,4 @@ namespace VKIntox
             // Note: ImGui overlay is now at device level, not destroyed here
         }
     }
-} // namespace VKIntox
+} // namespace VkHook

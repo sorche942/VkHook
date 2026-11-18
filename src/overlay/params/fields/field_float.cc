@@ -5,7 +5,7 @@
 #include <cstdio>
 #include <string>
 
-namespace VKIntox
+namespace VkHook
 {
     // Robust float field editor with custom value input via right-click
     // Uses deferred modal opening to avoid ImGui nested-popup issues
@@ -125,4 +125,4 @@ namespace VKIntox
 
     REGISTER_FIELD_EDITOR(ParamType::Float, FloatFieldEditor)
 
-} // namespace VKIntox
+} // namespace VkHook

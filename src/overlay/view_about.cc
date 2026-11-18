@@ -3,7 +3,7 @@
 
 #include "vendor/imgui/imgui.h"
 
-namespace VKIntox
+namespace VkHook
 {
     namespace
     {
@@ -12,14 +12,14 @@ namespace VKIntox
         // written.
         const char* runtimeVersion()
         {
-            return VKINTOX_VERSION;
+            return VKHOOK_VERSION;
         }
     }
 
     void ImGuiOverlay::renderAboutView()
     {
         ImGui::BeginChild("about_content");
-        ImGui::SeparatorText("VKIntox");
+        ImGui::SeparatorText("VkHook");
         ImGui::TextWrapped("ReShade-like Vulkan post processing layer, made Linux-first.");
         ImGui::TextDisabled("Version %s - beta", runtimeVersion());
         ImGui::TextWrapped("The overlay uses standard Dear ImGui controls.");
@@ -30,7 +30,7 @@ namespace VKIntox
             ImGui::SameLine();
             ImGui::TextLinkOpenURL(handle, url);
         };
-        credit("VKIntox by", "@buwryme", "https://github.com/buwryme");
+        credit("VKIntox by", "@buwryme", "https://github.com/buwryme/VKIntox");
         credit("vkShade by", "@slobodaapl", "https://github.com/slobodaapl");
         credit("vkBasalt by", "@DadSchoorse", "https://github.com/DadSchoorse/vkBasalt");
         credit("Overlay fork by", "@Boux", "https://github.com/Boux/vkBasalt_overlay");
@@ -38,11 +38,11 @@ namespace VKIntox
         credit("ReShade FX support by", "@crosire", "https://github.com/crosire/reshade");
         credit("Dear ImGui by", "@ocornut", "https://github.com/ocornut/imgui");
         ImGui::Spacing();
-        ImGui::TextDisabled("VKIntox by buwryme  \xC2\xB7  version %s", runtimeVersion());
+        ImGui::TextDisabled("VkHook  \xC2\xB7  version %s", runtimeVersion());
         ImGui::TextDisabled("Report issues:");
         ImGui::SameLine();
-        ImGui::TextLinkOpenURL("github.com/buwryme/VKIntox/issues", "https://github.com/buwryme/VKIntox/issues");
+        ImGui::TextLinkOpenURL("github.com/sorche942/VkHook/issues", "https://github.com/sorche942/VkHook/issues");
         ImGui::EndChild();
     }
 
-} // namespace VKIntox
+} // namespace VkHook

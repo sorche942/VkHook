@@ -1,7 +1,7 @@
 // DLSS5 network benchmark: the production PTX graph on a private device, timed with GPU timestamps.
 // No layer, no swapchain: isolates the network that dominates the effect's frame cost.
 //
-//   vkintox-dlss5-bench --model DIR --shaders DIR --ptx DIR [--width W --height H --frames N]
+//   vkhook-dlss5-bench --model DIR --shaders DIR --ptx DIR [--width W --height H --frames N]
 //                       [--chain 0|1] [--profile] [--dump head.f32] [--compare head.f32]
 //                       [--image in.rgba [--seed S] [--output out.rgba] [--expect reference.rgba]]
 //
@@ -171,7 +171,7 @@ int main(int argc, char** argv)
         const std::string shaders = argument(argc, argv, "--shaders");
         const std::string ptx = argument(argc, argv, "--ptx", shaders);
         require(!model.empty() && !shaders.empty(),
-            "usage: vkintox-dlss5-bench --model DIR --shaders DIR [--ptx DIR] [--width W --height H --frames N] "
+            "usage: vkhook-dlss5-bench --model DIR --shaders DIR [--ptx DIR] [--width W --height H --frames N] "
             "[--chain 0|1] [--profile] [--dump FILE] [--compare FILE] "
             "[--image FILE [--seed S] [--output FILE] [--expect FILE]]");
         const uint32_t width = std::stoul(argument(argc, argv, "--width", "1920"));
@@ -346,7 +346,7 @@ int main(int argc, char** argv)
         vkd.vkDestroyCommandPool(device.device, pool, nullptr);
         return status;
     } catch (const std::exception& error) {
-        std::fprintf(stderr, "vkintox-dlss5-bench: %s\n", error.what());
+        std::fprintf(stderr, "vkhook-dlss5-bench: %s\n", error.what());
         return 1;
     }
 }

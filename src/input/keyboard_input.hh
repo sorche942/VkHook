@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <string>
 
-namespace VKIntox
+namespace VkHook
 {
     struct KeyboardState
     {
@@ -22,4 +22,4 @@ namespace VKIntox
     void beginKeyboardInputFrame();
     bool     isKeyPressed(uint32_t ks);
     KeyboardState getKeyboardState();
-} // namespace VKIntox
+} // namespace VkHook

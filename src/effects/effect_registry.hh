@@ -15,7 +15,7 @@
 #include "effect_config.hh"
 #include "config.hh"
 
-namespace VKIntox
+namespace VkHook
 {
     // EffectRegistry is the single source of truth for all effect configurations.
     // UI reads/writes here, rendering reads from here.
@@ -128,7 +128,7 @@ namespace VKIntox
         bool initializedFromConfig = false;        // True once first load from config is complete
         // Named rootConfig rather than config: initReshadeEffect builds a local
         // EffectConfig called config, and this is a different type entirely --
-        // the parsed VKIntox.conf. The old pConfig prefix was doing the job a
+        // the parsed VkHook.conf. The old pConfig prefix was doing the job a
         // name has to do, which is to say which of two same-ish things this is.
         Config* rootConfig = nullptr;
         mutable std::mutex mutex;
@@ -149,6 +149,6 @@ namespace VKIntox
         std::optional<const EffectParam*> findParam(const EffectConfig& effect, const std::string& paramName) const;
     };
 
-} // namespace VKIntox
+} // namespace VkHook
 
 #endif // EFFECT_REGISTRY_HPP_INCLUDED

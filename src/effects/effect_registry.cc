@@ -11,7 +11,7 @@
 #include "logger.hh"
 #include "dlss5_config.hh"
 
-namespace VKIntox
+namespace VkHook
 {
 
     namespace
@@ -714,4 +714,4 @@ namespace VKIntox
                       " effects from config (" + std::to_string(disabledEffects.size()) + " disabled)");
     }
 
-} // namespace VKIntox
+} // namespace VkHook

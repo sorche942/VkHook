@@ -16,7 +16,7 @@
 #include <stdexcept>
 #include <vector>
 
-using namespace VKIntox;
+using namespace VkHook;
 namespace {
 void require(bool condition, const char* message)
 {
@@ -100,7 +100,7 @@ template<typename T> std::vector<T> download(vk::Context& context, const vk::Buf
 
 int main(int argc, char** argv)
 {
-    if (!std::getenv("VKINTOX_TEST_DLSS5_GPU")) return 77;
+    if (!std::getenv("VKHOOK_TEST_DLSS5_GPU")) return 77;
     try {
         require(argc == 2, "pass the compiled DLSS5 shader directory");
         Loader loader;

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Opt-in GPU regression; needs Python 3, libX11, DISPLAY and an Xlib vkcube.
 
-Usage: python3 src/tests/test_shared_texture_smoke.py --layer /abs/libvkintox.so
+Usage: python3 src/tests/test_shared_texture_smoke.py --layer /abs/libvkhook.so
 Supply --vkcube /path/to/32-bit/vkcube with a matching 32-bit layer if desired.
 No desktop screenshots, global key injection, or user configuration writes.
 """
@@ -175,26 +175,26 @@ class X11:
 
 
 def seed(work, layer, executable):
-    layer_dir, config = work / "layers", work / "config" / "VKIntox"
+    layer_dir, config = work / "layers", work / "config" / "VkHook"
     profiles = config / "configs" / "shaders"
     shaders = config / "reshade" / "Shaders"
     for directory in (layer_dir, profiles, shaders, work / "home", work / "data", work / "cache"):
         directory.mkdir(parents=True, exist_ok=True)
-    layer_name = "VK_LAYER_VKINTOX_post_processing"
+    layer_name = "VK_LAYER_VKHOOK_post_processing"
     manifest = {"file_format_version": "1.0.0", "layer": {
         "name": layer_name, "type": "GLOBAL", "library_path": str(layer),
         "api_version": "1.3.223", "implementation_version": "1",
-        "description": "VKIntox shared texture GPU regression",
-        "functions": {"vkGetInstanceProcAddr": "VKIntox_GetInstanceProcAddr",
-                      "vkGetDeviceProcAddr": "VKIntox_GetDeviceProcAddr"}}}
-    # Deliberately no disable_environment: DISABLE_VKINTOX disables installed
+        "description": "VkHook shared texture GPU regression",
+        "functions": {"vkGetInstanceProcAddr": "VkHook_GetInstanceProcAddr",
+                      "vkGetDeviceProcAddr": "VkHook_GetDeviceProcAddr"}}}
+    # Deliberately no disable_environment: DISABLE_VKHOOK disables installed
     # implicit manifests, not this explicitly requested test manifest.
-    (layer_dir / "VKIntox.json").write_text(json.dumps(manifest), encoding="utf-8")
+    (layer_dir / "VkHook.json").write_text(json.dumps(manifest), encoding="utf-8")
     names = ("SharedTextureProducer", "SharedTextureConsumer")
     for name in names:
         shutil.copyfile(Path(__file__).resolve().parent / "fixtures" / (name + ".fx"),
                         shaders / (name + ".fx"))
-    (config / "VKIntox.conf").write_text(
+    (config / "VkHook.conf").write_text(
         "enableOnLaunch = true\noverlayKey = Home\nreloadKey = F10\n"
         "maxEffects = 10\nautoApply = false\ndepthCapture = on\nshowDebugWindow = false\n",
         encoding="utf-8")
@@ -210,8 +210,8 @@ def seed(work, layer, executable):
         "".join("\n[" + name + ".fx]\n" for name in names), encoding="utf-8")
     (profiles / (game + ".last-profile")).write_text("shared-texture\n", encoding="utf-8")
     env = {key: value for key, value in os.environ.items()
-           if not key.startswith(("VKINTOX_", "VK_LAYER_", "VK_ADD_LAYER_", "VK_LOADER_LAYERS_"))
-           and key not in ("VK_INSTANCE_LAYERS", "ENABLE_VKINTOX", "DISABLE_VKINTOX")}
+           if not key.startswith(("VKHOOK_", "VK_LAYER_", "VK_ADD_LAYER_", "VK_LOADER_LAYERS_"))
+           and key not in ("VK_INSTANCE_LAYERS", "ENABLE_VKHOOK", "DISABLE_VKHOOK")}
     # Preserve default X authentication before replacing HOME for the child.
     authority = Path(os.environ.get("HOME", "")) / ".Xauthority"
     if "XAUTHORITY" not in env and authority.is_file():
@@ -219,8 +219,8 @@ def seed(work, layer, executable):
     env.update(HOME=str(work / "home"), XDG_CONFIG_HOME=str(work / "config"),
                XDG_DATA_HOME=str(work / "data"), XDG_CACHE_HOME=str(work / "cache"),
                VK_LAYER_PATH=str(layer_dir), VK_INSTANCE_LAYERS=layer_name,
-               VK_LOADER_LAYERS_DISABLE="~implicit", DISABLE_VKINTOX="1",
-               VK_LOADER_DEBUG="layer", VKINTOX_LOG_LEVEL="debug")
+               VK_LOADER_LAYERS_DISABLE="~implicit", DISABLE_VKHOOK="1",
+               VK_LOADER_DEBUG="layer", VKHOOK_LOG_LEVEL="debug")
     return env
 
 
@@ -259,7 +259,7 @@ def diagnostics(work, artifacts, samples):
 
 
 def run(args, executable):
-    with tempfile.TemporaryDirectory(prefix="vkintox-shared-texture-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="vkhook-shared-texture-") as temporary:
         work = Path(temporary)
         child, x11, window, samples = None, None, None, None
         try:
@@ -303,7 +303,7 @@ def run(args, executable):
                 # requested build, not an installed layer, actually participated.
                 if str(args.layer) not in (work / "vkcube.log").read_text(errors="replace"):
                     raise RuntimeError("loader trace does not identify the requested layer library")
-                if not (work / "config" / "VKIntox" / "vkintox.log").is_file():
+                if not (work / "config" / "VkHook" / "vkhook.log").is_file():
                     raise RuntimeError("requested layer produced no initialization log")
                 stop(child, x11, window)
                 if child.returncode != 0:
@@ -326,7 +326,7 @@ def run(args, executable):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--layer", type=Path, required=True, help="absolute path to libvkintox.so under test")
+    parser.add_argument("--layer", type=Path, required=True, help="absolute path to libvkhook.so under test")
     parser.add_argument("--vkcube", default="vkcube", help="Xlib-capable vkcube executable (default: vkcube)")
     parser.add_argument("--timeout", type=float, default=30, help="window/contents readiness deadline in seconds (default: 30)")
     parser.add_argument("--artifacts", type=Path, help="optional directory for failure logs/pixels; otherwise stdout only")

@@ -11,7 +11,7 @@
 
 #include "logical_device.hh"
 
-namespace VKIntox
+namespace VkHook
 {
     std::vector<VkImage> createFakeSwapchainImages(LogicalDevice*                    logicalDevice,
                                                       VkSwapchainCreateInfoKHR          swapchainCreateInfo,

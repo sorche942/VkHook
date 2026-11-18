@@ -9,19 +9,19 @@
 #include "config_serializer.hh"
 #include "default_config.hh"
 
-namespace VKIntox
+namespace VkHook
 {
-    // Single source of truth for all VKIntox settings.
+    // Single source of truth for all VkHook settings.
     // Similar to EffectRegistry for effect parameters.
     //
     // Usage:
     // - Call initialize() once at startup to load from config
     // - Read/write settings directly via getters/setters
-    // - Call save() to persist changes to VKIntox.conf
+    // - Call save() to persist changes to VkHook.conf
     class SettingsManager
     {
     public:
-        // Initialize from VKIntox.conf (call once at startup)
+        // Initialize from VkHook.conf (call once at startup)
         void initialize();
 
         // Check if already initialized
@@ -31,7 +31,7 @@ namespace VKIntox
             return initialized;
         }
 
-        // Save current settings to VKIntox.conf
+        // Save current settings to VkHook.conf
         bool save();
 
         // Getters
@@ -276,6 +276,6 @@ namespace VKIntox
     // Global settings manager instance (like effectRegistry)
     extern SettingsManager settingsManager;
 
-} // namespace VKIntox
+} // namespace VkHook
 
 #endif // SETTINGS_MANAGER_HPP_INCLUDED

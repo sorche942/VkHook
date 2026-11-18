@@ -3,19 +3,19 @@
 
 From the repository root, after building the corresponding layer/shader headers:
 
-  g++ -std=c++17 -O2 -Ibuild-gcc/src/libvkintox.so.p \
+  g++ -std=c++17 -O2 -Ibuild-gcc/src/libvkhook.so.p \
     src/tests/depth_clear_smoke.cc -o build-gcc/depth-clear-smoke -lvulkan -lX11
   zig c++ \
     -target x86-linux-gnu.2.34 -std=c++17 -O2 -idirafter /usr/include \
-    -Ibuild-zig32/src/libvkintox.so.p src/tests/depth_clear_smoke.cc \
+    -Ibuild-zig32/src/libvkhook.so.p src/tests/depth_clear_smoke.cc \
     -L/usr/lib32 -lvulkan -lX11 -Wl,--allow-shlib-undefined -o build-zig32/depth-clear-smoke
 
   python3 \
     src/tests/test_depth_clear_smoke.py --binary "$PWD/build-gcc/depth-clear-smoke" \
-    --layer "$PWD/build-gcc/src/libvkintox.so" --artifacts "$PWD/build-gcc"
+    --layer "$PWD/build-gcc/src/libvkhook.so" --artifacts "$PWD/build-gcc"
   python3 \
     src/tests/test_depth_clear_smoke.py --binary "$PWD/build-zig32/depth-clear-smoke" \
-    --layer "$PWD/build-zig32/src/libvkintox.so" --artifacts "$PWD/build-zig32"
+    --layer "$PWD/build-zig32/src/libvkhook.so" --artifacts "$PWD/build-zig32"
 
 Pass --layer /absolute/baseline.so for the unfixed-layer negative control.
 Keep the test's own window visible/unobscured. --width 3840 --height 2160
@@ -64,24 +64,24 @@ technique DepthClearProbe
 
 
 def seed(work, args):
-    config = work / "config" / "VKIntox"
+    config = work / "config" / "VkHook"
     profiles = config / "configs" / "shaders"
     shaders = config / "reshade" / "Shaders"
     layers = work / "layers"
     for directory in (profiles, shaders, layers, work / "home", work / "data", work / "cache"):
         directory.mkdir(parents=True, exist_ok=True)
-    name = "VK_LAYER_VKINTOX_post_processing"
+    name = "VK_LAYER_VKHOOK_post_processing"
     manifest = {"file_format_version": "1.0.0", "layer": {
         "name": name, "type": "GLOBAL", "library_path": str(args.layer),
         "api_version": "1.3.223", "implementation_version": "1",
-        "description": "VKIntox depth clear GPU regression",
-        "functions": {"vkGetInstanceProcAddr": "VKIntox_GetInstanceProcAddr",
-                      "vkGetDeviceProcAddr": "VKIntox_GetDeviceProcAddr"}}}
-    (layers / "VKIntox.json").write_text(json.dumps(manifest), encoding="utf-8")
+        "description": "VkHook depth clear GPU regression",
+        "functions": {"vkGetInstanceProcAddr": "VkHook_GetInstanceProcAddr",
+                      "vkGetDeviceProcAddr": "VkHook_GetDeviceProcAddr"}}}
+    (layers / "VkHook.json").write_text(json.dumps(manifest), encoding="utf-8")
     effect_name = "DepthClearProbe"
     effect = EFFECT
     (shaders / (effect_name + ".fx")).write_text(effect, encoding="utf-8")
-    (config / "VKIntox.conf").write_text(
+    (config / "VkHook.conf").write_text(
         "enableOnLaunch = true\noverlayKey = Home\nreloadKey = F10\n"
         "maxEffects = 10\nautoApply = false\ndepthCapture = on\nshowDebugWindow = false\n",
         encoding="utf-8")
@@ -93,18 +93,18 @@ def seed(work, args):
         f"TechniqueSorting={effect_name}@{effect_name}.fx\n\n[{effect_name}.fx]\n", encoding="utf-8")
     (profiles / (game + ".last-profile")).write_text("depth-clear\n", encoding="utf-8")
     env = {key: value for key, value in os.environ.items()
-           if not key.startswith(("VKINTOX_", "VK_LAYER_", "VK_ADD_LAYER_", "VK_LOADER_LAYERS_"))
-           and key not in ("VK_INSTANCE_LAYERS", "ENABLE_VKINTOX", "DISABLE_VKINTOX")}
+           if not key.startswith(("VKHOOK_", "VK_LAYER_", "VK_ADD_LAYER_", "VK_LOADER_LAYERS_"))
+           and key not in ("VK_INSTANCE_LAYERS", "ENABLE_VKHOOK", "DISABLE_VKHOOK")}
     authority = Path(os.environ.get("HOME", "")) / ".Xauthority"
     if "XAUTHORITY" not in env and authority.is_file():
         env["XAUTHORITY"] = str(authority.resolve())
     env.update(HOME=str(work / "home"), XDG_CONFIG_HOME=str(work / "config"),
                XDG_DATA_HOME=str(work / "data"), XDG_CACHE_HOME=str(work / "cache"),
                VK_LAYER_PATH=str(layers), VK_INSTANCE_LAYERS=name,
-               VK_LOADER_LAYERS_DISABLE="~implicit", DISABLE_VKINTOX="1",
-               VK_LOADER_DEBUG="layer", VKINTOX_LOG_LEVEL="debug")
+               VK_LOADER_LAYERS_DISABLE="~implicit", DISABLE_VKHOOK="1",
+               VK_LOADER_DEBUG="layer", VKHOOK_LOG_LEVEL="debug")
     if args.validation:
-        # Validation is BELOW VKIntox so it observes injected commands too.
+        # Validation is BELOW VkHook so it observes injected commands too.
         env["VK_INSTANCE_LAYERS"] += ":VK_LAYER_KHRONOS_validation"
         env["VK_LAYER_PATH"] += ":/usr/share/vulkan/explicit_layer.d:/etc/vulkan/explicit_layer.d"
     return env
@@ -140,7 +140,7 @@ def pixels_match(samples, phase):
 
 
 def run(args):
-    with tempfile.TemporaryDirectory(prefix="vkintox-depth-clear-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="vkhook-depth-clear-") as temporary:
         work = Path(temporary)
         child, x11 = None, None
         samples, selected = {}, {}
@@ -149,7 +149,7 @@ def run(args):
             env = seed(work, args)
             x11 = X11()
             log = work / "application.log"
-            layer_log = work / "config" / "VKIntox" / "vkintox.log"
+            layer_log = work / "config" / "VkHook" / "vkhook.log"
             with log.open("wb") as output:
                 command = [str(args.binary), "--width", str(args.width), "--height", str(args.height)]
                 if args.legacy:
@@ -168,7 +168,7 @@ def run(args):
                         match = re.search(r"^WINDOW=(\d+)$", text, re.MULTILINE)
                         if match and "READY phase=" + phase in text:
                             window = int(match.group(1))
-                            if x11.name(window) != "VKIntox depth clear regression":
+                            if x11.name(window) != "VkHook depth clear regression":
                                 raise RuntimeError("test window identity changed")
                             samples[phase] = x11.sample(window)
                             consecutive = consecutive + 1 if pixels_match(samples[phase], phase) else 0

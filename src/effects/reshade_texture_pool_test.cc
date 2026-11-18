@@ -14,13 +14,13 @@
 // The headless executable never creates overlay objects. Complete these
 // forward-declared owners so LogicalDevice's null unique_ptrs can be destroyed
 // without linking the unrelated ImGui renderer.
-namespace VKIntox
+namespace VkHook
 {
     struct OverlayPersistentState {};
     class ImGuiOverlay {};
 }
 
-using namespace VKIntox;
+using namespace VkHook;
 
 namespace
 {
@@ -282,7 +282,7 @@ namespace
 // Only the GPU image allocation and initialization boundary is replaced. Pool
 // lookup, format conversion, view creation dispatch, ownership and deferred
 // release ordering all use the production implementations.
-namespace VKIntox
+namespace VkHook
 {
     VkImage createSingleImage(LogicalDevice*, VkExtent3D extent, VkFormat format, VkImageUsageFlags usage,
                               VkMemoryPropertyFlags properties, VkDeviceMemory& memory, uint32_t mipLevels)

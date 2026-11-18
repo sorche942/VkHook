@@ -259,7 +259,7 @@ struct ImGui_ImplVulkan_Texture
     VkImageView                 ImageView;
     VkDescriptorSet             DescriptorSet;
 
-    // VKIntox: uploads submit async, staging freed when the fence signals.
+    // VkHook: uploads submit async, staging freed when the fence signals.
     // inline vkQueueWaitIdle() could hang the thread on a parked queue.
     VkBuffer                    UploadBuffer;
     VkDeviceMemory              UploadBufferMemory;

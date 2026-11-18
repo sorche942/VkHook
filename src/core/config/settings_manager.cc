@@ -1,7 +1,7 @@
 #include "settings_manager.hh"
 #include "logger.hh"
 
-namespace VKIntox
+namespace VkHook
 {
     // Global instance
     SettingsManager settingsManager;
@@ -28,4 +28,4 @@ namespace VKIntox
         return success;
     }
 
-} // namespace VKIntox
+} // namespace VkHook

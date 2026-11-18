@@ -1,7 +1,7 @@
 #include "buffer.hh"
 #include "memory.hh"
 
-namespace VKIntox
+namespace VkHook
 {
     void createBuffer(LogicalDevice*        logicalDevice,
                       VkDeviceSize          size,
@@ -53,4 +53,4 @@ namespace VKIntox
         }
     }
 
-} // namespace VKIntox
+} // namespace VkHook

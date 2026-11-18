@@ -1,7 +1,7 @@
 #include "descriptor_set.hh"
 #include "logger.hh"
 
-namespace VKIntox
+namespace VkHook
 {
 
     VkDescriptorPool createDescriptorPool(LogicalDevice* logicalDevice, const std::vector<VkDescriptorPoolSize>& poolSizes)
@@ -232,4 +232,4 @@ namespace VKIntox
             std::move(imageViewsVectors),
             std::vector<VkDescriptorType>(bindingCount, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER));
     }
-} // namespace VKIntox
+} // namespace VkHook

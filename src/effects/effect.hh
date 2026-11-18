@@ -11,7 +11,7 @@
 #include "vulkan_include.hh"
 #include "params/effect_param.hh"
 
-namespace VKIntox
+namespace VkHook
 {
     class Effect
     {
@@ -36,6 +36,6 @@ namespace VKIntox
 
     private:
     };
-} // namespace VKIntox
+} // namespace VkHook
 
 #endif // EFFECT_HPP_INCLUDED

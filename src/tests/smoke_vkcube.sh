@@ -6,11 +6,11 @@
 # that catches the class of bug unit tests cannot: a bad interceptor, a null
 # handle dereference, a use-after-free on a handle whose lifetime we guessed at.
 #
-# usage: src/tests/smoke_vkcube.sh [LIBVKINTOX_SO] [SECONDS]
+# usage: src/tests/smoke_vkcube.sh [LIBVKHOOK_SO] [SECONDS]
 #
-# VKINTOX_SMOKE_DEPTH_REFRESH sets how often, in ms, the run forces a depth
+# VKHOOK_SMOKE_DEPTH_REFRESH sets how often, in ms, the run forces a depth
 # re-detect (default 500), which is what drives the rebuild assertions below.
-# VKINTOX_SMOKE_REBUILD_MODE=1 seeds the fast rebuild path instead of the safe
+# VKHOOK_SMOKE_REBUILD_MODE=1 seeds the fast rebuild path instead of the safe
 # default; on a GPU, run both to cover the two.
 #
 # needs a display. on CI wrap it: xvfb-run -a src/tests/smoke_vkcube.sh
@@ -26,12 +26,12 @@ set -euo pipefail
 # looks like it passed.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-LIBRARY="${1:-build/src/libvkintox.so}"
+LIBRARY="${1:-build/src/libvkhook.so}"
 DURATION="${2:-11}"
-LAYER_NAME="VK_LAYER_VKINTOX_smoke_test"
+LAYER_NAME="VK_LAYER_VKHOOK_smoke_test"
 # the installed production layer, which on a developer machine would otherwise
 # be discovered alongside ours and could shadow the build we actually want to test
-INSTALLED_LAYER="VK_LAYER_VKINTOX_post_processing"
+INSTALLED_LAYER="VK_LAYER_VKHOOK_post_processing"
 
 if [[ -t 1 ]]; then
     B='\033[1m'; BLUE='\033[34m'; GREEN='\033[32m'; YELLOW='\033[33m'; RED='\033[31m'; DIM='\033[2m'; NC='\033[0m'
@@ -60,8 +60,8 @@ if [[ -z "${DISPLAY:-}" && -z "${WAYLAND_DISPLAY:-}" ]]; then
     # without one. Re-exec under xvfb-run so the same command works on a
     # developer desktop and on CI. The env marker keeps a broken xvfb-run from
     # turning this into an exec loop.
-    if [[ -z "${VKINTOX_SMOKE_XVFB:-}" ]] && command -v xvfb-run >/dev/null 2>&1; then
-        VKINTOX_SMOKE_XVFB=1 exec xvfb-run -a "$0" "$@"
+    if [[ -z "${VKHOOK_SMOKE_XVFB:-}" ]] && command -v xvfb-run >/dev/null 2>&1; then
+        VKHOOK_SMOKE_XVFB=1 exec xvfb-run -a "$0" "$@"
     fi
     die "no display, and xvfb-run is not available to provide one"
 fi
@@ -91,13 +91,13 @@ cat >"$LAYER_DIR/$LAYER_NAME.json" <<JSON
     "library_path": "$LIBRARY",
     "api_version": "1.3.223",
     "implementation_version": "1",
-    "description": "vkintox smoke test",
+    "description": "vkhook smoke test",
     "functions": {
-      "vkGetInstanceProcAddr": "VKIntox_GetInstanceProcAddr",
-      "vkGetDeviceProcAddr": "VKIntox_GetDeviceProcAddr"
+      "vkGetInstanceProcAddr": "VkHook_GetInstanceProcAddr",
+      "vkGetDeviceProcAddr": "VkHook_GetDeviceProcAddr"
     },
-    "enable_environment": { "ENABLE_VKINTOX": "1" },
-    "disable_environment": { "DISABLE_VKINTOX": "1" }
+    "enable_environment": { "ENABLE_VKHOOK": "1" },
+    "disable_environment": { "DISABLE_VKHOOK": "1" }
   }
 }
 JSON
@@ -114,10 +114,10 @@ jq -e . "$LAYER_DIR/$LAYER_NAME.json" >/dev/null || die "generated manifest is n
 #   depthSourceChannel = 0 -> Luminance/Red, the standard Vulkan depth layout
 #   depthInvert        = false -> near/far not flipped
 seed_config() {
-    local base="$CONFIG_DIR/VKIntox"
+    local base="$CONFIG_DIR/VkHook"
     mkdir -p "$base/configs/shaders" "$base/reshade/packages/Shaders"
 
-    cat >"$base/VKIntox.conf" <<'CONF'
+    cat >"$base/VkHook.conf" <<'CONF'
 enableOnLaunch = true
 overlayKey = Home
 reloadKey = F10
@@ -165,14 +165,14 @@ INI
     printf 'smoke\n' >"$base/configs/shaders/vkcube.last-profile"
 
     # Exercise automatic or manual scale without changing the user's config.
-    if [[ -n "${VKINTOX_SMOKE_UI_SCALE:-}" ]]; then
-        printf 'uiScale = %s\n' "$VKINTOX_SMOKE_UI_SCALE" >>"$base/VKIntox.conf"
+    if [[ -n "${VKHOOK_SMOKE_UI_SCALE:-}" ]]; then
+        printf 'uiScale = %s\n' "$VKHOOK_SMOKE_UI_SCALE" >>"$base/VkHook.conf"
     fi
 
     # Which path the forced rebuilds below take: 0 = safe (idles the queue),
     # 1 = fast (fence-gated). Unset leaves the shipped default (safe).
-    if [[ -n "${VKINTOX_SMOKE_REBUILD_MODE:-}" ]]; then
-        printf 'depthRebuildMode = %s\n' "$VKINTOX_SMOKE_REBUILD_MODE" >>"$base/VKIntox.conf"
+    if [[ -n "${VKHOOK_SMOKE_REBUILD_MODE:-}" ]]; then
+        printf 'depthRebuildMode = %s\n' "$VKHOOK_SMOKE_REBUILD_MODE" >>"$base/VkHook.conf"
     fi
 }
 
@@ -182,7 +182,7 @@ say "layer      $LIBRARY"
 say "duration   ${DURATION}s"
 
 # VK_LOADER_LAYERS_ENABLE is what guarantees our layer is the one that ends up in
-# the chain. Without it, a VKIntox already installed on the machine wins and the
+# the chain. Without it, a VkHook already installed on the machine wins and the
 # run silently tests the installed build instead of this one.
 #
 # The XDG_CONFIG_HOME redirect sends the layer's own log somewhere disposable, so
@@ -196,12 +196,12 @@ set +e
 # environment limitation). At the default info level those two look identical,
 # so the test cannot fail correctly without asking for debug.
 VK_LOADER_DEBUG=layer \
-    VKINTOX_LOG_LEVEL=debug \
-    VKINTOX_SMOKE_DEPTH_REFRESH="${VKINTOX_SMOKE_DEPTH_REFRESH:-500}" \
+    VKHOOK_LOG_LEVEL=debug \
+    VKHOOK_SMOKE_DEPTH_REFRESH="${VKHOOK_SMOKE_DEPTH_REFRESH:-500}" \
     VK_LOADER_LAYERS_ENABLE="$LAYER_NAME" \
     VK_LOADER_LAYERS_DISABLE="$INSTALLED_LAYER" \
     VK_LAYER_PATH="$LAYER_DIR" \
-    ENABLE_VKINTOX=1 \
+    ENABLE_VKHOOK=1 \
     XDG_CONFIG_HOME="$CONFIG_DIR" \
     timeout "$DURATION" vkcube >"$WORK_DIR/vkcube.log" 2>&1
 STATUS=$?
@@ -219,7 +219,7 @@ if [[ "$LOADED" != yes ]]; then
 fi
 ok "layer loaded from the build directory"
 
-LAYER_LOG="$CONFIG_DIR/VKIntox/vkintox.log"
+LAYER_LOG="$CONFIG_DIR/VkHook/vkhook.log"
 if [[ -s "$LAYER_LOG" ]]; then
     ok "layer engaged ($(wc -l <"$LAYER_LOG") log lines)"
 else
@@ -229,8 +229,8 @@ fi
 # A panic means the layer hit a state it does not trust and soft-disabled itself
 # or tore the device down; for a smoke run that is a failure even when the
 # process limps on to the end, because nothing after it proves anything.
-if grep -qF 'VKIntox panic' "$LAYER_LOG"; then
-    grep -F 'VKIntox panic' "$LAYER_LOG" >&2
+if grep -qF 'VkHook panic' "$LAYER_LOG"; then
+    grep -F 'VkHook panic' "$LAYER_LOG" >&2
     die "the layer panicked during the run (see the line above)"
 fi
 
@@ -285,7 +285,7 @@ fi
 if grep -q 'depth resolve source view changed' "$LAYER_LOG"; then
     ok "depth resolve engaged"
 
-    # VKINTOX_SMOKE_DEPTH_REFRESH drops the depth selection every 500ms, the
+    # VKHOOK_SMOKE_DEPTH_REFRESH drops the depth selection every 500ms, the
     # same as clicking "Refresh depth buffers", so the rebuild below runs
     # repeatedly while the queue is loaded. A rebuild frees command buffers and
     # tears down resolve targets: getting the fence gating or the safe-mode wait

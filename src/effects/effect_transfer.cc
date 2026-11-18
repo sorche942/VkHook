@@ -1,6 +1,6 @@
 #include "effect_transfer.hh"
 
-namespace VKIntox
+namespace VkHook
 {
     TransferEffect::TransferEffect(LogicalDevice*       logicalDevice,
                                    VkFormat             format,
@@ -85,4 +85,4 @@ namespace VKIntox
     {
     }
 
-} // namespace VKIntox
+} // namespace VkHook

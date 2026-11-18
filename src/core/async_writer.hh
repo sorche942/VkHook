@@ -7,7 +7,7 @@
 #include <mutex>
 #include <thread>
 
-namespace VKIntox
+namespace VkHook
 {
     // Runs slow, order-dependent work (profile and settings writes) on one
     // background thread so the present thread never blocks on disk. Jobs run
@@ -41,6 +41,6 @@ namespace VKIntox
         bool m_stopping = false;
         size_t m_active = 0;
     };
-} // namespace VKIntox
+} // namespace VkHook
 
 #endif // ASYNC_WRITER_HPP_INCLUDED

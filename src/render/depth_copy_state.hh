@@ -8,7 +8,7 @@
 #include <utility>
 #include <vector>
 
-namespace VKIntox
+namespace VkHook
 {
     // v3 deferred depth copy: depth that needs blitting at QueueSubmit time.
     //
@@ -131,6 +131,6 @@ namespace VKIntox
         std::vector<VkFence> m_fences;
         uint32_t m_index = 0;
     };
-} // namespace VKIntox
+} // namespace VkHook
 
 #endif // DEPTH_COPY_STATE_HPP_INCLUDED

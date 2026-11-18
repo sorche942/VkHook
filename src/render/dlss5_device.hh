@@ -4,7 +4,7 @@
 #include <vector>
 #include "vulkan_include.hh"
 
-namespace VKIntox
+namespace VkHook
 {
     struct Dlss5OpticalQueue
     {

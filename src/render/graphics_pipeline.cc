@@ -1,6 +1,6 @@
 #include "graphics_pipeline.hh"
 
-namespace VKIntox
+namespace VkHook
 {
     VkPipelineLayout createGraphicsPipelineLayout(LogicalDevice* logicalDevice, 
                                                    std::vector<VkDescriptorSetLayout> descriptorSetLayouts,
@@ -182,4 +182,4 @@ namespace VKIntox
 
         return pipeline;
     }
-} // namespace VKIntox
+} // namespace VkHook

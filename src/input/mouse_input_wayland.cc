@@ -9,7 +9,7 @@
 #include <chrono>
 #include <cstring>
 
-namespace VKIntox
+namespace VkHook
 {
     // Mouse-specific state (seat/queue come from wayland_input_common)
     static wl_pointer* wlPointer = nullptr;
@@ -290,4 +290,4 @@ namespace VKIntox
 
         return state;
     }
-} // namespace VKIntox
+} // namespace VkHook

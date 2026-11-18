@@ -8,8 +8,8 @@
 #include <string>
 #include <vector>
 
-using VKIntox::DeferredDestroyQueue;
-using VKIntox::DestroyPhase;
+using VkHook::DeferredDestroyQueue;
+using VkHook::DestroyPhase;
 
 namespace
 {

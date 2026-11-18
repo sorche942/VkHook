@@ -15,7 +15,7 @@
 
 #include "logical_device.hh"
 
-namespace VKIntox
+namespace VkHook
 {
     class TransferEffect : public Effect
     {
@@ -37,5 +37,5 @@ namespace VKIntox
         VkFormat             format;
         Config*              config;
     };
-} // namespace VKIntox
+} // namespace VkHook
 #endif // EFFECT_TRANSFER_HPP_INCLUDED

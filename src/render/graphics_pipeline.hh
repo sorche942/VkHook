@@ -11,7 +11,7 @@
 
 #include "logical_device.hh"
 
-namespace VKIntox
+namespace VkHook
 {
     VkPipelineLayout createGraphicsPipelineLayout(LogicalDevice* logicalDevice, 
                                                    std::vector<VkDescriptorSetLayout> descriptorSetLayouts,
@@ -30,6 +30,6 @@ namespace VKIntox
                                       bool                  flip = false,
                                       uint32_t              subpass = 0);
 
-} // namespace VKIntox
+} // namespace VkHook
 
 #endif // GRAPHICS_PIPELINE_HPP_INCLUDED

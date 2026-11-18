@@ -17,7 +17,7 @@ Third-party components used by the build (downloaded or cloned by the scripts, n
 - No scene assets are included. The "Lone Monk" scene (Carlo Bergonzini, CC BY) is referenced by a camera view
   file only.
 
-VKIntox vendor integration:
+VkHook vendor integration:
 - Includes only the OpenDLSS-NR compute host, CPU numeric references, shaders and PTX generators.
 - Uses per-context downstream Vulkan dispatch instead of process-global volk.
 - Adds Linux Meson/Python asset generation, explicit shader/PTX paths, and borrowed-device lifetime handling.

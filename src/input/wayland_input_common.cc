@@ -14,7 +14,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-namespace VKIntox
+namespace VkHook
 {
     static wl_display* displayWrapper = nullptr;
     static wl_event_queue* queue = nullptr;
@@ -166,7 +166,7 @@ namespace VKIntox
         const size_t size = static_cast<size_t>(width) * static_cast<size_t>(height) * 4u;
 
         char name[64];
-        std::snprintf(name, sizeof(name), "/vkintox-input-%d", static_cast<int>(getpid()));
+        std::snprintf(name, sizeof(name), "/vkhook-input-%d", static_cast<int>(getpid()));
         const int fd = shm_open(name, O_RDWR | O_CREAT | O_EXCL, 0600);
         if (fd < 0)
         {
@@ -492,4 +492,4 @@ namespace VKIntox
         commonInitialized = false;
     }
 
-} // namespace VKIntox
+} // namespace VkHook

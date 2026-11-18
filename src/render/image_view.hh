@@ -11,7 +11,7 @@
 
 #include "logical_device.hh"
 
-namespace VKIntox
+namespace VkHook
 {
     std::vector<VkImageView> createImageViews(LogicalDevice*       logicalDevice,
                                               VkFormat             format,

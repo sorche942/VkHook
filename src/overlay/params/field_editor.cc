@@ -1,7 +1,7 @@
 #include "field_editor.hh"
 #include "../../vendor/imgui/imgui.h"
 
-namespace VKIntox
+namespace VkHook
 {
     FieldEditorFactory& FieldEditorFactory::instance()
     {
@@ -44,4 +44,4 @@ namespace VKIntox
         return changed;
     }
 
-} // namespace VKIntox
+} // namespace VkHook

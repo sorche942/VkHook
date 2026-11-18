@@ -12,10 +12,10 @@
 
 #include "logical_device.hh"
 
-namespace VKIntox
+namespace VkHook
 {
     void createShaderModule(LogicalDevice* logicalDevice, const std::vector<char>& code, VkShaderModule* shaderModule);
     void createShaderModule(LogicalDevice* logicalDevice, const std::vector<uint32_t>& code, VkShaderModule* shaderModule);
-} // namespace VKIntox
+} // namespace VkHook
 
 #endif // SHADER_HPP_INCLUDED

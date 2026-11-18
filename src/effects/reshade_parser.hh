@@ -9,7 +9,7 @@
 #include "effects/params/effect_param.hh"
 #include "config.hh"
 
-namespace VKIntox
+namespace VkHook
 {
     // Result of testing a shader for compilation errors
     struct ShaderTestResult
@@ -60,6 +60,6 @@ namespace VKIntox
         const std::string& effectName,
         const std::string& effectPath);
 
-} // namespace VKIntox
+} // namespace VkHook
 
 #endif // RESHADE_PARSER_HPP_INCLUDED

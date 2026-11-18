@@ -20,11 +20,11 @@
 #include "vendor/imgui/imgui.h"
 #include "vendor/imgui/imfilebrowser.h"
 
-namespace VKIntox
+namespace VkHook
 {
     namespace
     {
-        constexpr const char* kEffectReorderPayload = "VKINTOX_EFFECT_REORDER";
+        constexpr const char* kEffectReorderPayload = "VKHOOK_EFFECT_REORDER";
 
         // Render a single preprocessor definition input, returns true if value changed
         bool renderPreprocessorDef(PreprocessorDefinition& def, EffectRegistry* registry, const std::string& effectName)
@@ -626,4 +626,4 @@ namespace VKIntox
             pushToast(LogLevel::Info, "Imported shader preset \"" + imported + "\".");
     }
 
-} // namespace VKIntox
+} // namespace VkHook

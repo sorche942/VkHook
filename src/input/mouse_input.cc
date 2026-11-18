@@ -6,7 +6,7 @@
 #include "mouse_input_wayland.hh"
 #include "mouse_input_x11.hh"
 
-namespace VKIntox
+namespace VkHook
 {
     static void warnUnsupportedMouseOnce(const char* message)
     {
@@ -28,4 +28,4 @@ namespace VKIntox
         warnUnsupportedMouseOnce("unsupported Vulkan surface: mouse polling disabled; returning default state");
         return MouseState();
     }
-} // namespace VKIntox
+} // namespace VkHook

@@ -1,6 +1,6 @@
 #include "imgui_overlay.hh"
 #include "settings_manager.hh"
-#include "vkintox_internal.hh"
+#include "vkhook_internal.hh"
 #include "logger.hh"
 #include "overlay/ui_theme.hh"
 
@@ -11,7 +11,7 @@
 
 #include "vendor/imgui/imgui.h"
 
-namespace VKIntox
+namespace VkHook
 {
     // Dirty flag for deferred saving — avoids blocking the UI thread with
     // synchronous disk I/O on every single checkbox/radio/combo change.
@@ -158,7 +158,7 @@ namespace VKIntox
             else
             {
                 // Pinned view was destroyed since last frame — clear the stale pin
-                // so we fall back to auto.  getDepthState() in vkintox.cpp does the
+                // so we fall back to auto.  getDepthState() in vkhook.cpp does the
                 // same check, but we need it here too so the UI is consistent.
                 Logger::debug("gatherDepthInfo: pinned view no longer tracked, clearing stale pin");
                 logicalDevice->pinnedDepthImageView = VK_NULL_HANDLE;
@@ -555,4 +555,4 @@ namespace VKIntox
         flushSettingsSaveIfNeeded();
     }
 
-} // namespace VKIntox
+} // namespace VkHook

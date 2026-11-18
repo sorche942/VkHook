@@ -288,7 +288,7 @@ namespace
 
                 restoreProtection(pageAddr, pageSize);
 
-                VKIntox::Logger::info("Wayland interpose: gated the marshal entry in " + std::string(info->dlpi_name));
+                VkHook::Logger::info("Wayland interpose: gated the marshal entry in " + std::string(info->dlpi_name));
                 return true;
             }
             return false;
@@ -317,7 +317,7 @@ namespace
     }
 } // namespace
 
-namespace VKIntox
+namespace VkHook
 {
     void* waylandMarshalArrayFlagsForCaller(void* caller)
     {
@@ -359,4 +359,4 @@ namespace VKIntox
         dl_iterate_phdr(scanCallback, &scan);
         return scan.stopped;
     }
-} // namespace VKIntox
+} // namespace VkHook

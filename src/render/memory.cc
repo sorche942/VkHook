@@ -1,6 +1,6 @@
 #include "memory.hh"
 
-namespace VKIntox
+namespace VkHook
 {
     uint32_t findMemoryTypeIndex(LogicalDevice* logicalDevice, uint32_t typeFilter, VkMemoryPropertyFlags properties)
     {
@@ -32,4 +32,4 @@ namespace VKIntox
         Logger::err("No memory type matching filter bits at all");
         return 0xFFFFFFFF;
     }
-} // namespace VKIntox
+} // namespace VkHook

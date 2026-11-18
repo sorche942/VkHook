@@ -2,7 +2,7 @@
 
 #include "mouse_input.hh"
 
-namespace VKIntox
+namespace VkHook
 {
     MouseState getMouseStateX11();
-} // namespace VKIntox
+} // namespace VkHook

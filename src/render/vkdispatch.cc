@@ -12,21 +12,21 @@ namespace
 
     VKAPI_ATTR VkResult VKAPI_CALL gatedQueuePresent(VkQueue queue, const VkPresentInfoKHR* presentInfo)
     {
-        VKIntox::installWaylandInterposeHooks();
+        VkHook::installWaylandInterposeHooks();
 
-        const uint32_t surfaceId = VKIntox::WaylandSyncobjGate::waylandSurfaceId();
+        const uint32_t surfaceId = VkHook::WaylandSyncobjGate::waylandSurfaceId();
         if (surfaceId)
-            VKIntox::WaylandSyncobjGate::beginPresent(surfaceId);
+            VkHook::WaylandSyncobjGate::beginPresent(surfaceId);
 
         const VkResult result = realQueuePresent.load(std::memory_order_acquire)(queue, presentInfo);
 
         if (surfaceId)
-            VKIntox::WaylandSyncobjGate::endPresent(surfaceId);
+            VkHook::WaylandSyncobjGate::endPresent(surfaceId);
         return result;
     }
 } // namespace
 
-namespace VKIntox
+namespace VkHook
 {
 
     void fillDispatchTableInstance(VkInstance instance, PFN_vkGetInstanceProcAddr gipa, InstanceDispatch* table)
@@ -65,4 +65,4 @@ namespace VKIntox
         }
     }
 
-} // namespace VKIntox
+} // namespace VkHook

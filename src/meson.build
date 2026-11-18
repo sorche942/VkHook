@@ -55,7 +55,7 @@ if dlss5_available
         command : [opendlss_nr_python, files('../scripts/generate-dlss5-device-chain.py'), '@INPUT@', '@OUTPUT@'])
     dlss5_sources += [files('effects/effect_dlss5.cc', 'render/dlss5_device.cc', 'render/dlss5_optical_flow.cc'), dlss5_chain]
     dlss5_dependencies += opendlss_nr_dep
-    dlss5_args += '-DVKINTOX_DLSS5=1'
+    dlss5_args += '-DVKHOOK_DLSS5=1'
     dlss5_assets += opendlss_nr_assets
 endif
 summary('DLSS5 PTX backend', dlss5_available)
@@ -89,9 +89,9 @@ overlay_src = [
     'overlay/params/fields/field_uintvec.cc',
 ]
 
-VKIntox_src = [
-    'core/vkintox.cc',
-    'core/vkintox_depth.cc',
+VkHook_src = [
+    'core/vkhook.cc',
+    'core/vkhook_depth.cc',
     'core/async_writer.cc',
     'render/buffer.cc',
     'render/command_buffer.cc',
@@ -169,7 +169,7 @@ if fs.exists('../VERSION')
 endif
 
 conf_version = configuration_data()
-conf_version.set_quoted('VKINTOX_VERSION', version_string)
+conf_version.set_quoted('VKHOOK_VERSION', version_string)
 
 configure_file(output: 'version.hh',
                configuration : conf_version)
@@ -245,28 +245,28 @@ shader_asset_inc = include_directories('effects/shaders')
 # present on the desktop and inside Flatpak runtimes. Optional: without it the
 # shader manager falls back to the in-overlay file browser.
 gio_dep = dependency('gio-2.0', required: false)
-vkintox_deps = [x11_dep, xi_dep, xtst_dep, wayland_client_dep, xkbcommon_dep, reshade_dep] + dlss5_dependencies
-vkintox_cpp_args = ['-DIMGUI_IMPL_VULKAN_NO_PROTOTYPES'] + dlss5_args
+vkhook_deps = [x11_dep, xi_dep, xtst_dep, wayland_client_dep, xkbcommon_dep, reshade_dep] + dlss5_dependencies
+vkhook_cpp_args = ['-DIMGUI_IMPL_VULKAN_NO_PROTOTYPES'] + dlss5_args
 if gio_dep.found()
-    vkintox_deps += gio_dep
-    vkintox_cpp_args += '-DVKINTOX_HAVE_GIO=1'
+    vkhook_deps += gio_dep
+    vkhook_cpp_args += '-DVKHOOK_HAVE_GIO=1'
 endif
 
-vkintox_lib = shared_library('vkintox',
-    VKIntox_src, overlay_src, imgui_src, shader_include, dlss5_sources,
+vkhook_lib = shared_library('vkhook',
+    VkHook_src, overlay_src, imgui_src, shader_include, dlss5_sources,
     link_depends : dlss5_assets,
     link_with: [keyboard_input_x11_lib, mouse_input_lib, input_blocker_lib,
                 x11_display_lib, mouse_input_x11_lib,
                 wayland_input_common_lib, keyboard_input_wayland_lib, mouse_input_wayland_lib,
                 wayland_pointer_constraints_lib, wayland_interpose_lib],
-    include_directories : [VKIntox_include_path, imgui_inc, overlay_inc, effects_inc, effects_params_inc, core_inc, input_inc, render_inc, vendor_inc, include_directories('vendor/reshade'), stb_inc, shader_asset_inc, source_inc],
-    cpp_args : vkintox_cpp_args,
-    dependencies : vkintox_deps,
+    include_directories : [VkHook_include_path, imgui_inc, overlay_inc, effects_inc, effects_params_inc, core_inc, input_inc, render_inc, vendor_inc, include_directories('vendor/reshade'), stb_inc, shader_asset_inc, source_inc],
+    cpp_args : vkhook_cpp_args,
+    dependencies : vkhook_deps,
     gnu_symbol_visibility: 'hidden',
     install : true,
     install_dir : lib_dir)
 
-shader_check = executable('vkintox-shader-check',
+shader_check = executable('vkhook-shader-check',
     'effects/shader_check.cc',
     'effects/reshade_parser.cc',
     'vendor/reshade/effect_codegen_spirv.cc',
@@ -281,7 +281,7 @@ shader_check = executable('vkintox-shader-check',
     'core/config/config_serializer_profile.cc',
     'core/logger.cc',
     'core/util.cc',
-    include_directories : [VKIntox_include_path, imgui_inc, overlay_inc, effects_inc, effects_params_inc, core_inc, input_inc, render_inc, vendor_inc, include_directories('vendor/reshade'), stb_inc, source_inc],
+    include_directories : [VkHook_include_path, imgui_inc, overlay_inc, effects_inc, effects_params_inc, core_inc, input_inc, render_inc, vendor_inc, include_directories('vendor/reshade'), stb_inc, source_inc],
     dependencies : [reshade_dep],
     install : true)
 
@@ -295,7 +295,7 @@ if spirv_validator.found()
     endforeach
 endif
 
-config_serializer_tests = executable('vkintox-config-serializer-tests',
+config_serializer_tests = executable('vkhook-config-serializer-tests',
     'tests/config_serializer_test.cc',
     'core/config/config_serializer.cc',
     'core/config/config_serializer_profile.cc',
@@ -308,7 +308,7 @@ test('config serializer', config_serializer_tests)
 # The variable-font extension to stb_truetype is pure but invisible to CI: a bad
 # download or a gvar/HVAR regression would only show as wrong-looking text. This
 # links the header directly and checks the axes, outlines and advances.
-variable_font_tests = executable('vkintox-variable-font-tests',
+variable_font_tests = executable('vkhook-variable-font-tests',
     'tests/variable_font_test.cc',
     include_directories : [imgui_inc])
 test('variable font', variable_font_tests)
@@ -316,7 +316,7 @@ test('variable font', variable_font_tests)
 # The deferred destroy queue's release order is load-bearing for driver
 # stability and impossible to observe without a real GPU, so it is tested
 # directly rather than only through the smoke test.
-vk_handle_tests = executable('vkintox-vk-handle-tests',
+vk_handle_tests = executable('vkhook-vk-handle-tests',
     'render/vk_handle_test.cc',
     'render/vk_handle.cc',
     'core/logger.cc',
@@ -326,33 +326,33 @@ test('vk handle ordering', vk_handle_tests)
 # X11 input blocking: notification hitboxes remain non-modal, but an interactive
 # menu owns pointer and keyboard for its whole lifetime. Held keys are handed
 # back on close. Uses the real blocker and synthesises input on a display:
-# opt in with VKINTOX_X11_INPUT_TEST=1.
+# opt in with VKHOOK_X11_INPUT_TEST=1.
 libdl_dep = meson.get_compiler('cpp').find_library('dl', required : false)
-x11_input_handoff_tests = executable('vkintox-x11-input-handoff-tests',
+x11_input_handoff_tests = executable('vkhook-x11-input-handoff-tests',
     'tests/x11_input_handoff_test.cc',
     dependencies : [x11_dep, xtst_dep, libdl_dep],
     include_directories : [source_inc])
-test('x11 input handoff', x11_input_handoff_tests, args: [vkintox_lib.full_path()])
+test('x11 input handoff', x11_input_handoff_tests, args: [vkhook_lib.full_path()])
 
 # DepthCopyState serializes the CmdEndRenderPass* -> QueueSubmit handoff and the
 # copy ring against DestroyDevice. A missing lock only shows as an intermittent
 # device loss under load, so the state is hammered directly here.
 threads_dep = dependency('threads')
-depth_copy_state_tests = executable('vkintox-depth-copy-state-tests',
+depth_copy_state_tests = executable('vkhook-depth-copy-state-tests',
     'render/depth_copy_state_test.cc',
     dependencies : [threads_dep],
     include_directories : [render_inc, source_inc])
 test('depth copy state', depth_copy_state_tests)
 
 if dlss5_available
-    dlss5_device_tests = executable('vkintox-dlss5-device-tests',
+    dlss5_device_tests = executable('vkhook-dlss5-device-tests',
         'tests/dlss5_device_test.cc',
         'render/dlss5_device.cc',
         dlss5_chain,
         dependencies : [opendlss_nr_dep],
         include_directories : [core_inc, render_inc, source_inc])
     test('DLSS5 device feature preservation', dlss5_device_tests)
-    dlss5_temporal_gpu = executable('vkintox-dlss5-temporal-gpu-smoke',
+    dlss5_temporal_gpu = executable('vkhook-dlss5-temporal-gpu-smoke',
         'tests/dlss5_temporal_gpu_smoke.cc',
         'render/dlss5_device.cc',
         'render/dlss5_optical_flow.cc',
@@ -363,14 +363,14 @@ if dlss5_available
     test('DLSS5 optical-flow temporal GPU', dlss5_temporal_gpu,
         args : [opendlss_nr_build_shader_dir], timeout : 120)
     # GPU timing and head parity of the network alone: see docs/WORKFLOWS.md.
-    executable('vkintox-dlss5-bench', 'tests/dlss5_network_bench.cc',
+    executable('vkhook-dlss5-bench', 'tests/dlss5_network_bench.cc',
         dependencies : [opendlss_nr_dep, libdl_dep],
         link_depends : dlss5_assets)
 endif
 
 # Link the production recorder and fake only Vulkan dispatch. Section GC keeps
 # unrelated command-buffer allocation/effect code out of the headless executable.
-depth_snapshot_scope_tests = executable('vkintox-depth-snapshot-scope-tests',
+depth_snapshot_scope_tests = executable('vkhook-depth-snapshot-scope-tests',
     'render/depth_snapshot_scope_test.cc',
     'render/command_buffer.cc',
     'render/format.cc',
@@ -381,7 +381,7 @@ depth_snapshot_scope_tests = executable('vkintox-depth-snapshot-scope-tests',
     dependencies : [threads_dep],
     include_directories : [core_inc, render_inc, effects_inc, source_inc])
 test('depth snapshot scope', depth_snapshot_scope_tests,
-    env : ['VKINTOX_LOG_LEVEL=none'])
+    env : ['VKHOOK_LOG_LEVEL=none'])
 
 # The compile cache is what stops a chain reload from re-parsing every ReShade
 # effect. Its keying and bound are the contract, and a missing lock would only
@@ -389,7 +389,7 @@ test('depth snapshot scope', depth_snapshot_scope_tests,
 # The explicit-sync gate's hold-and-release ordering is invisible until a
 # compositor kills the connection over a racing commit, so its state machine
 # is driven directly with threads.
-wayland_syncobj_gate_tests = executable('vkintox-wayland-syncobj-gate-tests',
+wayland_syncobj_gate_tests = executable('vkhook-wayland-syncobj-gate-tests',
     'tests/wayland_syncobj_gate_test.cc',
     'input/wayland_syncobj_gate.cc',
     'core/logger.cc',
@@ -399,7 +399,7 @@ test('wayland syncobj gate', wayland_syncobj_gate_tests)
 
 # The marshal patcher parses live ELF state; reading one dynamic-section
 # pointer with the wrong convention took the whole client down once.
-wayland_interpose_patch_tests = executable('vkintox-wayland-interpose-patch-tests',
+wayland_interpose_patch_tests = executable('vkhook-wayland-interpose-patch-tests',
     'tests/wayland_interpose_patch_test.cc',
     'input/wayland_interpose_patch.cc',
     'core/logger.cc',
@@ -407,13 +407,13 @@ wayland_interpose_patch_tests = executable('vkintox-wayland-interpose-patch-test
     include_directories : [core_inc, input_inc, source_inc])
 test('wayland interpose patch', wayland_interpose_patch_tests)
 
-compile_cache_tests = executable('vkintox-compile-cache-tests',
+compile_cache_tests = executable('vkhook-compile-cache-tests',
     'effects/compile_cache_test.cc',
     dependencies : [threads_dep],
     include_directories : [effects_inc, source_inc])
 test('compile cache', compile_cache_tests)
 
-reshade_texture_pool_tests = executable('vkintox-reshade-texture-pool-tests',
+reshade_texture_pool_tests = executable('vkhook-reshade-texture-pool-tests',
     'effects/reshade_texture_pool_test.cc',
     'effects/reshade_texture_pool.cc',
     'render/format.cc',
@@ -423,7 +423,7 @@ reshade_texture_pool_tests = executable('vkintox-reshade-texture-pool-tests',
 test('reshade texture pool', reshade_texture_pool_tests)
 
 # Temporal ReShade shaders may declare framecount as float, int or uint.
-reshade_uniform_tests = executable('vkintox-reshade-uniform-tests',
+reshade_uniform_tests = executable('vkhook-reshade-uniform-tests',
     'effects/reshade_uniforms_test.cc',
     'effects/reshade_uniforms.cc',
     'core/logger.cc',
@@ -435,22 +435,10 @@ test('reshade uniform sources', reshade_uniform_tests)
 # AsyncWriter is what keeps profile/settings writes off the present thread. Its
 # FIFO order and idle barrier are the contract, and its thread lifetime is the
 # part a mistake would crash on, so it is exercised headless.
-async_writer_tests = executable('vkintox-async-writer-tests',
+async_writer_tests = executable('vkhook-async-writer-tests',
     'core/async_writer_test.cc',
     'core/async_writer.cc',
     'core/logger.cc',
     dependencies : [threads_dep],
     include_directories : [core_inc, source_inc])
 test('async writer', async_writer_tests)
-
-vkintox_run = configure_file(
-    input: '../scripts/vkintox-run.in',
-    output: 'vkintox-run',
-    copy: true,
-)
-
-install_data(
-    vkintox_run,
-    install_dir: get_option('bindir'),
-    install_mode: ['rwxr-xr-x'],
-)

@@ -15,7 +15,7 @@
 
 #include "vendor/imgui/imgui.h"
 
-namespace VKIntox
+namespace VkHook
 {
     namespace
     {
@@ -699,4 +699,4 @@ namespace VKIntox
         ImGui::EndChild();
     }
 
-} // namespace VKIntox
+} // namespace VkHook

@@ -5,7 +5,7 @@
 #include <sstream>
 #include <vector>
 
-namespace VKIntox
+namespace VkHook
 {
     void addUniqueCString(std::vector<const char*>& stringVector, const char* addString);
 
@@ -66,6 +66,6 @@ namespace VKIntox
         ss << object;
         return ss.str();
     }
-} // namespace VKIntox
+} // namespace VkHook
 
 #endif // UTIL_HPP_INCLUDED

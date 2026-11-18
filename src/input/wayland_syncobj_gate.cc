@@ -9,7 +9,7 @@
 #include <thread>
 #include <unordered_map>
 
-namespace VKIntox::WaylandSyncobjGate
+namespace VkHook::WaylandSyncobjGate
 {
     namespace
     {
@@ -108,4 +108,4 @@ namespace VKIntox::WaylandSyncobjGate
         held.store(0, std::memory_order_relaxed);
         budgetMicros.store(100'000, std::memory_order_relaxed);
     }
-} // namespace VKIntox::WaylandSyncobjGate
+} // namespace VkHook::WaylandSyncobjGate

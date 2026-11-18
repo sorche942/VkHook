@@ -4,7 +4,7 @@
 #include "format.hh"
 #include "vk_handle.hh"
 
-namespace VKIntox
+namespace VkHook
 {
     std::vector<VkImage> createImages(LogicalDevice*        logicalDevice,
                                       uint32_t              count,
@@ -437,4 +437,4 @@ namespace VKIntox
                 commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &memoryBarrier);
         }
     }
-} // namespace VKIntox
+} // namespace VkHook

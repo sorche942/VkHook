@@ -5,7 +5,7 @@
 #include <cstdio>
 #include <string>
 
-namespace VKIntox
+namespace VkHook
 {
     // Robust float vector (vec2/3/4) field editor with custom value input via right-click
     class FloatVecFieldEditor : public FieldEditor
@@ -175,4 +175,4 @@ namespace VKIntox
 
     REGISTER_FIELD_EDITOR(ParamType::FloatVec, FloatVecFieldEditor)
 
-} // namespace VKIntox
+} // namespace VkHook

@@ -1,6 +1,6 @@
 #pragma once
 
-namespace VKIntox
+namespace VkHook
 {
     // An overlay hitbox, in surface pixels — the same space as wl_pointer
     // coordinates and x11 window-relative coordinates.
@@ -51,4 +51,4 @@ namespace VKIntox
     bool inputGrabActive();        // X11: a server-side pointer or keyboard grab is up
     bool inputKeyboardWithheld();  // Wayland keys withheld from the game
     bool inputPointerOverOverlay();
-} // namespace VKIntox
+} // namespace VkHook

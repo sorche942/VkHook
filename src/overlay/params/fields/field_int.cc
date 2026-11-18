@@ -4,7 +4,7 @@
 #include <cstdio>
 #include <string>
 
-namespace VKIntox
+namespace VkHook
 {
     // Robust int field editor with custom value input via right-click
     // Supports both slider mode and combo/dropdown mode
@@ -160,4 +160,4 @@ namespace VKIntox
 
     REGISTER_FIELD_EDITOR(ParamType::Int, IntFieldEditor)
 
-} // namespace VKIntox
+} // namespace VkHook

@@ -1,5 +1,5 @@
 option('with_so', type : 'boolean', value : true, description : 'install the library')
 option('with_json', type : 'boolean', value : true, description : 'install the json')
-option('append_libdir_vkintox', type : 'boolean', value : false, description: 'Append "vkintox" to libdir path or not.')
+option('append_libdir_vkhook', type : 'boolean', value : false, description: 'Append "vkhook" to libdir path or not.')
 option('dlss5', type : 'feature', value : 'auto', description : 'OpenDLSS-NR PTX neural rendering (modern Vulkan headers/glslang)')
 option('dlss5_vulkan_registry', type : 'string', value : '/usr/share/vulkan/registry/vk.xml', description : 'Vulkan registry matching the DLSS5 build headers')

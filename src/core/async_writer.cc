@@ -2,7 +2,7 @@
 
 #include "logger.hh"
 
-namespace VKIntox
+namespace VkHook
 {
     AsyncWriter& AsyncWriter::instance()
     {
@@ -86,4 +86,4 @@ namespace VKIntox
         std::unique_lock<std::mutex> lock(m_mutex);
         m_done.wait(lock, [this] { return m_jobs.empty() && m_active == 0; });
     }
-} // namespace VKIntox
+} // namespace VkHook

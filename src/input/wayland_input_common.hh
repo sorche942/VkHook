@@ -4,7 +4,7 @@
 
 #include "input_blocker.hh"
 
-namespace VKIntox
+namespace VkHook
 {
     // Shared Wayland input state — single wl_seat and event queue used by both
     // keyboard and mouse input backends. Avoids binding two separate seats and
@@ -58,4 +58,4 @@ namespace VKIntox
     // first call after beginWaylandInputFrame() does real work.
     void dispatchWaylandInputEvents();
 
-} // namespace VKIntox
+} // namespace VkHook

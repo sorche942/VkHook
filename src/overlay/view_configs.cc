@@ -6,7 +6,7 @@
 
 #include "vendor/imgui/imgui.h"
 
-namespace VKIntox
+namespace VkHook
 {
     void ImGuiOverlay::renderConfigManagerView()
     {
@@ -52,7 +52,7 @@ namespace VKIntox
 
             if (load)
             {
-                // Signal to vkintox.cpp to load this config
+                // Signal to vkhook.cpp to load this config
                 pendingConfigPath = ConfigSerializer::getConfigsDir() + "/" + cfg + ".conf";
                 strncpy(saveConfigName, cfg.c_str(), sizeof(saveConfigName) - 1);
                 applyRequested = true;
@@ -73,4 +73,4 @@ namespace VKIntox
         }
     }
 
-} // namespace VKIntox
+} // namespace VkHook

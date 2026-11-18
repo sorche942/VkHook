@@ -9,7 +9,7 @@
 #include <type_traits>
 #include <vector>
 
-namespace VKIntox
+namespace VkHook
 {
     // Match the other headless LogicalDevice tests: these owners stay null.
     struct OverlayPersistentState {};
@@ -19,7 +19,7 @@ namespace VKIntox
     SettingsManager settingsManager{};
 }
 
-using namespace VKIntox;
+using namespace VkHook;
 
 namespace
 {

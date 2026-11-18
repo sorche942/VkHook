@@ -4,7 +4,7 @@
 
 struct _XDisplay;
 
-namespace VKIntox
+namespace VkHook
 {
     struct MouseState;
     // Shared X11 connection for the input backends and the input blocker. One
@@ -41,4 +41,4 @@ namespace VKIntox
     // Supplies the virtual pointer and event-driven buttons while captured.
     // Raw device deltas, not game-controlled absolute pointer warps, move it.
     bool x11CapturedMouseState(MouseState& state);
-} // namespace VKIntox
+} // namespace VkHook

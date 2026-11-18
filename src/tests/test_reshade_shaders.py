@@ -14,12 +14,12 @@ from pathlib import Path
 
 
 DEFAULT_MANIFEST_URL = (
-    "https://raw.githubusercontent.com/buwryme/VKIntox/refs/heads/main/assets/EffectPackages.ini"
+    "https://raw.githubusercontent.com/sorche942/VkHook/refs/heads/main/assets/EffectPackages.ini"
 )
 
 
 def fetch_manifest(url: str, destination: Path) -> None:
-    request = urllib.request.Request(url, headers={"User-Agent": "VKIntox-tests"})
+    request = urllib.request.Request(url, headers={"User-Agent": "VkHook-tests"})
     with urllib.request.urlopen(request, timeout=60) as response, destination.open("wb") as output:
         shutil.copyfileobj(response, output)
 
@@ -49,7 +49,7 @@ def install_manifest_packages(manifest: Path, work_dir: Path, shader_dir: Path) 
         archive_path = work_dir / f"{section}.zip"
         extract_dir = work_dir / section
         try:
-            request = urllib.request.Request(url, headers={"User-Agent": "VKIntox-tests"})
+            request = urllib.request.Request(url, headers={"User-Agent": "VkHook-tests"})
             with urllib.request.urlopen(request, timeout=120) as response, archive_path.open("wb") as output:
                 shutil.copyfileobj(response, output)
             extract_dir.mkdir(parents=True, exist_ok=True)
@@ -127,9 +127,9 @@ def compile_shaders(shader_check: Path, shader_dir: Path) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--shader-check", required=True, type=Path, help="vkintox-shader-check executable")
+    parser.add_argument("--shader-check", required=True, type=Path, help="vkhook-shader-check executable")
     parser.add_argument("--shader-dir", type=Path, help="use an existing installed shader tree")
-    parser.add_argument("--manifest-url", default=os.environ.get("VKINTOX_EFFECT_PACKAGES_URL", DEFAULT_MANIFEST_URL))
+    parser.add_argument("--manifest-url", default=os.environ.get("VKHOOK_EFFECT_PACKAGES_URL", DEFAULT_MANIFEST_URL))
     args = parser.parse_args()
 
     if not args.shader_check.is_file():
@@ -137,7 +137,7 @@ def main() -> int:
     if args.shader_dir and not args.shader_dir.is_dir():
         parser.error(f"shader directory does not exist: {args.shader_dir}")
 
-    with tempfile.TemporaryDirectory(prefix="vkintox-shader-tests-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="vkhook-shader-tests-") as temporary:
         work_dir = Path(temporary)
         manifest = work_dir / "EffectPackages.ini"
         try:

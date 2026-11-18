@@ -17,7 +17,7 @@
 #include <cerrno>
 #include <cctype>
 
-namespace VKIntox
+namespace VkHook
 {
     // --- Per-app profile system ---
 
@@ -70,7 +70,7 @@ namespace VKIntox
         }
 
         // Create default profile with empty effects
-        std::string contents = "# VKIntox profile for " + gameName + "\n";
+        std::string contents = "# VkHook profile for " + gameName + "\n";
         contents += "# Auto-created on first launch\n\n";
         contents += "effects = \n";
         if (!writeAtomically(profilePath, contents))
@@ -385,7 +385,7 @@ namespace VKIntox
             const auto it = effectPaths.find(effectName);
             if (it != effectPaths.end() && std::filesystem::path(it->second).extension() == ".fx")
                 // ReShade looks up preset sections by the shader filename.
-                // Using VKIntox instance names here makes imported presets lose
+                // Using VkHook instance names here makes imported presets lose
                 // their parameter values in ReShade.
                 return std::filesystem::path(it->second).filename().string();
             return effectName;
@@ -536,7 +536,7 @@ namespace VKIntox
         if (!file.good() || !writeAtomically(path, file.str()))
             return false;
 
-        // the sidecar keeps VKIntox-only state out of the ReShade preset:
+        // the sidecar keeps VkHook-only state out of the ReShade preset:
         // the ordered instance list ("*" marks unchecked) plus values for
         // disabled effects. it is always written so the .ini is recognised
         // as ours and applies its stack exactly on the next load.
@@ -555,7 +555,7 @@ namespace VKIntox
         };
         const std::string sidecarPath = getShaderProfileSidecarPath(path);
         std::ostringstream sidecar;
-        sidecar << "[VKINTOX]\nEffects=";
+        sidecar << "[VKHOOK]\nEffects=";
         for (size_t i = 0; i < effects.size(); ++i)
         {
             if (i) sidecar << ", ";
@@ -686,7 +686,7 @@ namespace VKIntox
                 if (!item.empty()) values.push_back(std::move(item));
                 return values;
             };
-            if (section == "VKINTOX")
+            if (section == "VKHOOK")
             {
                 data.owned = true;
                 if (key == "Effects")
@@ -728,13 +728,13 @@ namespace VKIntox
                 data.techniqueSorting = splitValues(value, ',');
                 continue;
             }
-            if (section.empty() && key == "VKIntoxEffects")
+            if (section.empty() && key == "VkHookEffects")
             {
                 data.hasEffectList = true;
                 data.effects = splitValues(value, ':');
                 continue;
             }
-            if (section.empty() && key == "VKIntoxDisabledEffects")
+            if (section.empty() && key == "VkHookDisabledEffects")
             {
                 data.hasEffectList = true;
                 data.disabledEffects = splitValues(value, ':');
@@ -770,4 +770,4 @@ namespace VKIntox
     }
 
 
-} // namespace VKIntox
+} // namespace VkHook

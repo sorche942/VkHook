@@ -9,7 +9,7 @@
 #include <string>
 #include <vector>
 
-namespace VKIntox
+namespace VkHook
 {
     static std::atomic<bool> blockingEnabled{false};
     static std::atomic<bool> blocked{false};
@@ -182,4 +182,4 @@ namespace VKIntox
         blocked.store(false, std::memory_order_release);
         Logger::debug(std::string("Input blocking ") + (enabled ? "disabled for unsupported surface" : "disabled"));
     }
-} // namespace VKIntox
+} // namespace VkHook

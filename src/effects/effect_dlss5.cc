@@ -18,7 +18,7 @@
 #include <filesystem>
 #include <stdexcept>
 
-namespace VKIntox
+namespace VkHook
 {
     namespace
     {
@@ -117,13 +117,13 @@ namespace VKIntox
         if (input.empty() || input.size() != output.size())
             throw std::runtime_error("DLSS5 input/output image counts differ");
         const auto geometry = nr::Geometry::fromValid(extent.width, extent.height);
-        const std::string modelPath = pathOption(config, "dlss5ModelPath", "VKINTOX_DLSS5_MODEL",
+        const std::string modelPath = pathOption(config, "dlss5ModelPath", "VKHOOK_DLSS5_MODEL",
             (std::filesystem::path(ConfigSerializer::getBaseConfigDir()) / "models/dlss5").string());
         if (!std::filesystem::is_regular_file(std::filesystem::path(modelPath) / "manifest.json"))
-            throw std::runtime_error("DLSS5 model missing: extract your DLL with scripts/extract-dlss5-weights.py and set dlss5ModelPath or VKINTOX_DLSS5_MODEL");
-        const std::string shaderPath = pathOption(config, "dlss5ShaderPath", "VKINTOX_DLSS5_SHADER_DIR",
+            throw std::runtime_error("DLSS5 model missing: extract your DLL with scripts/extract-dlss5-weights.py and set dlss5ModelPath or VKHOOK_DLSS5_MODEL");
+        const std::string shaderPath = pathOption(config, "dlss5ShaderPath", "VKHOOK_DLSS5_SHADER_DIR",
             installedAssets("shaders", DLSS5_SHADER_RELATIVE_DIR, DLSS5_SHADER_DIR));
-        const std::string ptxPath = pathOption(config, "dlss5PtxPath", "VKINTOX_DLSS5_PTX_DIR",
+        const std::string ptxPath = pathOption(config, "dlss5PtxPath", "VKHOOK_DLSS5_PTX_DIR",
             installedAssets("ptx", DLSS5_PTX_RELATIVE_DIR, DLSS5_PTX_DIR));
         auto& s = *state;
         s.device = device;

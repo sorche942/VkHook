@@ -1,7 +1,7 @@
 #include "framebuffer.hh"
 #include "logger.hh"
 
-namespace VKIntox
+namespace VkHook
 {
     std::vector<VkFramebuffer>
     createFramebuffers(LogicalDevice* logicalDevice, VkRenderPass renderPass, VkExtent2D& extent, std::vector<std::vector<VkImageView>> imageViews)
@@ -43,4 +43,4 @@ namespace VKIntox
         }
         return framebuffers;
     }
-} // namespace VKIntox
+} // namespace VkHook

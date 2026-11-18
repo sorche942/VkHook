@@ -11,7 +11,7 @@
 
 #include "logical_device.hh"
 
-namespace VKIntox
+namespace VkHook
 {
     VkDescriptorPool createDescriptorPool(LogicalDevice* logicalDevice, const std::vector<VkDescriptorPoolSize>& poolSizes);
 
@@ -37,6 +37,6 @@ namespace VKIntox
                                                                             VkDescriptorSetLayout                 descriptorSetLayout,
                                                                             std::vector<VkSampler>                samplers,
                                                                             std::vector<std::vector<VkImageView>> imageViewsVectors);
-} // namespace VKIntox
+} // namespace VkHook
 
 #endif // DESCRIPTOR_SET_HPP_INCLUDED

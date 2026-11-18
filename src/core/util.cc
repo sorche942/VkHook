@@ -11,12 +11,12 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#ifdef VKINTOX_HAVE_GIO
+#ifdef VKHOOK_HAVE_GIO
 #include <gio/gio.h>
 #include <glib.h>
 #endif
 
-namespace VKIntox
+namespace VkHook
 {
     void addUniqueCString(std::vector<const char*>& stringVector, const char* addString)
     {
@@ -155,7 +155,7 @@ namespace VKIntox
         return false;
     }
 
-#ifdef VKINTOX_HAVE_GIO
+#ifdef VKHOOK_HAVE_GIO
     namespace
     {
         // GIO talks to org.freedesktop.portal over the session bus, which is the
@@ -254,7 +254,7 @@ namespace VKIntox
             const gchar* sender = g_dbus_connection_get_unique_name(bus);
             std::string sender_token = sender ? (sender + 1) : "0";
             std::replace(sender_token.begin(), sender_token.end(), '.', '_');
-            const std::string token = "vkintox" + std::to_string(g_random_int());
+            const std::string token = "vkhook" + std::to_string(g_random_int());
             const std::string request_path =
                 "/org/freedesktop/portal/desktop/request/" + sender_token + "/" + token;
 
@@ -328,7 +328,7 @@ namespace VKIntox
 
     bool startOpenFileDialog(const std::string& title, const std::vector<std::string>& globFilters)
     {
-#ifdef VKINTOX_HAVE_GIO
+#ifdef VKHOOK_HAVE_GIO
         return startPortalRequest(title, FileDialogKind::OpenFile, globFilters);
 #else
         (void)title;
@@ -339,7 +339,7 @@ namespace VKIntox
 
     bool startOpenDirectoryDialog(const std::string& title)
     {
-#ifdef VKINTOX_HAVE_GIO
+#ifdef VKHOOK_HAVE_GIO
         return startPortalRequest(title, FileDialogKind::OpenDirectory, {});
 #else
         (void)title;
@@ -349,7 +349,7 @@ namespace VKIntox
 
     bool pollFileDialog(FileDialogKind kind, FileDialogResult& outResult, std::string& outPath)
     {
-#ifdef VKINTOX_HAVE_GIO
+#ifdef VKHOOK_HAVE_GIO
         PortalResult result = PortalResult::None;
         if (!pollPortal(kind, result, outPath))
             return false;
@@ -370,10 +370,10 @@ namespace VKIntox
 
     bool fileDialogPending()
     {
-#ifdef VKINTOX_HAVE_GIO
+#ifdef VKHOOK_HAVE_GIO
         return g_portal.pending;
 #else
         return false;
 #endif
     }
-} // namespace VKIntox
+} // namespace VkHook

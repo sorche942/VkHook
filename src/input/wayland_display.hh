@@ -3,7 +3,7 @@
 struct wl_display;
 struct wl_surface;
 
-namespace VKIntox
+namespace VkHook
 {
     // Which graphics WSI the game handed us. The layer processes Wayland and
     // X11; anything else passes straight through.
@@ -42,4 +42,4 @@ namespace VKIntox
 
     // Returns the captured XID, or 0 if not on X11.
     unsigned long getX11Window();
-} // namespace VKIntox
+} // namespace VkHook

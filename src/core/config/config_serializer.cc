@@ -25,7 +25,7 @@
 #include <cctype>
 #include <cmath>
 
-namespace VKIntox
+namespace VkHook
 {
     namespace
     {
@@ -37,10 +37,10 @@ namespace VKIntox
     std::string ConfigSerializer::getBaseConfigDir()
     {
         if (const char* xdgConfig = std::getenv("XDG_CONFIG_HOME"))
-            return std::string(xdgConfig) + "/VKIntox";
+            return std::string(xdgConfig) + "/VkHook";
 
         if (const char* home = std::getenv("HOME"))
-            return std::string(home) + "/.config/VKIntox";
+            return std::string(home) + "/.config/VkHook";
 
         return "";
     }
@@ -171,15 +171,14 @@ namespace VKIntox
     VkBasaltSettings ConfigSerializer::loadSettings()
     {
         VkBasaltSettings settings = DefaultConfig::appSettings();
-        const std::string gameName = detectGameName();
 
         // Check user config first, then fall back to system paths (same order as Config)
-        std::string userConfig = getBaseConfigDir() + "/VKIntox.conf";
+        std::string userConfig = getBaseConfigDir() + "/VkHook.conf";
 
         const std::array<std::string, 3> configPaths = {
             userConfig,
-            std::string(SYSCONFDIR) + "/VKIntox/VKIntox.conf",
-            std::string(SYSCONFDIR) + "/VKIntox.conf",
+            std::string(SYSCONFDIR) + "/VkHook/VkHook.conf",
+            std::string(SYSCONFDIR) + "/VkHook.conf",
         };
 
         std::string configPath;
@@ -195,7 +194,6 @@ namespace VKIntox
 
         if (configPath.empty())
         {
-            DefaultConfig::applyGameDefaults(settings, gameName);
             return settings;
         }
 
@@ -204,12 +202,9 @@ namespace VKIntox
         std::ifstream file(configPath);
         if (!file.is_open())
         {
-            DefaultConfig::applyGameDefaults(settings, gameName);
             return settings;
         }
 
-        bool sawDepthInvert = false;
-        bool sawDepthFlip = false;
         std::string line;
         while (std::getline(file, line))
         {
@@ -339,23 +334,14 @@ namespace VKIntox
             else if (key == "depthInvert")
             {
                 settings.depthInvert = (value == "true" || value == "1");
-                sawDepthInvert = true;
             }
             else if (key == "depthFlip")
             {
                 settings.depthFlip = (value == "true" || value == "1");
-                sawDepthFlip = true;
             }
             else if (key == "depthFlop")
                 settings.depthFlop = (value == "true" || value == "1");
         }
-
-        // an existing config predating the per-game default has no depthInvert
-        // key; seed it so old installs match a fresh one.
-        if (!sawDepthInvert)
-            settings.depthInvert = DefaultConfig::depthInvertForGame(gameName);
-        if (!sawDepthFlip)
-            settings.depthFlip = DefaultConfig::depthFlipForGame(gameName);
 
         return settings;
     }
@@ -371,11 +357,11 @@ namespace VKIntox
 
         mkdir(baseDir.c_str(), 0755);
 
-        std::string configPath = baseDir + "/VKIntox.conf";
+        std::string configPath = baseDir + "/VkHook.conf";
         std::ostringstream file;
 
         // Write settings with comments
-        file << "# VKIntox configuration\n\n";
+        file << "# VkHook configuration\n\n";
 
         file << "# Overlay settings\n";
         const int clampedMaxEffects = std::clamp(settings.maxEffects, MIN_MAX_EFFECTS, MAX_MAX_EFFECTS);
@@ -432,7 +418,7 @@ namespace VKIntox
 
         if (!file.good() || !writeAtomically(configPath, file.str()))
         {
-            Logger::err("Could not write VKIntox.conf: " + configPath);
+            Logger::err("Could not write VkHook.conf: " + configPath);
             return false;
         }
 
@@ -449,7 +435,7 @@ namespace VKIntox
         // Create directory if needed
         mkdir(baseDir.c_str(), 0755);
 
-        std::string configPath = baseDir + "/VKIntox.conf";
+        std::string configPath = baseDir + "/VkHook.conf";
 
         // Only create if no user config exists
         struct stat st;
@@ -457,14 +443,13 @@ namespace VKIntox
             return;
 
         VkBasaltSettings defaults = DefaultConfig::appSettings();
-        DefaultConfig::applyGameDefaults(defaults, detectGameName());
         saveSettings(defaults);
-        Logger::info("Created default VKIntox.conf");
+        Logger::info("Created default VkHook.conf");
     }
 
     bool ConfigSerializer::ensureVersionFile()
     {
-        const std::string version = VKINTOX_VERSION;
+        const std::string version = VKHOOK_VERSION;
         if (version.empty() || version == "unknown")
             return false;
 
@@ -639,16 +624,16 @@ namespace VKIntox
 
         if (!complete)
         {
-            Logger::warn("VKIntox: reshade/packages migration incomplete; leaving it in place");
+            Logger::warn("VkHook: reshade/packages migration incomplete; leaving it in place");
             return;
         }
 
         std::error_code removeError;
         std::filesystem::remove_all(legacy, removeError);
         if (removeError)
-            Logger::warn("VKIntox: could not remove the legacy reshade/packages directory");
+            Logger::warn("VkHook: could not remove the legacy reshade/packages directory");
         else
-            Logger::info("VKIntox: migrated reshade/packages into reshade/");
+            Logger::info("VkHook: migrated reshade/packages into reshade/");
     }
 
     std::vector<std::string> ConfigSerializer::expandShaderIncludePaths(const std::vector<std::string>& roots)
@@ -974,4 +959,4 @@ namespace VKIntox
         return true;
     }
 
-} // namespace VKIntox
+} // namespace VkHook

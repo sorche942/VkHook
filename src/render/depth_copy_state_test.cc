@@ -11,8 +11,8 @@
 #include <thread>
 #include <vector>
 
-using VKIntox::DepthCopyState;
-using VKIntox::DepthState;
+using VkHook::DepthCopyState;
+using VkHook::DepthState;
 
 namespace
 {

@@ -1,4 +1,4 @@
-#include "vkintox_internal.hh"
+#include "vkhook_internal.hh"
 
 #include "image_view.hh"
 #include "image.hh"
@@ -20,18 +20,18 @@
 #include <cstring>
 #include <vector>
 
-namespace VKIntox
+namespace VkHook
 {
 
-// Extracted from vkintox.cc. Everything below is the depth subsystem: tracking
+// Extracted from vkhook.cc. Everything below is the depth subsystem: tracking
 // the application's depth attachment as commands are recorded, choosing a
 // presentable snapshot target for it, resolving it, and retrying when the
 // attachment is not yet usable.
 //
 // The extraction is deliberately mechanical. No behaviour changed, no logic was
 // reorganised, and the only edits are that the functions the interceptors call
-// lost their `static` so they can be declared in vkintox_internal.hh, and the
-// three names the block shares with vkintox.cc became extern.
+// lost their `static` so they can be declared in vkhook_internal.hh, and the
+// three names the block shares with vkhook.cc became extern.
 
     bool handleKeyPress(uint32_t keySymbol, bool& wasPressed)
     {
@@ -151,7 +151,7 @@ namespace VKIntox
     }
 
     // A depth candidate must never be one of the application's real swapchain
-    // images or one of VKIntox's fake colour images.  Size alone is not enough
+    // images or one of VkHook's fake colour images.  Size alone is not enough
     // to distinguish a 1920x1080 depth buffer from a 1920x1080 backbuffer.
     static bool isSwapchainImage(LogicalDevice* logicalDevice, VkImage image)
     {
@@ -237,7 +237,7 @@ namespace VKIntox
         // dimensions happen to be identical to the swapchain extent.
         if (isSwapchainImage(logicalDevice, depth.image))
         {
-            VKINTOX_LOG_DEBUG([&](std::string& s) {
+            VKHOOK_LOG_DEBUG([&](std::string& s) {
                 s = "rejecting depth candidate: image belongs to a swapchain/fake colour image (image="
                     + convertToString(depth.image) + ")";
             });
@@ -247,7 +247,7 @@ namespace VKIntox
         // The state must actually describe a depth/stencil format.
         if (!isDepthStencilAttachmentFormat(depth.format))
         {
-            VKINTOX_LOG_DEBUG([&](std::string& s) {
+            VKHOOK_LOG_DEBUG([&](std::string& s) {
                 s = "rejecting depth candidate: non-depth format (image="
                     + convertToString(depth.image) + " format="
                     + convertToString(depth.format) + ")";
@@ -391,7 +391,7 @@ namespace VKIntox
                 depth.observedLayout = pRenderingInfo->pDepthAttachment->resolveImageLayout != VK_IMAGE_LAYOUT_UNDEFINED
                     ? pRenderingInfo->pDepthAttachment->resolveImageLayout
                     : pRenderingInfo->pDepthAttachment->imageLayout;
-                VKINTOX_LOG_DEBUG([&](std::string& s) {
+                VKHOOK_LOG_DEBUG([&](std::string& s) {
                     s = "depth dynamic rendering: following resolve image view instead of MSAA source (resolveMode="
                         + std::to_string(static_cast<uint32_t>(pRenderingInfo->pDepthAttachment->resolveMode)) + ")";
                 });
@@ -595,7 +595,7 @@ namespace VKIntox
             return;
 
         scopeIt->second.drawCount += additionalDraws;
-        VKINTOX_LOG_DEBUG([&](std::string& s) {
+        VKHOOK_LOG_DEBUG([&](std::string& s) {
             s = "accumulated secondary command buffer draws: primary="
                 + convertToString(primaryCommandBuffer)
                 + " draws=" + std::to_string(additionalDraws)
@@ -716,7 +716,7 @@ namespace VKIntox
         logicalDevice->bestDepthCandidate.extentMatchesPresentableTarget = scopeExtentMatchesPresentableTarget;
         logicalDevice->bestDepthCandidate.drawCount = scopeState.drawCount;
 
-        VKINTOX_LOG_DEBUG([&](std::string& s) {
+        VKHOOK_LOG_DEBUG([&](std::string& s) {
             s = "depth candidate promoted from " + std::string(reason)
                 + ": draws=" + std::to_string(scopeState.drawCount)
                 + " presentable=" + std::string(scopeHasPresentableSnapshotTarget ? "true" : "false")
@@ -740,7 +740,7 @@ namespace VKIntox
             if (hasDepthState(scopeState.depthState) && scopeState.drawCount > 0)
                 logicalDevice->pendingTransferLinkedDepthScopes[commandBuffer] = scopeState;
 
-            VKINTOX_LOG_DEBUG([&](std::string& s) {
+            VKHOOK_LOG_DEBUG([&](std::string& s) {
                 s = "depth candidate not activated from " + std::string(reason)
                     + ": draws=" + std::to_string(scopeState.drawCount)
                     + " presentable=" + std::string(scopeHasPresentableSnapshotTarget ? "true" : "false")
@@ -770,7 +770,7 @@ namespace VKIntox
         scopeState.snapshotTarget = snapshotTarget;
         logicalDevice->pendingTransferLinkedDepthScopes.erase(pendingIt);
 
-        VKINTOX_LOG_DEBUG([&](std::string& s) {
+        VKHOOK_LOG_DEBUG([&](std::string& s) {
             s = "depth candidate transfer-linked from " + std::string(reason)
               + ": draws=" + std::to_string(scopeState.drawCount)
               + " swapchain=" + convertToString(snapshotTarget.swapchain)
@@ -785,7 +785,7 @@ namespace VKIntox
         // candidate checks as the normal render-scope path.
         if (!isQualifiedDepthCandidate(logicalDevice, scopeState))
         {
-            VKINTOX_LOG_DEBUG([&](std::string& s) {
+            VKHOOK_LOG_DEBUG([&](std::string& s) {
                 s = "rejecting transfer-linked depth candidate: image="
                     + convertToString(scopeState.depthState.image)
                     + " extent=" + std::to_string(scopeState.depthState.extent.width)
@@ -823,7 +823,7 @@ namespace VKIntox
         // images aggressively).
         if (!validateDepthStateForResolve(logicalDevice, depthState))
         {
-            VKINTOX_LOG_DEBUG([&](std::string& s) {
+            VKHOOK_LOG_DEBUG([&](std::string& s) {
                 s = "recordDepthResolveSnapshotForCommandBuffer: depth state failed validation; skipping (image="
                     + convertToString(depthState.image) + ")";
             });
@@ -832,7 +832,7 @@ namespace VKIntox
 
         if (snapshotTarget == nullptr || snapshotTarget->swapchain == VK_NULL_HANDLE)
         {
-            VKINTOX_LOG_DEBUG([&](std::string& s) {
+            VKHOOK_LOG_DEBUG([&](std::string& s) {
                 s = "skip depth resolve snapshot: missing snapshot target for commandBuffer="
                     + convertToString(commandBuffer)
                     + " depthImage=" + convertToString(depthState.image)
@@ -845,7 +845,7 @@ namespace VKIntox
         auto swapIt = swapchainMap.find(target.swapchain);
         if (swapIt == swapchainMap.end() || !swapIt->second || swapIt->second->logicalDevice != logicalDevice)
         {
-            VKINTOX_LOG_DEBUG([&](std::string& s) {
+            VKHOOK_LOG_DEBUG([&](std::string& s) {
                 s = "skip depth resolve snapshot: snapshot target swapchain not found for commandBuffer="
                     + convertToString(commandBuffer)
                     + " swapchain=" + convertToString(target.swapchain);
@@ -868,7 +868,7 @@ namespace VKIntox
         // VALIDATE: same rationale as recordDepthResolveSnapshotForCommandBuffer.
         if (!validateDepthStateForResolve(logicalDevice, depthState))
         {
-            VKINTOX_LOG_DEBUG([&](std::string& s) {
+            VKHOOK_LOG_DEBUG([&](std::string& s) {
                 s = "recordDepthResolveSnapshotForAllSwapchains: depth state failed validation; skipping (image="
                     + convertToString(depthState.image) + ")";
             });
@@ -1340,7 +1340,7 @@ namespace VKIntox
     // through before recording commands. Calling this prevents:
     //   - using a depth view whose image was destroyed out from under us
     //   - using a depth image that lacks SAMPLED/TRANSFER_SRC (shouldn't happen
-    //     because VKIntox_CreateImage forces them, but defensive)
+    //     because VkHook_CreateImage forces them, but defensive)
     //   - using a depth state with zero extent (e.g. right after a DestroyImage
     //     race where the state hasn't been cleared yet)
     bool validateDepthStateForResolve(LogicalDevice* logicalDevice, const DepthState& depth)
@@ -1353,7 +1353,7 @@ namespace VKIntox
             return false;
         if (isSwapchainImage(logicalDevice, depth.image))
         {
-            VKINTOX_LOG_DEBUG([&](std::string& s) {
+            VKHOOK_LOG_DEBUG([&](std::string& s) {
                 s = "validateDepthStateForResolve: refusing swapchain/fake colour image as depth (image="
                     + convertToString(depth.image) + ")";
             });
@@ -1364,7 +1364,7 @@ namespace VKIntox
         auto extentIt = logicalDevice->depthImageExtents.find(depth.image);
         if (extentIt == logicalDevice->depthImageExtents.end())
         {
-            VKINTOX_LOG_DEBUG([&](std::string& s) {
+            VKHOOK_LOG_DEBUG([&](std::string& s) {
                 s = "validateDepthStateForResolve: image handle not tracked (image="
                     + convertToString(depth.image) + "), likely destroyed by app";
             });
@@ -1373,7 +1373,7 @@ namespace VKIntox
         const VkExtent3D& tracked = extentIt->second;
         if (tracked.width != depth.extent.width || tracked.height != depth.extent.height || tracked.depth != depth.extent.depth)
         {
-            VKINTOX_LOG_DEBUG([&](std::string& s) {
+            VKHOOK_LOG_DEBUG([&](std::string& s) {
                 s = "validateDepthStateForResolve: extent mismatch (tracked "
                     + std::to_string(tracked.width) + "x" + std::to_string(tracked.height)
                     + " vs depth " + std::to_string(depth.extent.width) + "x" + std::to_string(depth.extent.height)
@@ -1792,7 +1792,7 @@ namespace VKIntox
                 continue;
 
             reallocateCommandBuffers(logicalDevice, logicalSwapchain.get(), effectiveDepth);
-            VKINTOX_LOG_DEBUG([&](std::string& s) {
+            VKHOOK_LOG_DEBUG([&](std::string& s) {
                 s = "reallocated command buffers for swapchain " + convertToString(swapchainHandle) + " (deferred depth change)";
             });
         }
@@ -1805,7 +1805,7 @@ namespace VKIntox
             return;
 
         logicalDevice->activeDepthState = depth;
-        VKINTOX_LOG_DEBUG([&](std::string& s) {
+        VKHOOK_LOG_DEBUG([&](std::string& s) {
             s = std::string("active depth state updated from ") + reason + ": image=" + convertToString(depth.image)
                 + " view=" + convertToString(depth.imageView) + " format=" + convertToString(depth.format)
                 + " extent=" + std::to_string(depth.extent.width) + "x" + std::to_string(depth.extent.height)
@@ -1815,7 +1815,7 @@ namespace VKIntox
         auto metadataIt = logicalDevice->depthImageMetadata.find(depth.image);
         if (metadataIt != logicalDevice->depthImageMetadata.end())
         {
-            VKINTOX_LOG_DEBUG([&](std::string& s) {
+            VKHOOK_LOG_DEBUG([&](std::string& s) {
                 s = std::string("active depth state metadata from ") + reason
                     + ": image=" + convertToString(depth.image)
                     + " usage=0x" + formatHexU64(static_cast<uint64_t>(metadataIt->second.usage))
@@ -1879,4 +1879,4 @@ namespace VKIntox
                             depth);
     }
 
-} // namespace VKIntox
+} // namespace VkHook

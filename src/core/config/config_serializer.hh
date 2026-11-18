@@ -7,7 +7,7 @@
 
 #include "effects/effect_config.hh"
 
-namespace VKIntox
+namespace VkHook
 {
     // Serialized parameter format for config files
     struct ConfigParam
@@ -33,13 +33,13 @@ namespace VKIntox
         bool hasEffectList = false;
         std::vector<std::string> effects;
         std::vector<std::string> disabledEffects;
-        // [VKINTOX] section seen: VKIntox wrote this profile, so the
+        // [VKHOOK] section seen: VkHook wrote this profile, so the
         // instance list is the exact stack and merges nothing
         bool owned = false;
         std::vector<ShaderProfileInstance> instances;
     };
 
-    // global VKIntox settings (from VKIntox.conf); construct through
+    // global VkHook settings (from VkHook.conf); construct through
     // DefaultConfig::appSettings so these members are never left uninitialised.
     struct VkBasaltSettings
     {
@@ -77,7 +77,7 @@ namespace VKIntox
         // using the best-candidate heuristic. "" = auto-promotion.
         std::string depthManualPin;
         // Workaround for transient multisampled depth attachments (Advanced tab).
-        // When true, VKIntox injects its own depth resolve attachment so the
+        // When true, VkHook injects its own depth resolve attachment so the
         // resolved depth survives past the render pass for effects to sample.
         bool depthTransientWorkaround;
         // Depth capture method for persistent storage path (Advanced tab).
@@ -118,7 +118,7 @@ namespace VKIntox
     class ConfigSerializer
     {
     public:
-        // Save a game-specific config to ~/.config/VKIntox/configs/<name>.conf
+        // Save a game-specific config to ~/.config/VkHook/configs/<name>.conf
         // effects: all effects in the list (enabled + disabled)
         // disabledEffects: effects that are unchecked (won't be rendered)
         // params: all effect parameters
@@ -132,10 +132,10 @@ namespace VKIntox
             const std::map<std::string, std::string>& effectPaths = {},
             const std::vector<PreprocessorDefinition>& preprocessorDefs = {});
 
-        // Get the base config directory path (~/.config/VKIntox/)
+        // Get the base config directory path (~/.config/VkHook/)
         static std::string getBaseConfigDir();
 
-        // Get the configs directory path (~/.config/VKIntox/configs/)
+        // Get the configs directory path (~/.config/VkHook/configs/)
         static std::string getConfigsDir();
 
         // List available config files
@@ -149,7 +149,7 @@ namespace VKIntox
         static std::string getDefaultConfig();
         static std::string getDefaultConfigPath();
 
-        // Global settings management (VKIntox.conf)
+        // Global settings management (VkHook.conf)
         static VkBasaltSettings loadSettings();
         static bool saveSettings(const VkBasaltSettings& settings);
 
@@ -157,7 +157,7 @@ namespace VKIntox
         static ShaderManagerConfig loadShaderManagerConfig();
         static bool saveShaderManagerConfig(const ShaderManagerConfig& config);
 
-        // Ensure VKIntox.conf exists with defaults (call early at startup)
+        // Ensure VkHook.conf exists with defaults (call early at startup)
         static void ensureConfigExists();
 
         // Write the running layer version to <config>/version. Keeps the config
@@ -191,7 +191,7 @@ namespace VKIntox
 
         static std::string getShaderProfilePath(const std::string& gameName, const std::string& profileName);
 
-        // Hidden sidecar beside a shader profile holding VKIntox-only state:
+        // Hidden sidecar beside a shader profile holding VkHook-only state:
         // the ordered instance list and values for disabled effects. ReShade
         // never reads it, so the .ini stays cross-compatible.
         static std::string getShaderProfileSidecarPath(const std::string& path);
@@ -238,6 +238,6 @@ namespace VKIntox
             const std::vector<PreprocessorDefinition>& preprocessorDefs = {});
     };
 
-} // namespace VKIntox
+} // namespace VkHook
 
 #endif // CONFIG_SERIALIZER_HPP_INCLUDED

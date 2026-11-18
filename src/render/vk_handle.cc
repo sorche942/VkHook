@@ -6,7 +6,7 @@
 #include "logical_device.hh"
 #include "util.hh"
 
-namespace VKIntox
+namespace VkHook
 {
     DeferredDestroyQueue& DeferredDestroyQueue::instance()
     {
@@ -160,4 +160,4 @@ namespace VKIntox
         return false;
     }
 
-} // namespace VKIntox
+} // namespace VkHook

@@ -1,6 +1,6 @@
 # workflows
 
-GitHub Actions builds VKIntox, runs the unit tests, compiles every ReShade shader from the package list, and smoke-tests the layer under `vkcube`. CI runs on Ubuntu with lavapipe, so the shader and smoke jobs exercise the layer without a GPU.
+GitHub Actions builds VkHook, runs the unit tests, compiles every ReShade shader from the package list, and smoke-tests the layer under `vkcube`. CI runs on Ubuntu with lavapipe, so the shader and smoke jobs exercise the layer without a GPU.
 
 ## vendor subtrees
 
@@ -8,12 +8,12 @@ GitHub Actions builds VKIntox, runs the unit tests, compiles every ReShade shade
 imported with `git subtree --squash`. A normal clone or Git source archive
 contains their complete patched sources; no submodule initialization is needed.
 
-| Prefix | Source repository | Initial imported revision |
-| --- | --- | --- |
-| `src/vendor/imgui` | https://github.com/buwryme/imgui-material-3.git | `80b80599b864489b78b6692a39ed7709c3404b2a` |
-| `src/vendor/reshade` | https://github.com/buwryme/reshade-vkintox.git | `4e296c625414adbc3ff846a363492e977a86780f` |
+| Prefix | Initial imported revision |
+| --- | --- |
+| `src/vendor/imgui` | `80b80599b864489b78b6692a39ed7709c3404b2a` |
+| `src/vendor/reshade` | `4e296c625414adbc3ff846a363492e977a86780f` |
 
-These are the existing VKIntox-specific forks, not direct imports of
+These are VkHook-specific forks, not direct imports of
 `ocornut/imgui` or `crosire/reshade`: extensions, file names and directory
 layouts differ. The migration retained the pinned versions and committed all
 existing local patches separately, including removal of the Material UI and
@@ -21,7 +21,7 @@ the ReShade code-generation fixes. No dependency upgrade was performed.
 
 ### committing local patches
 
-Edit vendor sources in place and commit them in VKIntox:
+Edit vendor sources in place and commit them in VkHook:
 
 ```bash
 git add src/vendor/imgui
@@ -35,13 +35,12 @@ There is no nested repository to commit or push first.
 ### updating a subtree
 
 Start with a clean working tree. Review the source changes and replace `main`
-below with a specific reviewed commit or tag when pinning an update:
+below with a specific reviewed commit or tag when pinning an update. `<fork-url>`
+is the repository of the corresponding vendor fork:
 
 ```bash
-git subtree pull --prefix=src/vendor/imgui \
-    https://github.com/buwryme/imgui-material-3.git main --squash
-git subtree pull --prefix=src/vendor/reshade \
-    https://github.com/buwryme/reshade-vkintox.git main --squash
+git subtree pull --prefix=src/vendor/imgui <imgui-fork-url> main --squash
+git subtree pull --prefix=src/vendor/reshade <reshade-fork-url> main --squash
 ```
 
 These commands merge the update with local patches; resolve conflicts normally.
@@ -49,7 +48,6 @@ Always retain `--squash`. Review theme removals and compiler fixes before
 accepting an update, then build and smoke-test both architectures. Do not point
 these commands at the original upstream repositories without a separate layout
 migration. URLs are used deliberately: local Git remotes are not copied by clone.
-This workstation also has `vendor-imgui` and `vendor-reshade` convenience remotes.
 
 ### exporting patches
 
@@ -57,14 +55,14 @@ Create vendor-only branches when preparing patches for a fork or upstream:
 
 ```bash
 git subtree split --prefix=src/vendor/imgui --branch=patches/imgui HEAD \
-    https://github.com/buwryme/imgui-material-3.git
+    <imgui-fork-url>
 git subtree split --prefix=src/vendor/reshade --branch=patches/reshade HEAD \
-    https://github.com/buwryme/reshade-vkintox.git
+    <reshade-fork-url>
 ```
 
 Use a new branch name if that name already exists. Splitting does not change
 the checked-out application branch or push anything. The exported histories
-start from the corresponding vendor baseline and contain VKIntox's vendor edits.
+start from the corresponding vendor baseline and contain VkHook's vendor edits.
 
 Keep the repository URL on these commands: a fresh clone has the squashed
 vendor sources but may not have the original vendor commit objects. Git can
@@ -82,21 +80,12 @@ do not need that fetch.
   23 depth rebuilds during an 11-second `vkcube` smoke run without crashing.
 - A transport-equivalent clone (`git clone --no-local`) exported both vendor
   histories using the commands above. Exported trees matched the corresponding
-  VKIntox directories and retained their original vendor baseline ancestry.
-
-### local migration backup
-
-Before conversion, both dirty submodule worktrees, binary diffs, complete Git
-bundles, and file/hash inventories were saved outside the checkout under
-`~/.local/state/vkintox/vendor-subtrees-20261018-204334/`.
-Restored vendor files matched the original contents, modes, and symlinks before
-the documentation updates. The old submodule object stores remain in `.git/modules`
-for recovery, but their active local configuration and `.gitmodules` were removed.
+  VkHook directories and retained their original vendor baseline ancestry.
 
 
 ## DLSS5 neural rendering
 
-`DLSS5` is a native effect, not a ReShade `.fx` shader. VKIntox vendors the
+`DLSS5` is a native effect, not a ReShade `.fx` shader. VkHook vendors the
 OpenDLSS-NR Vulkan/PTX implementation in `src/vendor/opendlss_nr`, including its
 license and provenance notice. It borrows the application's device through
 per-device downstream dispatch; it does not create a second Vulkan device.
@@ -114,8 +103,7 @@ per-device downstream dispatch; it does not create a second Vulkan device.
   Use `-Ddlss5=enabled` to require it, or `-Ddlss5=disabled` for other builds.
   Override the registry with `-Ddlss5_vulkan_registry=/path/to/vk.xml`.
 - Both native and i686 builds compile the backend. The regular Meson install
-  includes SPIR-V/PTX assets under `share/vkintox/dlss5`; `install-local.sh`
-  stages them beside each architecture's library instead.
+  includes SPIR-V/PTX assets under `share/vkhook/dlss5`.
   The Flatpak manifest builds pinned glslang 16.6.0 (the 26.08 SDK ships 16.4.0)
   and requires `-Ddlss5=enabled`, so missing build prerequisites fail explicitly
   instead of silently omitting the backend. The compiler is build-only; the
@@ -126,8 +114,8 @@ per-device downstream dispatch; it does not create a second Vulkan device.
   DLSS5; that fallback was exercised through clean shutdown.
 - Temporal history additionally requires `VK_NV_optical_flow`, its feature bit,
   supported image formats/grid size, and a usable optical-flow queue.
-  VKIntox prefers an unused family. If Proton/vkd3d already reserves the separate
-  optical engine, VKIntox shares its ordinary queue zero without changing the
+  VkHook prefers an unused family. If Proton/vkd3d already reserves the separate
+  optical engine, VkHook shares its ordinary queue zero without changing the
   application's queue-create infos. Layer submissions and application queue
   submits, waits, and debug labels use a shared host mutex; GPU work still uses
   semaphore dependencies. Protected or mixed graphics/compute queues are not
@@ -136,13 +124,13 @@ per-device downstream dispatch; it does not create a second Vulkan device.
 
 ### Extract the model
 
-Weights are proprietary, are not bundled, and are never downloaded by VKIntox.
+Weights are proprietary, are not bundled, and are never downloaded by VkHook.
 Supply your own `nvngx_dlssnr_2026_10_16.zip` or its DLL:
 
 ```bash
 python3 scripts/extract-dlss5-weights.py \
   /path/to/nvngx_dlssnr_2026_10_16.zip \
-  "${XDG_CONFIG_HOME:-$HOME/.config}/VKIntox/models/dlss5"
+  "${XDG_CONFIG_HOME:-$HOME/.config}/VkHook/models/dlss5"
 ```
 
 The output directory must not exist. DLL 310.9.16.0 carries two networks of the
@@ -161,7 +149,7 @@ DLL and resource hashes, checks every tensor's shape and storage, then publishes
 by its block count, logs it with the activation memory placed for the current
 resolution (`DLSS5: loaded the small network (31 blocks, 478 MiB of activations)`)
 and verifies each stage's hash before uploading. To switch, extract the other network
-into its own directory and point `dlss5ModelPath` or `VKINTOX_DLSS5_MODEL` at it.
+into its own directory and point `dlss5ModelPath` or `VKHOOK_DLSS5_MODEL` at it.
 Other DLL versions are rejected rather than guessed.
 
 ### Enable
@@ -191,7 +179,7 @@ from -1 to 1.
 | Conditioning control | Default | Behavior |
 | --- | --- | --- |
 | Auto-mask (`autoMask`) | On | Uses the bundled OpenDLSS-NR auto-mask conditioning mode. Off uses global Local structure and ignores Skin structure. This is not an explicit segmentation mask or a guarantee of face/HUD detection. |
-| Style (experimental) (`style`) | 0 | Passed to the model as `style / 128`. VKIntox bounds it to 0–128, an exploratory range rather than a validated visual scale. Zero preserves the previous conditioning input. |
+| Style (experimental) (`style`) | 0 | Passed to the model as `style / 128`. VkHook bounds it to 0–128, an exploratory range rather than a validated visual scale. Zero preserves the previous conditioning input. |
 | Noise seed (`seed`) | 0 | Fixed unsigned 32-bit seed for Gaussian model input. The slider covers 0–65535; right-click **Type in manually...** accepts the full 0–4294967295 range. It does not randomize each frame or select a quality level. |
 
 These defaults preserve the previous model inputs. Controls persist in shader
@@ -207,14 +195,14 @@ Keep the normal `depthCapture = on` setting: the layer's existing depth-transiti
 submission gate is also used for native effects.
 
 The default model directory is shown in the extraction command. Override it
-with `dlss5ModelPath` in the active config or `VKINTOX_DLSS5_MODEL`.
+with `dlss5ModelPath` in the active config or `VKHOOK_DLSS5_MODEL`.
 Uninstalled builds also need the compiled asset directories:
 
 ```bash
-VKINTOX_DLSS5_MODEL="$PWD/build-gcc/dlss5-model" \
-VKINTOX_DLSS5_SHADER_DIR="$PWD/build-gcc/src/vendor/opendlss_nr" \
-VKINTOX_DLSS5_PTX_DIR="$PWD/build-gcc/src/vendor/opendlss_nr" \
-ENABLE_VKINTOX=1 your-application
+VKHOOK_DLSS5_MODEL="$PWD/build-gcc/dlss5-model" \
+VKHOOK_DLSS5_SHADER_DIR="$PWD/build-gcc/src/vendor/opendlss_nr" \
+VKHOOK_DLSS5_PTX_DIR="$PWD/build-gcc/src/vendor/opendlss_nr" \
+ENABLE_VKHOOK=1 your-application
 ```
 
 Equivalent config keys are `dlss5ShaderPath` and `dlss5PtxPath`; explicit config
@@ -228,30 +216,23 @@ transfer path.
 
 ### Heroic Flatpak
 
-Build/install the current checkout for Heroic with:
-
-```bash
-./setup flatpak com.heroicgameslauncher.hgl
-```
-
-This installs the 26.08 Vulkan layer extension and enables `ENABLE_VKINTOX=1`
-for Heroic. A native host installation is separate and does not update this
-extension. The installer needs `just`, Python, `sha256sum`, `flatpak`,
-`flatpak-builder`, `curl`, and `unzip`.
+Heroic uses the 26.08 Vulkan layer extension
+(`org.freedesktop.Platform.VulkanLayer.VkHook`) with `ENABLE_VKHOOK=1`. A native
+host installation is separate and does not update this extension.
 
 Place your already-extracted model directory, containing `manifest.json` and
 the stage files, at:
 
 ```text
-~/.var/app/com.heroicgameslauncher.hgl/config/VKIntox/models/dlss5/
+~/.var/app/com.heroicgameslauncher.hgl/config/VkHook/models/dlss5/
 ```
 
-Alternatively, use `VKINTOX_DLSS5_MODEL` with a path the sandbox can read;
+Alternatively, use `VKHOOK_DLSS5_MODEL` with a path the sandbox can read;
 setting an environment variable alone does not grant filesystem access.
 No shader/PTX path overrides are needed for the installed extension.
 Fully quit Heroic (including its tray process) and the game, then relaunch.
 The log is
-`~/.var/app/com.heroicgameslauncher.hgl/config/VKIntox/vkintox.log`.
+`~/.var/app/com.heroicgameslauncher.hgl/config/VkHook/vkhook.log`.
 
 “Built without DLSS5 support” indicates an old/backend-disabled layer binary,
 not missing weights. A supported build with missing weights instead reports
@@ -259,7 +240,7 @@ the missing model.
 
 Proton/UMU adds a pressure-vessel container inside Heroic's Flatpak. Its imported
 layer symlink can target
-`/run/parent/usr/lib/extensions/vulkan/VKIntox/lib/libvkintox.so`, while the
+`/run/parent/usr/lib/extensions/vulkan/VkHook/lib/libvkhook.so`, while the
 compiled `/usr/lib/extensions/...` asset paths are absent. Library-relative
 lookup handles this remapping without environment overrides or copied kernels.
 A missing `dlss5_luma.spv` at the old absolute path can indicate an older layer
@@ -300,7 +281,7 @@ This is **same-resolution neural rendering**, not super-resolution or frame
 generation. Only RGBA8/BGRA8 UNORM/SRGB swapchains in the SRGB_NONLINEAR color
 space are accepted; HDR is rejected. Alpha is preserved.
 
-VKIntox has no engine motion-vector/reprojection inputs. Instead, the temporal
+VkHook has no engine motion-vector/reprojection inputs. Instead, the temporal
 path estimates current-to-previous and previous-to-current motion from the raw
 game image using NVIDIA hardware optical flow. It reprojects the previous neural
 result with bounded Catmull-Rom filtering, rejecting out-of-bounds pixels,
@@ -323,7 +304,7 @@ part of the final image; visual quality and temporal stability are not guarantee
 Both networks were compared with NVIDIA's own DLL output from DLSSNR-AMD's
 published NGX captures (`docs/ngx-verification`, MIT): one Tomb Raider frame
 at three sizes, evaluated by `nvngx_dlssnr` on an RTX 5090 with the default
-controls and Reset. `vkintox-dlss5-bench --image` ran the same frame here;
+controls and Reset. `vkhook-dlss5-bench --image` ran the same frame here;
 `original` is compared with the 310.8.0 captures (310.9.16's preset 1 gives
 byte-identical output), `small` with the 310.9.16 default preset. "Edit" is the
 output minus the input:
@@ -359,7 +340,7 @@ rejection. The opt-in hardware test runs real optical flow and bridge shaders
 without proprietary weights:
 
 ```bash
-VKINTOX_TEST_DLSS5_GPU=1 meson test -C build-gcc \
+VKHOOK_TEST_DLSS5_GPU=1 meson test -C build-gcc \
   'DLSS5 optical-flow temporal GPU' --print-errorlogs
 ```
 
@@ -379,13 +360,13 @@ lavapipe CI cannot prove it. These checks do not establish NVIDIA DLL parity.
 
 ### Network performance
 
-`vkintox-dlss5-bench` (built with the backend) times the neural network alone on
+`vkhook-dlss5-bench` (built with the backend) times the neural network alone on
 a private Vulkan device with synthetic input features; no weights leave the model
 directory and no window is needed:
 
 ```bash
 B=build-gcc/src/vendor/opendlss_nr
-build-gcc/src/vkintox-dlss5-bench --model build-gcc/dlss5-model-small \
+build-gcc/src/vkhook-dlss5-bench --model build-gcc/dlss5-model-small \
   --shaders "$B" --ptx "$B" --width 3840 --height 2160 --frames 40
 ```
 
@@ -449,7 +430,7 @@ recording a tensor outside its placed interval. The head stays valid after the
 recording; the caller's 16-channel F32 input features (510 MiB at 4K) keep their
 own memory. Only the debug capture options keep one allocation per tensor.
 
-Peak process memory of `vkintox-dlss5-bench` (weights, network and input
+Peak process memory of `vkhook-dlss5-bench` (weights, network and input
 features; no swapchain, history or optical-flow images), RTX 5070 Ti, 30 frames:
 
 | Network | Resolution | Pooled activations | Before | After |
@@ -469,80 +450,19 @@ networks. Interleaved 4K runs showed no GPU time change beyond noise.
 
 This addresses a CONTROL (DX12, vkd3d-proton) crash at 3840×2160 on the 16 GiB
 card. That game alone already exceeded VRAM: vkd3d logged system-memory
-fallbacks even without VKIntox. With DLSS5 adding about 3.9 GB, the session ended
+fallbacks even without VkHook. With DLSS5 adding about 3.9 GB, the session ended
 after 52 minutes. The NVIDIA DRM driver could no longer allocate the compositor's
 Xwayland buffers (`Failed to allocate NVKMS memory for GEM object`), and the game
 exited without an exception. A 2 h 17 min session without DLSS5 had no such errors.
 
 If an effect's auxiliary submission (DLSS5 optical flow) or the frame submission
-waiting on it fails, VKIntox logs `VKIntox panic: …` with the `VkResult` and turns
+waiting on it fails, VkHook logs `VkHook panic: …` with the `VkResult` and turns
 effects off until restart. It no longer fails every later present silently.
 
-## user-local native installation
+## diagnostic shaders
 
-Install existing 64-bit and 32-bit builds without root or changes to `/usr`:
-
-```bash
-scripts/install-local.sh install build-gcc build-zig32
-```
-
-Supply either build to update just that architecture. With no build arguments,
-the default is `build`; relative paths are resolved from the repository root.
-The script detects the architecture from the ELF header, not the directory name.
-It needs Bash, `jq`, `readelf`, and GNU file utilities, plus `patchelf` when a
-build supplies private runtime libraries. Run as your normal user, without `sudo`.
-
-Installed files:
-
-| Architecture | Library under `~/.local/lib/vkintox/` | Manifest under `${XDG_DATA_HOME:-$HOME/.local/share}/vulkan/implicit_layer.d/` |
-| --- | --- | --- |
-| x86-64 | `x86_64/libvkintox.so` | `VKIntox.x86_64.json` |
-| i386 | `i686/libvkintox.so` | `VKIntox.i686.json` |
-
-Both manifests retain the same Vulkan layer name and declare `library_arch`
-(`64` or `32`), allowing the loader to select the matching binary. The old
-single-library installation is migrated automatically, including when adding
-only a 32-bit build to an existing 64-bit installation.
-
-Optional `BUILD_DIR/runtime-libs/` files (`libXi.so.6`, `libXtst.so.6`, and
-`libxkbcommon.so.0`) are copied beside the corresponding layer in `runtime-libs/`.
-The installer checks their architecture and sets absolute private RUNPATHs:
-Steam Runtime's dependency importer did not resolve `$ORIGIN` for these bundled
-dependencies. No global `LD_LIBRARY_PATH` or system package installation is needed.
-Installed files remain usable independently of the checkout. Restart applications
-after an update; running processes retain their existing library mappings.
-
-The installer does not build, download fonts/shader packs, modify user configs,
-or change shell/Steam settings. Activation remains explicit:
-
-```bash
-ENABLE_VKINTOX=1 your-application
-```
-
-For native Steam:
-
-```text
-ENABLE_VKINTOX=1 %command%
-```
-
-Press **Home** to open/close the overlay, **End** to toggle effects, and **F10**
-to reload effects. Do not export `ENABLE_VKINTOX` globally if you want
-per-application activation. `DISABLE_VKINTOX=1` takes precedence.
-Flatpak Steam and Sober still need the separate Flatpak installation.
-
-Remove both architectures, their private runtime libraries, and any legacy
-installation while preserving configs, shaders, fonts, and unrelated files:
-
-```bash
-scripts/install-local.sh uninstall
-```
-
-Use the same `HOME` and `XDG_DATA_HOME` for install and uninstall.
-
-### installed diagnostic shaders
-
-The following files were installed into
-`~/.config/VKIntox/reshade/Shaders/`, an already configured shader search path:
+These effects are used as diagnostics. Install them into
+`~/.config/VkHook/reshade/Shaders/`, an already configured shader search path:
 
 | Effect | What it checks |
 | --- | --- |
@@ -559,7 +479,7 @@ and its headers come from `src/tests/fixtures/` (see its provenance notes).
 To repeat this shader installation from the repository root:
 
 ```bash
-shader_dir="${XDG_CONFIG_HOME:-$HOME/.config}/VKIntox/reshade/Shaders"
+shader_dir="${XDG_CONFIG_HOME:-$HOME/.config}/VkHook/reshade/Shaders"
 mkdir -p "$shader_dir"
 install -m644 src/tests/fixtures/DisplayDepth.fx \
     src/tests/fixtures/DisplayDepth_L10N.fxh src/tests/fixtures/ReShade.fxh \
@@ -580,16 +500,14 @@ cleanly on x86-64, and their visible `vkcube` output was checked.
 This check exposed a cleanup bug for effects without uniforms: the optional
 uniform-buffer handles were uninitialized and teardown could destroy garbage
 handles. They now start at `VK_NULL_HANDLE`; the previously crashing Sepia
-scenario passes through rendering and clean teardown. Both installed layer
-architectures were rebuilt and updated. Restart an already-running game before
+scenario passes through rendering and clean teardown. Restart an already-running game before
 using the new shaders so it loads that correction.
 
 ### installed dh shader pack
 
-The local checkout at
-`/home/sorche/Development/modding/reshade/dh-reshade-shaders` was checked before
+The local `dh-reshade-shaders` checkout was checked before
 installation. These eleven effects were copied into
-`~/.config/VKIntox/reshade/Shaders/`:
+`~/.config/VkHook/reshade/Shaders/`:
 
 - `dh_Lain.fx`
 - `dh_ahoh.fx`
@@ -679,13 +597,13 @@ window. It uses temporary configs and does not change installed presets:
 
 ```bash
 python3 src/tests/test_shared_texture_smoke.py \
-    --layer "$PWD/build-gcc/src/libvkintox.so"
+    --layer "$PWD/build-gcc/src/libvkhook.so"
 # For i686, supply --vkcube /absolute/path/to/a/32-bit/vkcube and its matching layer.
 ```
 
 #### Scene-transition attachment-clear crash
 
-The Proton crash stack and native core identified `VKIntox_CmdClearAttachments`
+The Proton crash stack and native core identified `VkHook_CmdClearAttachments`
 injecting a shader depth snapshot into an active application render pass.
 The snapshot began and ended another render pass before forwarding the game's
 clear. This invalid Vulkan sequence crashed NVIDIA's driver on DXVK's command
@@ -718,8 +636,7 @@ red/green geometry and 0.25/0.75 captured depth, subsequent depth-tested drawing
 remained correct without rebinding the pipeline, and shutdown completed cleanly.
 The installed i686 layer also passed this scenario inside Steam Runtime 4.
 
-Both user-local layers were reinstalled with `scripts/install-local.sh install
-build-gcc build-zig32`. Restart the game to use them; remove `DISABLE_VKINTOX=1` if it
+Both layers were rebuilt and reinstalled. Restart the game to use them; remove `DISABLE_VKHOOK=1` if it
 was added as a temporary bypass. No game presets or shader selections were changed.
 
 For the permanent GPU regression, `python3 src/tests/test_depth_clear_smoke.py
@@ -730,7 +647,7 @@ legacy render passes instead of dynamic rendering.
 
 ### Overlay input, readability, and scrolling
 
-A Proton game's log showed pointer grabs failing with `AlreadyGrabbed` while VKIntox
+A Proton game's log showed pointer grabs failing with `AlreadyGrabbed` while VkHook
 incorrectly reported capture as active. The interactive menu now acquires the
 keyboard first so Wine can relinquish capture, retries the pointer handoff, and
 owns input until close rather than only while the pointer crosses a panel.
@@ -755,11 +672,11 @@ framebuffer height / 900, bounded to 1–2.5×; 3840×2160 selects 2.4×. The de
 font is 18px before scaling. Uncheck Automatic UI scale for the 0.75–3× manual
 slider. Scaling applies after the active interaction ends, so dragging this
 slider does not move its own geometry. `uiScale = 0` in
-`~/.config/VKIntox/VKIntox.conf` means automatic; positive values select manual.
+`~/.config/VkHook/VkHook.conf` means automatic; positive values select manual.
 Each change scales fresh ImGui defaults, avoiding cumulative size growth.
 
 Existing `theme.colors`, downloaded fonts, and old ImGui window records are
-left untouched but no longer control the overlay. The new `VKIntox` window
+left untouched but no longer control the overlay. The new `VkHook` window
 starts with a readable framebuffer-bounded size, rather than inheriting the
 old themed window's dimensions. Shader presets and launch activation are
 unchanged. Installers no longer download or seed theme fonts.
@@ -775,8 +692,7 @@ raw motion versus game warps, held-button release, one-shot wheel delivery, and
 held-key restoration. It fails against the old installed layer and passes with
 the corrected layer. Run it on a disposable display: it synthesizes real input.
 
-Both local layers were rebuilt (GCC x86_64, Zig i686) and installed with
-`scripts/install-local.sh install build-gcc build-zig32`. Actual Vulkan UI checks
+Both local layers were rebuilt (GCC x86_64, Zig i686). Actual Vulkan UI checks
 covered effect selection and parameters, tabs, a preset modal, wheel scrolling,
 window movement/resizing, held-scrollbar stability, and manual-scale persistence.
 Scaling stayed fixed during a drag and applied the selected value on release.
@@ -784,8 +700,8 @@ The installed native layer rendered in `vkcube`; the installed i686 layer
 rendered at 1280×720 and completed both GPU fixture phases with clean shutdown.
 Screenshots from this local run are under `build-gcc/stock-ui/`.
 
-Restart the game to load the updated library. No `LD_PRELOAD`, global activation,
-or system installation was added; shaders and presets were not changed.
+Restart the game to load the updated library. No `LD_PRELOAD` or global activation
+was added; shaders and presets were not changed.
 
 ### CompleteRT compatibility fixes
 
@@ -809,10 +725,10 @@ from locally extracted packages. This is an Arch/CachyOS multilib build, not
 a self-contained binary for arbitrary distributions: X11, Wayland, GLib and
 their remaining 32-bit runtime dependencies must already be available.
 
-The Zig installation used here is:
+Put a Zig toolchain and `patchelf` on `PATH`:
 
 ```bash
-export PATH="$HOME/Apps/zig/zig-x86_64-linux-0.18.0-dev.253+16d31ceed:$HOME/.local/bin:$PATH"
+export PATH="/path/to/zig:$HOME/.local/bin:$PATH"
 uv tool install patchelf
 ```
 
@@ -857,7 +773,6 @@ for name in libXi.so.6 libXtst.so.6 libxkbcommon.so.0; do
 done
 ln -sfn ../runtime-libs build-zig32/src/runtime-libs
 uv tool run --with ninja meson test -C build-zig32 --no-rebuild --print-errorlogs
-scripts/install-local.sh install build-zig32
 ```
 
 The ReShade subtree has small local C++20/libc++ compatibility fixes (qualified
@@ -866,31 +781,6 @@ when updating that subtree. The main source also preserves full-width Vulkan
 handles on i386 and handles both ELF32 REL and ELF64 RELA relocations, including
 Wayland's non-PLT `GLOB_DAT` GOT entries.
 
-### local installation record
-
-The original GCC x86-64 installation was migrated to the architecture-specific
-layout above, and `build-zig32/` was added alongside `build-gcc/`.
-The i386 private dependencies are libXi 1.8.3, libXtst 1.2.5, and xkbcommon 1.13.2.
-`patchelf` was installed as a user-local `uv` tool. No system packages, global
-environment settings, or user shader/config files were changed.
-
-A 32-bit Proton game's diagnostic log confirmed an x86 DXVK build and only 32-bit Steam layers
-in its rendering chain; the old VKIntox installation loaded in 64-bit helper
-processes only. Verification after adding i386:
-
-- Steam Runtime 4's `i386-linux-gnu-check-vulkan` loaded the installed i386
-  VKIntox into its Vulkan device, initialized the overlay, and reported
-  `can-draw: true` on the NVIDIA GPU. Without opt-in it rendered without VKIntox.
-- Native Wayland `vkcube` selected only the x86-64 copy. Its six-second
-  DisplayDepth smoke run passed with depth resolve and 14 depth rebuilds.
-- Nine regression suites passed on each architecture; the opt-in X11 input
-  handoff suite was skipped. The previously failing Wayland hook regression
-  now passes: the library used `GLOB_DAT` rather than the assumed jump slots.
-- Isolated installer checks covered legacy migration, dual installation,
-  individual updates, Steam dependency capture, malformed/mismatched input
-  rejection, repeated uninstall, and preservation of unrelated files.
-
-A 32-bit Proton game was confirmed to load the layer and open its overlay.
 
 ## local checks
 
@@ -925,24 +815,24 @@ Each test is a small `main()` that prints `N checks, M failures` and exits non-z
 
 ## reshade shader check
 
-Compile every shader from the package list fetched by `setup`:
+Compile every shader from the package list:
 
 ```bash
 python3 src/tests/test_reshade_shaders.py \
-  --shader-check build/src/vkintox-shader-check
+  --shader-check build/src/vkhook-shader-check
 ```
 
-This does not need a GPU: `vkintox-shader-check` runs the embedded reshadefx compiler over each `.fx` and exits non-zero if any shader fails. It tells you the compiler integration still builds a real community shader pack, which the unit tests never touch.
+This does not need a GPU: `vkhook-shader-check` runs the embedded reshadefx compiler over each `.fx` and exits non-zero if any shader fails. It tells you the compiler integration still builds a real community shader pack, which the unit tests never touch.
 
 To use an installed shader tree instead of downloading the listed packages, pass its `Shaders` directory:
 
 ```bash
 python3 src/tests/test_reshade_shaders.py \
-  --shader-check build/src/vkintox-shader-check \
-  --shader-dir "$HOME/.var/app/org.vinegarhq.Sober/config/VKIntox/reshade/packages/Shaders"
+  --shader-check build/src/vkhook-shader-check \
+  --shader-dir /path/to/Shaders
 ```
 
-Set `VKINTOX_EFFECT_PACKAGES_URL` to use a different `EffectPackages.ini` URL. The default matches `scripts/setup`.
+Set `VKHOOK_EFFECT_PACKAGES_URL` to use a different `EffectPackages.ini` URL.
 
 ## smoke test
 
@@ -950,10 +840,10 @@ Run `vkcube` under the freshly built layer for a few seconds and fail if the pro
 
 ```bash
 src/tests/smoke_vkcube.sh                                  # 11s against the default build
-src/tests/smoke_vkcube.sh build/src/libvkintox.so 6
+src/tests/smoke_vkcube.sh build/src/libvkhook.so 6
 ```
 
-It needs `vkcube` from `vulkan-tools` and a display. It writes its own layer manifest under a name nothing else uses and sets `VK_LOADER_LAYERS_ENABLE` so that copy is the one in the chain: on a machine with VKIntox already installed, the installed layer would otherwise be discovered too and could shadow the build under test, making a green run validate stale code. The script fails rather than passes if the loader never loaded the library it was pointed at, so a green result always means the layer really ran.
+It needs `vkcube` from `vulkan-tools` and a display. It writes its own layer manifest under a name nothing else uses and sets `VK_LOADER_LAYERS_ENABLE` so that copy is the one in the chain: on a machine with VkHook already installed, the installed layer would otherwise be discovered too and could shadow the build under test, making a green run validate stale code. The script fails rather than passes if the loader never loaded the library it was pointed at, so a green result always means the layer really ran.
 
 It seeds a config with one depth-consuming effect and asserts the effect built a render pass and that a depth attachment was seen, so a run that silently falls back to pass-through fails instead of passing vacuously.
 

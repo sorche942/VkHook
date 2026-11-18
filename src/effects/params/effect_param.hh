@@ -9,7 +9,7 @@
 #include <sstream>
 #include <locale>
 
-namespace VKIntox
+namespace VkHook
 {
     // Locale-independent float-to-string (always uses '.' as decimal separator)
     inline std::string floatToString(float v)
@@ -428,6 +428,6 @@ namespace VKIntox
         return result;
     }
 
-} // namespace VKIntox
+} // namespace VkHook
 
 #endif // EFFECT_PARAM_HPP_INCLUDED

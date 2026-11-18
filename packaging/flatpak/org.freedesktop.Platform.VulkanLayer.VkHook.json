@@ -1,5 +1,5 @@
 {
-  "id": "org.freedesktop.Platform.VulkanLayer.VKIntox",
+  "id": "org.freedesktop.Platform.VulkanLayer.VkHook",
   "branch": "26.08",
   "runtime": "org.freedesktop.Platform",
   "runtime-version": "26.08",
@@ -26,7 +26,7 @@
       "buildsystem": "cmake-ninja",
       "config-opts": [
         "-DCMAKE_BUILD_TYPE=Release",
-        "-DCMAKE_INSTALL_PREFIX=/usr/lib/extensions/vulkan/VKIntox",
+        "-DCMAKE_INSTALL_PREFIX=/usr/lib/extensions/vulkan/VkHook",
         "-DBUILD_SHARED_LIBS=OFF",
         "-DBUILD_EXTERNAL=OFF",
         "-DENABLE_OPT=OFF",
@@ -43,26 +43,26 @@
       ]
     },
     {
-      "name": "vkintox",
+      "name": "vkhook",
       "buildsystem": "meson",
       "build-options": {
         "env": {
           "CC": "/usr/lib/sdk/llvm22/bin/clang",
           "CXX": "/usr/lib/sdk/llvm22/bin/clang++",
-          "CPPFLAGS": "-I/usr/lib/extensions/vulkan/VKIntox/include"
+          "CPPFLAGS": "-I/usr/lib/extensions/vulkan/VkHook/include"
         },
-        "prepend-path": "/usr/lib/extensions/vulkan/VKIntox/bin",
-        "prepend-pkg-config-path": "/usr/lib/extensions/vulkan/VKIntox/lib/pkgconfig"
+        "prepend-path": "/usr/lib/extensions/vulkan/VkHook/bin",
+        "prepend-pkg-config-path": "/usr/lib/extensions/vulkan/VkHook/lib/pkgconfig"
       },
       "config-opts": [
         "--buildtype=release",
-        "--prefix=/usr/lib/extensions/vulkan/VKIntox",
-        "--libdir=/usr/lib/extensions/vulkan/VKIntox/lib",
-        "-Dappend_libdir_vkintox=false",
+        "--prefix=/usr/lib/extensions/vulkan/VkHook",
+        "--libdir=/usr/lib/extensions/vulkan/VkHook/lib",
+        "-Dappend_libdir_vkhook=false",
         "-Dwith_so=true",
         "-Dwith_json=true",
         "-Ddlss5=enabled",
-        "-Dcpp_args=-I/usr/lib/extensions/vulkan/VKIntox/include"
+        "-Dcpp_args=-I/usr/lib/extensions/vulkan/VkHook/include"
       ],
       "sources": [
         {

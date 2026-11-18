@@ -7,7 +7,7 @@
 #include <cstdio>
 #include <utility>
 
-namespace VKIntox
+namespace VkHook
 {
 // The layer still has to hand descriptors and streams to C APIs that have no
 // C++ equivalent, and the compiler cannot see those resources at all. An
@@ -224,6 +224,6 @@ private:
     DIR* handle = nullptr;
 };
 
-} // namespace VKIntox
+} // namespace VkHook
 
 #endif // C_RESOURCE_HPP_INCLUDED

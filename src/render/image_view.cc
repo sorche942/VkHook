@@ -1,6 +1,6 @@
 #include "image_view.hh"
 
-namespace VKIntox
+namespace VkHook
 {
     std::vector<VkImageView> createImageViews(LogicalDevice*       logicalDevice,
                                               VkFormat             format,
@@ -63,4 +63,4 @@ namespace VKIntox
         return imageViews[0];
     }
 
-} // namespace VKIntox
+} // namespace VkHook

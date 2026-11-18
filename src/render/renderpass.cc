@@ -1,6 +1,6 @@
 #include "renderpass.hh"
 
-namespace VKIntox
+namespace VkHook
 {
     VkRenderPass createRenderPass(LogicalDevice* logicalDevice, VkFormat format, VkImageLayout finalLayout)
     {
@@ -380,4 +380,4 @@ namespace VKIntox
 
         return renderPass;
     }
-} // namespace VKIntox
+} // namespace VkHook

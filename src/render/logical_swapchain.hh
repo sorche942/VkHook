@@ -9,7 +9,7 @@
 
 #include "logical_device.hh"
 
-namespace VKIntox
+namespace VkHook
 {
     class Config;
 
@@ -95,6 +95,6 @@ namespace VKIntox
         void destroy();
         void reloadEffects(Config* config);
     };
-} // namespace VKIntox
+} // namespace VkHook
 
 #endif // LOGICAL_SWAPCHAIN_HPP_INCLUDED

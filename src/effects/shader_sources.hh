@@ -3,7 +3,7 @@
 #include <vector>
 #include <cstdint>
 
-namespace VKIntox
+namespace VkHook
 {
     const std::vector<uint32_t> depth_resolve_frag = {
 #include "depth_resolve.frag.h"
@@ -42,4 +42,4 @@ namespace VKIntox
 #include "full_screen_triangle.vert.h"
     };
 
-} // namespace VKIntox
+} // namespace VkHook

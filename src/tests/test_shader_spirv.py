@@ -8,11 +8,11 @@ import tempfile
 
 checker, validator, fixture_name = sys.argv[1:]
 fixture = Path(__file__).resolve().parent / "fixtures" / fixture_name
-with tempfile.TemporaryDirectory(prefix="vkintox-shader-spirv-") as directory:
+with tempfile.TemporaryDirectory(prefix="vkhook-shader-spirv-") as directory:
     module = Path(directory) / "shader.spv"
     subprocess.run(
         [checker, str(fixture), "--include", str(fixture.parent)],
-        env={**os.environ, "VKINTOX_DUMP_SPIRV": str(module)},
+        env={**os.environ, "VKHOOK_DUMP_SPIRV": str(module)},
         check=True,
     )
     subprocess.run([validator, "--target-env", "vulkan1.3", str(module)], check=True)

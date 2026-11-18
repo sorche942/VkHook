@@ -12,7 +12,7 @@
 
 #include "logical_device.hh"
 
-namespace VKIntox
+namespace VkHook
 {
     std::vector<VkImage> createImages(LogicalDevice*        logicalDevice,
                                       uint32_t              count,
@@ -40,6 +40,6 @@ namespace VKIntox
     void changeImageLayout(LogicalDevice* logicalDevice, const std::vector<VkImage>& images, uint32_t mipLevels = 1);
 
     void generateMipMaps(LogicalDevice* logicalDevice, VkCommandBuffer commandBuffer, VkImage image, VkExtent3D extent, uint32_t mipLevels);
-} // namespace VKIntox
+} // namespace VkHook
 
 #endif // IMAGE_HPP_INCLUDED

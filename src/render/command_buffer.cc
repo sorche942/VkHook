@@ -8,7 +8,7 @@
 #include "settings_manager.hh"
 #include "util.hh"
 
-namespace VKIntox
+namespace VkHook
 {
     static bool hasDepthResolveResources(const LogicalSwapchain* logicalSwapchain, size_t commandBufferCount)
     {
@@ -356,7 +356,7 @@ namespace VKIntox
     }
     void writeCommandBuffers(LogicalDevice*                                 logicalDevice,
                              LogicalSwapchain*                              logicalSwapchain,
-                             const std::vector<std::shared_ptr<VKIntox::Effect>>& effects,
+                             const std::vector<std::shared_ptr<VkHook::Effect>>& effects,
                              const std::vector<VkCommandBuffer>&             commandBuffers,
                              const DepthState&                              depthState,
                              uint32_t                                       imageIndex)
@@ -500,7 +500,7 @@ namespace VKIntox
 
         logicalSwapchain->depthResolvePerImage[imageIndex].initialized = true;
 
-        VKINTOX_LOG_DEBUG([&](std::string& s) {
+        VKHOOK_LOG_DEBUG([&](std::string& s) {
             s = "depth MSAA resolve via subpass: image=" + convertToString(depthState.image)
                 + " samples=" + convertToString(depthState.samples)
                 + " mode=" + std::to_string(logicalSwapchain->depthResolveMode)
@@ -597,7 +597,7 @@ namespace VKIntox
 
         logicalSwapchain->depthResolvePerImage[imageIndex].initialized = true;
 
-        VKINTOX_LOG_DEBUG([&](std::string& s) {
+        VKHOOK_LOG_DEBUG([&](std::string& s) {
             s = "depth MSAA transform via fused pass: image=" + convertToString(depthState.image)
                 + " samples=" + convertToString(depthState.samples)
                 + " mode=" + std::to_string(logicalSwapchain->depthResolveMode)
@@ -727,7 +727,7 @@ namespace VKIntox
                                                    0, 0, nullptr, 0, nullptr, 1, &srcBarrier);
         }
 
-        VKINTOX_LOG_DEBUG([&](std::string& s) {
+        VKHOOK_LOG_DEBUG([&](std::string& s) {
             s = "depth MSAA resolve via vkCmdResolveImage: image=" + convertToString(depthState.image)
                 + " samples=" + convertToString(depthState.samples)
                 + " sourceWasGeneral=" + std::string(sourceInGeneral ? "true" : "false");
@@ -809,7 +809,7 @@ namespace VKIntox
         auto logMetadataIt = logicalDevice->depthImageMetadata.find(depthState.image);
         if (logMetadataIt != logicalDevice->depthImageMetadata.end())
         {
-            VKINTOX_LOG_DEBUG([&](std::string& s) {
+            VKHOOK_LOG_DEBUG([&](std::string& s) {
                 s = "depth snapshot source state: commandBuffer=" + convertToString(commandBuffer)
                     + " image=" + convertToString(depthState.image)
                     + " observedLayout=" + convertToString(depthState.observedLayout)
@@ -821,7 +821,7 @@ namespace VKIntox
         }
         else
         {
-            VKINTOX_LOG_DEBUG([&](std::string& s) {
+            VKHOOK_LOG_DEBUG([&](std::string& s) {
                 s = "depth snapshot source state: commandBuffer=" + convertToString(commandBuffer)
                     + " image=" + convertToString(depthState.image)
                     + " observedLayout=" + convertToString(depthState.observedLayout)
@@ -1023,4 +1023,4 @@ namespace VKIntox
         return semaphores;
     }
 
-} // namespace VKIntox
+} // namespace VkHook
