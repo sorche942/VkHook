@@ -9,3 +9,5 @@ build-debug.sh
 .cache/
 
 .flatpak-*/
+__pycache__/
+steam-*.log
