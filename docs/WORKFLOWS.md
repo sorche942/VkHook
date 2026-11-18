@@ -525,12 +525,6 @@ For native Steam:
 ENABLE_VKINTOX=1 %command%
 ```
 
-DDDA can keep its existing mod-loader override:
-
-```text
-ENABLE_VKINTOX=1 WINEDLLOVERRIDES="dinput8=n,b" %command%
-```
-
 Press **Home** to open/close the overlay, **End** to toggle effects, and **F10**
 to reload effects. Do not export `ENABLE_VKINTOX` globally if you want
 per-application activation. `DISABLE_VKINTOX=1` takes precedence.
@@ -558,7 +552,7 @@ The following files were installed into
 | `DebugInvert` | Negative colors; color processing only |
 
 `ReShade.fxh` and `DisplayDepth_L10N.fxh` were installed alongside the effects.
-No DDDA preset was changed and no effects were enabled automatically.
+No preset was changed and no effects were enabled automatically.
 The color-only shaders are maintained in `assets/builtInShaders/`; DisplayDepth
 and its headers come from `src/tests/fixtures/` (see its provenance notes).
 
@@ -630,8 +624,8 @@ Verification: after the include-case correction, all thirteen files compiled
 with the 32-bit checker and completed pipeline-initialization/cleanup probes in
 Steam Runtime 4. The original nine standalone effects were additionally run from
 their final installation paths in native `vkcube`; their visible output and depth
-attachment were checked. DDDA-specific depth selection, tuning, and optional
-shader modes remain separate in-game checks.
+attachment were checked. Per-game depth selection, tuning, and optional shader
+modes remain separate in-game checks.
 
 Use **Shaders → Rescan all**, then **Effects → Add effects…** and search `dh_`.
 Start with one effect at a time. **End** toggles the chain for comparison.
@@ -649,7 +643,7 @@ The motion producer's `texMotionVectors` and Uber RT's sampler now refer to the
 same image. Mipmap barriers include rendering and transfer writes, attachment
 views cover only the base mip, and sRGB views exclude unsupported storage usage.
 
-After restarting DDDA to load the updated layer:
+After restarting the game to load the updated layer:
 
 1. **Shaders → Rescan all**, then add both effects.
 2. Enable and order **`dh_uber_motion` before `dh_uber_rt`**.
@@ -689,7 +683,7 @@ python3 src/tests/test_shared_texture_smoke.py \
 # For i686, supply --vkcube /absolute/path/to/a/32-bit/vkcube and its matching layer.
 ```
 
-#### DDDA scene-transition attachment-clear crash
+#### Scene-transition attachment-clear crash
 
 The Proton crash stack and native core identified `VKIntox_CmdClearAttachments`
 injecting a shader depth snapshot into an active application render pass.
@@ -725,9 +719,8 @@ remained correct without rebinding the pipeline, and shutdown completed cleanly.
 The installed i686 layer also passed this scenario inside Steam Runtime 4.
 
 Both user-local layers were reinstalled with `scripts/install-local.sh install
-build-gcc build-zig32`. Restart DDDA to use them; remove `DISABLE_VKINTOX=1` if it
+build-gcc build-zig32`. Restart the game to use them; remove `DISABLE_VKINTOX=1` if it
 was added as a temporary bypass. No game presets or shader selections were changed.
-DDDA's actual save-load transition still requires an in-game retry.
 
 For the permanent GPU regression, `python3 src/tests/test_depth_clear_smoke.py
 --help` includes native and Zig build/run commands. It requires an unobscured
@@ -737,7 +730,7 @@ legacy render passes instead of dynamic rendering.
 
 ### Overlay input, readability, and scrolling
 
-The DDDA log showed pointer grabs failing with `AlreadyGrabbed` while VKIntox
+A Proton game's log showed pointer grabs failing with `AlreadyGrabbed` while VKIntox
 incorrectly reported capture as active. The interactive menu now acquires the
 keyboard first so Wine can relinquish capture, retries the pointer handoff, and
 owns input until close rather than only while the pointer crosses a panel.
@@ -774,8 +767,8 @@ unchanged. Installers no longer download or seed theme fonts.
 Runtime checks use an isolated Xwayland display and real Vulkan applications.
 The earlier input handoff checks established independent motion despite game
 cursor warps, held-button release, one-shot wheel input, and restoration of game
-capture. This verifies X11/Xwayland, DDDA's observed backend; it does not
-establish native Wayland locked-pointer support or replace an in-game DDDA check.
+capture. This verifies X11/Xwayland; it does not establish native Wayland
+locked-pointer support or replace an in-game check.
 
 The opt-in `x11 input handoff` regression now checks menu-session ownership,
 raw motion versus game warps, held-button release, one-shot wheel delivery, and
@@ -794,164 +787,19 @@ Screenshots from this local run are under `build-gcc/stock-ui/`.
 Restart the game to load the updated library. No `LD_PRELOAD`, global activation,
 or system installation was added; shaders and presets were not changed.
 
-### DDDA native materials and CompleteRT
+### CompleteRT compatibility fixes
 
-CompleteRT 1.6.0.9 was installed from the user-supplied
-`CompleteRT_1_6_0_9.zip` into `~/.config/VKIntox/reshade/Shaders/Complete/`.
-Its blue-noise dependency is under
-`~/.config/VKIntox/reshade/Textures/NiceGuy/BlueNoise-64frames128x128.png`.
-The local adapter modifies `CompleteRT_Main.fxh` and `CompleteFX_Common.fxh`
-and adds `VKIntox_DDDA_CompleteRT.fxh`. Original files were preserved with
-the suffix `.pre-ddda-20261018-162554`; the ZIP and adjacent license remain intact.
-These are private modifications: proprietary CompleteRT source is not shipped
-in this repository and must not be redistributed without the author's permission.
-
-The original, redistributable helper files are maintained in
-`assets/builtInShaders/` and were installed in the root shader search directory:
-
-```bash
-shader_dir="${XDG_CONFIG_HOME:-$HOME/.config}/VKIntox/reshade/Shaders"
-install -m644 assets/builtInShaders/VKIntox_DDDA.fxh \
-    assets/builtInShaders/VKIntox_DDDA_Materials.fx \
-    assets/builtInShaders/VKIntox_DDDA_Diagnostics.fx "$shader_dir/"
-```
-
-#### Activation and effect order
-
-Restart DDDA with:
-
-```text
-ENABLE_VKINTOX=1 VKINTOX_DDDA_GBUFFER=1 WINEDLLOVERRIDES="dinput8=n,b" %command%
-```
-
-The new capture path is separately opt-in. No global environment, Steam launch
-options, or existing game presets were changed. RenderDoc and
-`ENABLE_VULKAN_RENDERDOC_CAPTURE` are not needed for normal use.
-Neither `DISABLE_VKINTOX` nor `DXVK_DEBUG=markers` is required.
-Current [DXVK emits SPIR-V debug names unconditionally](https://github.com/doitsujin/dxvk/blob/master/src/dxvk/dxvk_shader_ir.cpp);
-builds that strip the identifying metadata fall back rather than guessing.
-
-Use **Shaders → Rescan all**, add these effects, and arrange them in this order:
-
-1. `dh_uber_motion.fx`
-2. `VKIntox_DDDA_Materials.fx`
-3. `Complete/COMPLETE_RT.fx`
-4. `VKIntox_DDDA_Diagnostics.fx` — optional, last; disable for gameplay.
-
-Disable `dh_uber_rt.fx` while comparing CompleteRT, rather than stacking two
-lighting effects unintentionally. Keep CompleteRT's
-`C_RT_USE_LAUNCHPAD_MOTIONS=0`: it consumes DH's shared `texMotionVectors`
-directly, with `previousUV-currentUV` coordinates; no Launchpad addon is needed.
-These are estimated optical-flow vectors, not native game velocity.
-
-CompleteRT's **DDDA source status strip** is an optional small status indicator:
-red means no native source; orange means the producer is absent/out of order;
-green means the current producer and source are available. The separate
-Diagnostics effect exposes validity, normals, specular exponent, light groups,
-roughness, metallic/skin/hair confidence, and normal-agreement views.
-Magenta pixels in validity/material diagnostics are uncovered/invalid native
-pixels, not a reason to force the native path on. CompleteRT uses its original
-depth/color-derived behavior there.
-
-Native normals default on; estimated roughness blend defaults to 1. For a
-conservative comparison, set **DDDA HEURISTIC specular F0 blend** to 0 first,
-then increase it only after inspecting the confidence maps. Its installed
-default is 0.5. The DDDA camera FOV override and depth-normal fallback default
-to the captured vertical FOV of 55 degrees; adjust both if a camera mod changes it.
-
-#### What is real, and what is estimated
-
-| Output | Meaning |
-| --- | --- |
-| Normal XYZ | Native view-space normals, including the game's material normal maps |
-| Specular exponent | Native legacy lobe exponent, decoded from G-buffer B |
-| Light-group ID | Native alpha byte; a lighting group, **not** a material class |
-| Perceptual roughness | Approximation `(2 / (exponent + 2))^(1/4)`, with calibration controls |
-| Metallic confidence | Adjustable sharp-lobe/lit-color heuristic |
-| Skin confidence | Adjustable chroma/lobe/local-contrast heuristic |
-| Hair confidence | Adjustable dark/directional-texture/lobe heuristic |
-
-Lit scene color is not albedo. Wood, leather, water, foliage, fabric and lighting
-can fool the estimates. Confidence is not a probability or semantic segmentation.
-Optional light-group gates are user-selected filters, not built-in skin/hair IDs.
-The adapter uses these estimates for roughness and scalar Fresnel F0; it does not
-add subsurface scattering, colored-metal albedo, or anisotropic hair scattering.
-Screen-space RT still lacks off-screen/occluded scene data and can ghost during
-disocclusion. Native normals do not remove those limitations.
-
-The shared interface is `VKIntox_DDDA.fxh`: signed RH view normals in
-`VKIntox_DDDA_NormalTex`; roughness/metallic/skin/hair in
-`VKIntox_DDDA_MaterialTex`; exponent/group/depth/validity in
-`VKIntox_DDDA_NativeTex`. A separate RGBA32F status texel carries exact low/high
-16-bit frame words and validity, preventing disabled or out-of-order producers
-from silently reusing old maps. CompleteRT converts normals to its own convention
-as `(-x,+y,+z)` and does its own GGX roughness squaring.
-
-#### Capture and compatibility checks
-
-The engine identifies the actual DDDA producer shader, its sphere-normal and
-log-exponent packing, and its BGRA8 attachment. No RenderDoc resource IDs are
-hard-coded. Opaque RGBA writes and blended RGB-only writes that preserve the
-light-group alpha are supported. Copies occur outside render scopes, into
-owned snapshots; application layouts are restored. Missing submissions and
-extent mismatches report unavailable rather than retaining old scene data.
-
-The path requires one queue in the effect graphics family, single-sample,
-single-layer attachments, and supported render scopes. Other-family submissions,
-ambiguous same-family queues, suspended/resumed rendering, multiview, imageless
-or multi-subpass legacy rendering and unsupported producer metadata fail closed.
-Per-image fences protect descriptor replacement; affected effect command buffers
-are re-recorded before submission without requiring descriptor-indexing features.
-
-The saved DDDA frame 3038 contains 380 main G-buffer draws using 40 fragment
-shader variants. All 40 pass the production classifier; the scene-color writer
-is rejected. The captured device requests one queue each in families 0 and 1,
-matching the queue safety requirement. Zero light-group pixels in this capture
-are outside the normal encoding domain; all nonzero groups are inside it.
-
-CompleteRT also exposed an engine uniform bug: a float `source="framecount"`
+CompleteRT exposed an engine uniform bug: a float `source="framecount"`
 received integer bit patterns (frame 1 became `1.4013e-45`). The source now writes
-numeric floats while preserving integer/unsigned counters. Regression coverage
-also checks missing-frame invalidation, queue ambiguity, dynamic output state,
-secondary-command-buffer ownership, and snapshot recycling.
+numeric floats while preserving integer/unsigned counters.
 
-Two additional compiler fixes were necessary for CompleteRT: scalar texel-fetch
-coordinates must use signed zero components, and `out`/`inout` values must be cast
-back to the caller's original l-value type (including swizzles and array elements).
-Both previously generated invalid SPIR-V despite successful frontend compilation.
-Small original fixtures now run through `spirv-val` when that tool is available.
-The private CompleteRT copy also fixes the disabled-filter paths in spatial
-passes 1 and 3 to read their input ping-pong texture, not the attachment being
-cleared and written. File-backed sRGB sampling views no longer inherit unsupported
-storage-image usage from the underlying UNORM image.
-
-The GPU regression uses isolated configuration, not the installed game preset:
-
-```bash
-python3 src/tests/test_depth_clear_smoke.py --native-material \
-    --binary "$PWD/build-gcc/depth-clear-smoke" \
-    --layer "$PWD/build-gcc/src/libvkintox.so" --artifacts "$PWD/build-gcc"
-# Add --legacy for ordinary render passes; use matching i686 paths for Proton.
-```
-
-Installed both verified libraries with
-`scripts/install-local.sh install build-gcc build-zig32`. Each architecture's
-Meson run passed 15 tests and skipped the opt-in X11 handoff test. GPU checks
-passed on both architectures with dynamic rendering and legacy render passes:
-native binding, missing-frame invalidation, source resize, RGB-only blended
-writers, recovery, and shutdown. The installed i686 library also rendered the
-DH Motion → DDDA Materials → CompleteRT chain; CompleteRT's own normal-debug
-output matched the synthetic native normal. Separate pixel checks verified the
-roughness map and missing-producer warning. These are isolated GPU fixtures and
-saved-capture checks, **not a live DDDA gameplay verification**.
-
-Vulkan validation is not globally clean: swapchain initial-layout and binary
-semaphore diagnostics (`01430`, `09600`, `00067`) remain. The previous installed
-library reproduced these in the ordinary depth fixture without native capture.
-The final CompleteRT runs no longer reported the shader-module, sRGB usage, or
-render-target sampling-layout errors fixed above. Validation logs and screenshots
-are retained under `build-gcc/` and `build-zig32/`; the baseline comparison is
-`build-gcc/depth-clear-qnncti22/`.
+Two compiler fixes were also necessary: scalar texel-fetch coordinates must use
+signed zero components, and `out`/`inout` values must be cast back to the caller's
+original l-value type (including swizzles and array elements). Both previously
+generated invalid SPIR-V despite successful frontend compilation. Small original
+fixtures now run through `spirv-val` when that tool is available. File-backed sRGB
+sampling views no longer inherit unsupported storage-image usage from the
+underlying UNORM image.
 
 ### Zig 32-bit build on this workstation
 
@@ -1026,7 +874,7 @@ The i386 private dependencies are libXi 1.8.3, libXtst 1.2.5, and xkbcommon 1.13
 `patchelf` was installed as a user-local `uv` tool. No system packages, global
 environment settings, or user shader/config files were changed.
 
-DDDA's diagnostic log confirmed an x86 DXVK build and only 32-bit Steam layers
+A 32-bit Proton game's diagnostic log confirmed an x86 DXVK build and only 32-bit Steam layers
 in its rendering chain; the old VKIntox installation loaded in 64-bit helper
 processes only. Verification after adding i386:
 
@@ -1042,8 +890,7 @@ processes only. Verification after adding i386:
   individual updates, Steam dependency capture, malformed/mismatched input
   rejection, repeated uninstall, and preservation of unrelated files.
 
-The user confirmed that DDDA loads the layer and opens its overlay. Depth-buffer
-selection and the diagnostic shaders still need checking in the actual game.
+A 32-bit Proton game was confirmed to load the layer and open its overlay.
 
 ## local checks
 

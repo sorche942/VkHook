@@ -15,7 +15,6 @@
 #include <vector>
 #include <poll.h>
 #include <unistd.h>
-#include "native_material_smoke_spirv.hh"
 
 static void check(VkResult result, const char* operation)
 {
@@ -62,12 +61,7 @@ int main(int argc, char** argv)
     try {
         uint32_t width = 640, height = 480;
         bool dynamicRendering = true;
-        bool nativeMaterial = false;
         for (int i = 1; i < argc; ++i) {
-            if (std::strcmp(argv[i], "--native-material") == 0) {
-                nativeMaterial = true;
-                continue;
-            }
             if (std::strcmp(argv[i], "--legacy") == 0) {
                 dynamicRendering = false;
                 continue;
@@ -176,8 +170,7 @@ int main(int argc, char** argv)
         VK_CHECK(vkGetPhysicalDeviceSurfaceFormatsKHR(physical, surface, &count, formats.data()));
         VkSurfaceFormatKHR format{};
         for (const auto& candidate : formats)
-            if ((candidate.format == VK_FORMAT_B8G8R8A8_UNORM
-                 || (!nativeMaterial && candidate.format == VK_FORMAT_R8G8B8A8_UNORM))
+            if ((candidate.format == VK_FORMAT_B8G8R8A8_UNORM || candidate.format == VK_FORMAT_R8G8B8A8_UNORM)
                 && candidate.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
                 format = candidate;
                 break;
@@ -310,10 +303,7 @@ int main(int argc, char** argv)
             return module;
         };
         VkShaderModule vertex = shader(vertexCode, sizeof(vertexCode));
-        const auto nativeCode = nativeMaterialSmokeSpirv();
-        VkShaderModule fragment = nativeMaterial
-            ? shader(nativeCode.data(), nativeCode.size() * sizeof(uint32_t))
-            : shader(fragmentCode, sizeof(fragmentCode));
+        VkShaderModule fragment = shader(fragmentCode, sizeof(fragmentCode));
         VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         VkPipelineLayout layout;
         VK_CHECK(vkCreatePipelineLayout(device, &layoutInfo, nullptr, &layout));
@@ -339,7 +329,7 @@ int main(int argc, char** argv)
         depthState.depthWriteEnable = VK_TRUE;
         depthState.depthCompareOp = VK_COMPARE_OP_LESS;
         VkPipelineColorBlendAttachmentState blendAttachment{};
-        blendAttachment.blendEnable = nativeMaterial ? VK_FALSE : VK_TRUE;
+        blendAttachment.blendEnable = VK_TRUE;
         blendAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_CONSTANT_COLOR;
         blendAttachment.dstColorBlendFactor = VK_BLEND_FACTOR_ZERO;
         blendAttachment.colorBlendOp = VK_BLEND_OP_ADD;
@@ -374,13 +364,6 @@ int main(int argc, char** argv)
         pipelineInfo.renderPass = renderPass;
         VkPipeline pipeline;
         VK_CHECK(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &pipeline));
-        VkPipeline rgbBlendPipeline = VK_NULL_HANDLE;
-        if (nativeMaterial) {
-            blendAttachment.blendEnable = VK_TRUE;
-            blendAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
-            blendAttachment.colorWriteMask = 7; // DDDA alpha-tested producers preserve group alpha.
-            VK_CHECK(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &rgbBlendPipeline));
-        }
 
         VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         bufferInfo.size = 8;
@@ -415,31 +398,7 @@ int main(int argc, char** argv)
         VK_CHECK(vkCreateSemaphore(device, &semaphoreInfo, nullptr, &acquired));
         for (auto& semaphore : finished)
             VK_CHECK(vkCreateSemaphore(device, &semaphoreInfo, nullptr, &semaphore));
-        for (unsigned phase = 0; phase != (nativeMaterial ? 5u : 2u); ++phase) {
-            if (nativeMaterial && (phase == 2 || phase == 3)) {
-                // Prior phase waited for the queue. Reset the CB before
-                // destroying its recorded application attachment references.
-                VK_CHECK(vkResetCommandBuffer(command, 0));
-                if (framebuffer) vkDestroyFramebuffer(device, framebuffer, nullptr);
-                vkDestroyImageView(device, color.view, nullptr);
-                vkDestroyImage(device, color.image, nullptr);
-                vkFreeMemory(device, color.memory, nullptr);
-                width = phase == 2 ? extent.width / 2 : extent.width;
-                height = phase == 2 ? extent.height / 2 : extent.height;
-                color = makeImage(format.format, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
-                                  VK_IMAGE_ASPECT_COLOR_BIT);
-                if (!dynamicRendering) {
-                    const VkImageView views[] = {color.view, depth.view};
-                    VkFramebufferCreateInfo info{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
-                    info.renderPass = renderPass;
-                    info.attachmentCount = 2;
-                    info.pAttachments = views;
-                    info.width = width;
-                    info.height = height;
-                    info.layers = 1;
-                    VK_CHECK(vkCreateFramebuffer(device, &info, nullptr, &framebuffer));
-                }
-            }
+        for (unsigned phase = 0; phase != 2u; ++phase) {
             bool readyAnnounced = false;
             for (unsigned frame = 0;; ++frame) {
                 uint32_t index;
@@ -471,7 +430,6 @@ int main(int argc, char** argv)
                     colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
                     colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
                     colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-                    if (nativeMaterial && phase == 3) colorAttachment.clearValue.color.float32[3] = 1.0f / 255.0f;
                     VkRenderingAttachmentInfo depthAttachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
                     depthAttachment.imageView = depth.view;
                     depthAttachment.imageLayout = depthLayout;
@@ -487,7 +445,6 @@ int main(int argc, char** argv)
                     vkCmdBeginRendering(command, &rendering);
                 } else {
                     VkClearValue clears[2]{};
-                    if (nativeMaterial && phase == 3) clears[0].color.float32[3] = 1.0f / 255.0f;
                     clears[1].depthStencil = {1.0f, 0};
                     VkRenderPassBeginInfo pass{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
                     pass.renderPass = renderPass;
@@ -497,8 +454,7 @@ int main(int argc, char** argv)
                     pass.pClearValues = clears;
                     vkCmdBeginRenderPass(command, &pass, VK_SUBPASS_CONTENTS_INLINE);
                 }
-                vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                  nativeMaterial && phase == 3 ? rgbBlendPipeline : pipeline);
+                vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
                 VkRect2D scissor{{0, 0}, {width, height}};
                 vkCmdSetScissor(command, 0, 1, &scissor);
                 auto draw = [&](float z, float r, float g, float b) {
@@ -508,9 +464,8 @@ int main(int argc, char** argv)
                     vkCmdSetBlendConstants(command, constants);
                     vkCmdDraw(command, 3, 1, 0, 0);
                 };
-                if (!nativeMaterial || (phase != 1 && phase != 4))
-                    draw(0.25f, 1, 0, 0);
-                if (!nativeMaterial && phase) {
+                draw(0.25f, 1, 0, 0);
+                if (phase) {
                     VkClearAttachment clear{};
                     clear.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
                     clear.clearValue.depthStencil.depth = 0.9f;
@@ -594,19 +549,6 @@ int main(int argc, char** argv)
                 VK_CHECK(vkQueueWaitIdle(queue));
                 const auto* pixels = static_cast<const uint8_t*>(mapped);
                 for (unsigned i = 0; i != 2; ++i) {
-                    if (nativeMaterial) {
-                        const bool missing = phase == 1 || phase == 4;
-                        const uint8_t expected[] = {
-                            uint8_t(missing ? 0 : 110), uint8_t(missing ? 0 : 128),
-                            uint8_t(missing ? 0 : 128), uint8_t(missing ? 0 : 1)};
-                        for (unsigned channel = 0; channel < 4; ++channel)
-                            if (std::abs(int(pixels[i * 4 + channel]) - int(expected[channel])) > (channel == 3 ? 0 : 1))
-                                throw std::runtime_error("native BGRA8 producer readback mismatch phase=" + std::to_string(phase)
-                                    + " frame=" + std::to_string(frame) + " channel=" + std::to_string(channel)
-                                    + " actual=" + std::to_string(pixels[i * 4 + channel])
-                                    + " expected=" + std::to_string(expected[channel]));
-                        continue;
-                    }
                     const unsigned red = format.format == VK_FORMAT_B8G8R8A8_UNORM ? 2 : 0;
                     const unsigned blue = 2 - red;
                     const bool green = phase && i == 0;
@@ -617,9 +559,7 @@ int main(int argc, char** argv)
                 }
                 if (frame + 1 >= 120) {
                     if (!readyAnnounced) {
-                        const char* nativePhases[] = {"native", "missing", "resized", "restored", "missing-again"};
-                        std::printf("READY phase=%s color_readback=PASS frames=%u\n",
-                                    nativeMaterial ? nativePhases[phase] : (phase ? "clear" : "warmup"), frame + 1);
+                        std::printf("READY phase=%s color_readback=PASS frames=%u\n", phase ? "clear" : "warmup", frame + 1);
                         std::fflush(stdout);
                         readyAnnounced = true;
                     }
@@ -645,7 +585,6 @@ int main(int argc, char** argv)
         vkDestroyBuffer(device, readback, nullptr);
         vkFreeMemory(device, readbackMemory, nullptr);
         vkDestroyPipeline(device, pipeline, nullptr);
-        if (rgbBlendPipeline) vkDestroyPipeline(device, rgbBlendPipeline, nullptr);
         vkDestroyPipelineLayout(device, layout, nullptr);
         vkDestroyShaderModule(device, fragment, nullptr);
         vkDestroyShaderModule(device, vertex, nullptr);

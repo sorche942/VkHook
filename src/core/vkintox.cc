@@ -39,7 +39,6 @@
 #include "logical_device.hh"
 #include "vk_handle.hh"
 #include "logical_swapchain.hh"
-#include "native_capture.hh"
 
 #include "image_view.hh"
 #include "image.hh"
@@ -2078,22 +2077,6 @@ namespace VKIntox
                 break;
             }
         }
-        if (nativeCaptureEnabled())
-        {
-            logicalDevice->nativeCapture = std::make_shared<NativeCapture>();
-            auto& native = *logicalDevice->nativeCapture;
-            native.queueFamily = logicalDevice->queueFamilyIndex;
-            uint32_t graphicsQueueCount = 0;
-            for (uint32_t i = 0; i < pCreateInfo->queueCreateInfoCount; ++i)
-                if (pCreateInfo->pQueueCreateInfos[i].queueFamilyIndex == native.queueFamily)
-                    graphicsQueueCount += pCreateInfo->pQueueCreateInfos[i].queueCount;
-            // A recorded CB may be submitted to any queue in its pool's family.
-            // With multiple queues we cannot prove that a future replay won't
-            // overwrite a snapshot while an effect on another queue reads it.
-            native.queueSafe = logicalDevice->queue && graphicsQueueCount == 1;
-            if (!native.queueSafe)
-                Logger::warn("DDDA native G-buffer unavailable: requires one queue in the effect graphics family");
-        }
 
         if (!logicalDevice->queue)
         {
@@ -2191,12 +2174,6 @@ namespace VKIntox
             logicalDevice->vkd.DestroyPipelineCache(device, logicalDevice->pipelineCache, pAllocator);
             logicalDevice->pipelineCache = VK_NULL_HANDLE;
         }
-        // The application has finished its device work; retained snapshots must
-        // release their Vulkan objects before the underlying device disappears.
-        for (auto& entry : swapchainMap)
-            if (entry.second && entry.second->logicalDevice == logicalDevice)
-                entry.second->nativeMaterialSnapshots.clear();
-        logicalDevice->nativeCapture.reset();
 
         logicalDevice->vkd.DestroyDevice(device, pAllocator);
 
@@ -2484,7 +2461,7 @@ namespace VKIntox
         {
             VkCommandPoolCreateInfo poolCI = {};
             poolCI.sType            = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-            poolCI.flags            = nativeCaptureEnabled() ? VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT : 0;
+            poolCI.flags            = 0;
             poolCI.queueFamilyIndex = logicalDevice->queueFamilyIndex;
             VkResult poolResult = logicalDevice->vkd.CreateCommandPool(
                 logicalDevice->device, &poolCI, nullptr, &logicalSwapchain->commandPool);
@@ -3127,17 +3104,6 @@ namespace VKIntox
     VKAPI_ATTR VkResult VKAPI_CALL VKIntox_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPresentInfo)
     {
         uint64_t frameSerial = 0;
-        // Consume even on early soft-disable/resize/passthrough returns. Menus
-        // and a later re-enable must not resurrect an older native submission.
-        std::shared_ptr<NativeSnapshot> nativeFrame;
-        if (nativeCaptureEnabled())
-        {
-            scoped_lock nativeLock(globalLock);
-            const auto found = deviceMap.find(GetKey(queue));
-            if (found != deviceMap.end() && found->second->nativeCapture)
-                nativeFrame = found->second->nativeCapture->takeFrame(
-                    queue == found->second->queue ? queue : VK_NULL_HANDLE);
-        }
         // Soft-disable fast path: panicLayer() has flipped this bit. The layer
         // is no longer trusted to touch the GPU, so we pass straight through
         // to the driver — except we still submit an overlay-only frame so any
@@ -3715,12 +3681,6 @@ namespace VKIntox
                 // fenced submissions, so skip our submit for this frame the way
                 // the depth-copy ring skips a busy slot.
                 const uint32_t presentImage = presentIndices[presentIndex];
-                if (nativeCaptureEnabled() && (presentImage >= sc->effectSubmitFences.size()
-                    || sc->effectSubmitFences[presentImage] == VK_NULL_HANDLE))
-                {
-                    bypassDepthForPresent = true;
-                    break;
-                }
                 if (presentImage < sc->effectSubmitFences.size()
                     && presentImage < sc->effectSubmitFenceUsed.size()
                     && sc->effectSubmitFenceUsed[presentImage]
@@ -3815,21 +3775,6 @@ namespace VKIntox
         {
             LogicalSwapchain* logicalSwapchain = presentSwapchains[i].get();
             uint32_t index = presentIndices[i];
-            if (nativeCaptureEnabled())
-            {
-                const bool valid = nativeFrame
-                    && nativeFrame->extent.width == logicalSwapchain->imageExtent.width
-                    && nativeFrame->extent.height == logicalSwapchain->imageExtent.height;
-                // The per-image fence gate above has completed. Retain the new
-                // allocation before updating descriptors, releasing the old one
-                // only now that its previous effect submission is no longer live.
-                logicalSwapchain->nativeMaterialSnapshots.resize(logicalSwapchain->imageCount);
-                logicalSwapchain->nativeMaterialSnapshots[index] = valid ? nativeFrame : nullptr;
-                for (auto& effect : logicalSwapchain->effects)
-                    effect->useNativeMaterial(index, valid ? nativeFrame->view : VK_NULL_HANDLE,
-                                             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, valid);
-            }
-
             // Update effect uniforms only when effects are active (saves CPU+GPU when off).
             // Wrapped in try/catch so a misbehaving effect's per-frame update can
             // never escape into vkQueuePresentKHR (which is noexcept from the
@@ -3841,7 +3786,7 @@ namespace VKIntox
                     bool frameCommandsChanged = false;
                     for (auto& effect : logicalSwapchain->effects)
                         frameCommandsChanged |= effect->updateFrame(index);
-                    if (nativeCaptureEnabled() || frameCommandsChanged)
+                    if (frameCommandsChanged)
                     {
                         // Updating ordinary descriptor bindings invalidates the
                         // executable CB. Re-record only this fence-safe image.
@@ -5820,7 +5765,6 @@ namespace VKIntox
         }
         return VK_SUCCESS;
     }
-#include "native_intercepts.inc"
 
 } // namespace VKIntox
 
@@ -5916,16 +5860,13 @@ extern "C"
         if (auto optical = VKIntox::opticalQueueIntercept(pName))
         {
             if (!device) return nullptr;
-            auto native = VKIntox::nativeIntercept(pName);
             VKIntox::scoped_lock lock(VKIntox::globalLock);
             auto found = VKIntox::deviceMap.find(VKIntox::GetKey(device));
             // Preserve null for unsupported/disabled extension entry points.
             if (found == VKIntox::deviceMap.end()
                 || !found->second->vkd.GetDeviceProcAddr(device, pName)) return nullptr;
-            return native ? native : optical;
+            return optical;
         }
-        if (auto native = VKIntox::nativeIntercept(pName))
-            return native;
 
         INTERCEPT_CALLS
 
@@ -5952,15 +5893,12 @@ extern "C"
         if (auto optical = VKIntox::opticalQueueIntercept(pName))
         {
             if (!instance) return nullptr;
-            auto native = VKIntox::nativeIntercept(pName);
             VKIntox::scoped_lock lock(VKIntox::globalLock);
             auto found = VKIntox::instanceDispatchMap.find(VKIntox::GetKey(instance));
             if (found == VKIntox::instanceDispatchMap.end()
                 || !found->second.GetInstanceProcAddr(instance, pName)) return nullptr;
-            return native ? native : optical;
+            return optical;
         }
-        if (auto native = VKIntox::nativeIntercept(pName))
-            return native;
 
         INTERCEPT_CALLS
 

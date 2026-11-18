@@ -16,7 +16,6 @@
 namespace VKIntox
 {
     struct LogicalSwapchain;  // Forward declaration
-    struct NativeCapture;
 
     // Global lock guarding all layer state (defined in vkintox.cpp). Shared with
     // the overlay so it can read LogicalDevice state for the Advanced tab.
@@ -86,7 +85,6 @@ namespace VKIntox
         // Shared driver pipeline cache. Rebuilt effects reuse compiled pipelines
         // instead of making the driver recompile them on every chain reload.
         VkPipelineCache          pipelineCache = VK_NULL_HANDLE;
-        std::shared_ptr<NativeCapture> nativeCapture;
         PFN_vkGetInstanceProcAddr downstreamGIPA = nullptr;
         PFN_vkGetDeviceProcAddr downstreamGDPA = nullptr;
         bool dlss5Supported = false;

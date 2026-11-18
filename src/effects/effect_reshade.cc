@@ -339,13 +339,6 @@ namespace VKIntox
         enumerateReshadeUniforms(module);
 
         uniforms = createReshadeUniforms(module);
-        for (const auto& uniform : module.uniforms)
-        {
-            const auto source = std::find_if(uniform.annotations.begin(), uniform.annotations.end(),
-                [](const auto& annotation) { return annotation.name == "source"; });
-            if (source != uniform.annotations.end() && source->value.string_data == "ddda_gbuffer_available")
-                nativeMaterialAvailabilityOffsets.push_back(uniform.offset);
-        }
 
         buildUiParamCache();
 
@@ -414,19 +407,6 @@ namespace VKIntox
 
                 textureFormatsUNORM[module.textures[i].unique_name] = inputOutputFormatUNORM;
                 textureFormatsSRGB[module.textures[i].unique_name]  = inputOutputFormatSRGB;
-                continue;
-            }
-            if (module.textures[i].semantic == "DDDA_GBUFFER")
-            {
-                // The real snapshot is borrowed through descriptor updates at present.
-                // Until then availability=false prevents sampling this safe placeholder.
-                const auto& name = module.textures[i].unique_name;
-                textureImageViewsUNORM[name] = inputImageViewsUNORM;
-                textureImageViewsSRGB[name] = inputImageViewsUNORM;
-                renderImageViewsUNORM[name] = inputImageViewsUNORM;
-                renderImageViewsSRGB[name] = inputImageViewsUNORM;
-                textureFormatsUNORM[name] = VK_FORMAT_B8G8R8A8_UNORM;
-                textureFormatsSRGB[name] = VK_FORMAT_B8G8R8A8_UNORM;
                 continue;
             }
             VkExtent3D textureExtent = {module.textures[i].width, module.textures[i].height, textureDepth};
@@ -621,13 +601,10 @@ namespace VKIntox
         }
 
         std::set<std::string> depthTextureNames;
-        std::set<std::string> nativeMaterialTextureNames;
         for (const auto& texture : module.textures)
         {
             if (texture.semantic == "DEPTH")
                 depthTextureNames.insert(texture.unique_name);
-            if (texture.semantic == "DDDA_GBUFFER")
-                nativeMaterialTextureNames.insert(texture.unique_name);
         }
 
         std::vector<reshadefx::texture_filter> samplerFilters;
@@ -635,13 +612,6 @@ namespace VKIntox
         for (size_t i = 0; i < module.samplers.size(); i++)
         {
             reshadefx::sampler_info info = module.samplers[i];
-            if (nativeMaterialTextureNames.count(info.texture_name))
-            {
-                if (info.storage)
-                    throw std::runtime_error("DDDA_GBUFFER is a read-only native texture");
-                nativeMaterialSamplerBindings.push_back(static_cast<uint32_t>(i));
-                info.srgb = false;
-            }
             if (depthTextureNames.find(info.texture_name) != depthTextureNames.end())
                 info.filter = reshadefx::texture_filter::min_mag_mip_point;
             samplerFilters.push_back(info.filter);
@@ -1306,9 +1276,6 @@ namespace VKIntox
 
             for (auto& uniform : uniforms)
                 uniform->update(stagingBufferMapped);
-            const uint32_t nativeAvailable = nativeMaterialAvailable ? 1u : 0u;
-            for (uint32_t offset : nativeMaterialAvailabilityOffsets)
-                std::memcpy(static_cast<char*>(stagingBufferMapped) + offset, &nativeAvailable, sizeof(nativeAvailable));
             // HOST_COHERENT: no flush needed, GPU sees writes automatically
         }
     }
@@ -1390,41 +1357,6 @@ namespace VKIntox
                     break;
                 }
             }
-        }
-    }
-
-    void ReshadeEffect::useNativeMaterial(uint32_t imageIndex, VkImageView imageView, VkImageLayout imageLayout, bool valid)
-    {
-        nativeMaterialAvailable = valid && imageView != VK_NULL_HANDLE;
-        if (imageIndex >= inputDescriptorSets.size() || imageIndex >= inputImageViewsUNORM.size())
-        {
-            nativeMaterialAvailable = false;
-            return;
-        }
-
-        for (uint32_t binding : nativeMaterialSamplerBindings)
-        {
-            VkDescriptorImageInfo imageInfo{};
-            imageInfo.sampler = samplers[binding];
-            imageInfo.imageView = nativeMaterialAvailable ? imageView : inputImageViewsUNORM[imageIndex];
-            imageInfo.imageLayout = nativeMaterialAvailable ? imageLayout : VK_IMAGE_LAYOUT_GENERAL;
-            std::array<VkWriteDescriptorSet, 3> writes{};
-            uint32_t count = 0;
-            const auto addWrite = [&](VkDescriptorSet set) {
-                auto& write = writes[count++];
-                write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-                write.dstSet = set;
-                write.dstBinding = binding;
-                write.descriptorCount = 1;
-                write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-                write.pImageInfo = &imageInfo;
-            };
-            addWrite(inputDescriptorSets[imageIndex]);
-            if (outputWrites > 1 && imageIndex < backBufferDescriptorSets.size())
-                addWrite(backBufferDescriptorSets[imageIndex]);
-            if (outputWrites > 2 && imageIndex < outputDescriptorSets.size())
-                addWrite(outputDescriptorSets[imageIndex]);
-            logicalDevice->vkd.UpdateDescriptorSets(logicalDevice->device, count, writes.data(), 0, nullptr);
         }
     }
     void ReshadeEffect::applyEffect(uint32_t imageIndex, VkCommandBuffer commandBuffer)

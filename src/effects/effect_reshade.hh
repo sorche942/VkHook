@@ -43,7 +43,6 @@ namespace VKIntox
         void virtual applyEffect(uint32_t imageIndex, VkCommandBuffer commandBuffer) override;
         void virtual updateEffect() override;
         void virtual useDepthImage(uint32_t imageIndex, VkImageView depthImageView, VkImageLayout depthImageLayout) override;
-        void useNativeMaterial(uint32_t imageIndex, VkImageView imageView, VkImageLayout imageLayout, bool valid) override;
         std::vector<std::unique_ptr<EffectParam>> getParameters() const override;
         int getOutputWrites() const { return outputWrites; }
         virtual ~ReshadeEffect();
@@ -140,9 +139,6 @@ namespace VKIntox
         bool                     disableComputePipelineOptimization = false;
 
         std::vector<std::shared_ptr<ReshadeUniform>> uniforms;
-        std::vector<uint32_t> nativeMaterialSamplerBindings;
-        std::vector<uint32_t> nativeMaterialAvailabilityOffsets;
-        bool nativeMaterialAvailable = false;
         // registry params resolved at build time; valid only while the registry
         // generation is unchanged, since a reparse frees the old param vector
         std::unordered_map<std::string, EffectParam*> uiParamCache;

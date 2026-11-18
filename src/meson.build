@@ -92,7 +92,6 @@ overlay_src = [
 VKIntox_src = [
     'core/vkintox.cc',
     'core/vkintox_depth.cc',
-    'render/native_capture.cc',
     'core/async_writer.cc',
     'render/buffer.cc',
     'render/command_buffer.cc',
@@ -432,13 +431,6 @@ reshade_uniform_tests = executable('vkintox-reshade-uniform-tests',
     link_args : ['-Wl,--gc-sections'],
     include_directories : [core_inc, effects_inc, vendor_inc, source_inc])
 test('reshade uniform sources', reshade_uniform_tests)
-
-native_capture_tests = executable('vkintox-native-capture-tests',
-    'tests/test_native_capture.cc',
-    'render/native_capture.cc',
-    'core/logger.cc',
-    include_directories : [core_inc, render_inc, source_inc])
-test('DDDA native capture', native_capture_tests)
 
 # AsyncWriter is what keeps profile/settings writes off the present thread. Its
 # FIFO order and idle barrier are the contract, and its thread lifetime is the

@@ -22,9 +22,6 @@ Keep the test's own window visible/unobscured. --width 3840 --height 2160
 reproduces the dump's dimensions when the display can show the entire window.
 By default, exercise dynamic rendering with GENERAL depth; --legacy tests render passes.
 No global input injection, desktop capture, or user configuration writes.
-Use --native-material for DDDA raw BGRA8 descriptor/freshness/lifetime/resize
-regression (five phases). This mode explicitly enables VKINTOX_DDDA_GBUFFER
-only in the isolated child environment and checks the external texture pixels.
 """
 
 import argparse
@@ -81,8 +78,8 @@ def seed(work, args):
         "functions": {"vkGetInstanceProcAddr": "VKIntox_GetInstanceProcAddr",
                       "vkGetDeviceProcAddr": "VKIntox_GetDeviceProcAddr"}}}
     (layers / "VKIntox.json").write_text(json.dumps(manifest), encoding="utf-8")
-    effect_name = "NativeMaterialProbe" if args.native_material else "DepthClearProbe"
-    effect = Path(__file__).with_name("NativeMaterialProbe.fx").read_text() if args.native_material else EFFECT
+    effect_name = "DepthClearProbe"
+    effect = EFFECT
     (shaders / (effect_name + ".fx")).write_text(effect, encoding="utf-8")
     (config / "VKIntox.conf").write_text(
         "enableOnLaunch = true\noverlayKey = Home\nreloadKey = F10\n"
@@ -106,8 +103,6 @@ def seed(work, args):
                VK_LAYER_PATH=str(layers), VK_INSTANCE_LAYERS=name,
                VK_LOADER_LAYERS_DISABLE="~implicit", DISABLE_VKINTOX="1",
                VK_LOADER_DEBUG="layer", VKINTOX_LOG_LEVEL="debug")
-    if args.native_material:
-        env["VKINTOX_DDDA_GBUFFER"] = "1"
     if args.validation:
         # Validation is BELOW VKIntox so it observes injected commands too.
         env["VK_INSTANCE_LAYERS"] += ":VK_LAYER_KHRONOS_validation"
@@ -132,17 +127,9 @@ def evidence(text, width, height, legacy):
     return found
 
 
-def pixels_match(samples, phase, native_material=False):
+def pixels_match(samples, phase):
     if not samples:
         return False
-    if native_material:
-        valid = phase in ("native", "restored")
-        expected = {0: (128, 128, 110) if valid else (255, 0, 255),
-                    2: (0, 255, 255) if valid else (255, 0, 255),
-                    6: (128, 128, 110) if valid else (255, 0, 255),
-                    8: (0, 255, 255) if valid else (255, 0, 255)}
-        return all(all(abs(actual - target) <= 8 for actual, target in zip(samples[index]["rgb"], color))
-                   for index, color in expected.items())
     # X11 helper returns a 3x3 grid. Avoid the half-width/half-height edges.
     expected = {0: (0, 255, 0) if phase == "clear" else (255, 0, 0),
                 2: (255, 0, 0),
@@ -167,12 +154,10 @@ def run(args):
                 command = [str(args.binary), "--width", str(args.width), "--height", str(args.height)]
                 if args.legacy:
                     command.append("--legacy")
-                if args.native_material:
-                    command.append("--native-material")
                 child = subprocess.Popen(command,
                                          env=env, stdin=subprocess.PIPE, stdout=output, stderr=subprocess.STDOUT,
                                          preexec_fn=lambda: resource.setrlimit(resource.RLIMIT_CORE, (0, 0)))
-                phases = ("native", "missing", "resized", "restored", "missing-again") if args.native_material else ("warmup", "clear")
+                phases = ("warmup", "clear")
                 for phase in phases:
                     deadline = time.monotonic() + args.timeout
                     consecutive = 0
@@ -186,7 +171,7 @@ def run(args):
                             if x11.name(window) != "VKIntox depth clear regression":
                                 raise RuntimeError("test window identity changed")
                             samples[phase] = x11.sample(window)
-                            consecutive = consecutive + 1 if pixels_match(samples[phase], phase, args.native_material) else 0
+                            consecutive = consecutive + 1 if pixels_match(samples[phase], phase) else 0
                             if consecutive >= 3:
                                 break
                         time.sleep(0.2)
@@ -198,12 +183,7 @@ def run(args):
                     if not layer_log.is_file():
                         raise RuntimeError("layer initialization log missing")
                     layer_text = layer_log.read_text(errors="replace")
-                    if args.native_material:
-                        if "DDDA native G-buffer source recognized:" not in layer_text:
-                            raise RuntimeError("native producer/submission recognition evidence missing")
-                        selected[phase] = {"native_available_from_probe": samples[phase][2]["rgb"][1] > 127}
-                    else:
-                        selected[phase] = evidence(layer_text, args.width, args.height, args.legacy)
+                    selected[phase] = evidence(layer_text, args.width, args.height, args.legacy)
                     print(phase + " selected-source evidence: " + json.dumps(selected[phase]), flush=True)
                     print(phase + " window color/depth pixels: " + json.dumps(samples[phase]), flush=True)
                     # The risky clear cannot be recorded until shader resources
@@ -220,9 +200,7 @@ def run(args):
             all_logs = text + "\n" + layer_log.read_text(errors="replace")
             if re.search(r"Validation Error|VUID-|UNASSIGNED-.*(?:Error|error)", all_logs):
                 raise RuntimeError("Vulkan validation reported an invalid command; see artifacts")
-            print("PASS: native G-buffer raw binding, missing-frame invalidation, source resize/lifetime and clean shutdown"
-                  if args.native_material else
-                  "PASS: in-scope depth clear, continued draws, GPU color readback, captured depth before/after clear, clean shutdown",
+            print("PASS: in-scope depth clear, continued draws, GPU color readback, captured depth before/after clear, clean shutdown",
                   flush=True)
             result = 0
         except (OSError, RuntimeError, subprocess.TimeoutExpired, KeyboardInterrupt) as error:
@@ -271,7 +249,6 @@ def main():
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--validation", action="store_true", help="also enable installed architecture-matched Khronos validation")
     parser.add_argument("--legacy", action="store_true", help="use legacy render passes instead of dynamic rendering")
-    parser.add_argument("--native-material", action="store_true", help="test DDDA native raw binding and per-frame availability")
     args = parser.parse_args()
     for name in ("binary", "layer"):
         path = getattr(args, name).resolve()
