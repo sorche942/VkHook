@@ -45,6 +45,11 @@ namespace VkHook::Ini
     // Items of a delimiter-separated list, each trimmed, empties dropped.
     std::vector<std::string> splitList(std::string_view text, char delimiter);
 
+    // The inverse of splitList: items joined by `delimiter`, unquoted. The one
+    // join for the ':'-separated `effects`/`disabledEffects` lists; a writer
+    // wraps the result in formatValue().
+    std::string joinList(const std::vector<std::string>& items, char delimiter);
+
     std::string trim(std::string_view text);
 
     // Every Pair line of a file in order. False when the file cannot be read.

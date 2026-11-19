@@ -158,6 +158,18 @@ namespace VkHook::Ini
         return items;
     }
 
+    std::string joinList(const std::vector<std::string>& items, char delimiter)
+    {
+        std::string result;
+        for (size_t i = 0; i < items.size(); ++i)
+        {
+            if (i > 0)
+                result += delimiter;
+            result += items[i];
+        }
+        return result;
+    }
+
     bool readFile(const std::string& path, std::vector<std::pair<std::string, std::string>>& out)
     {
         std::ifstream file(path);
