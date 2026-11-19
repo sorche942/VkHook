@@ -1,6 +1,7 @@
 #include "imgui_overlay.hh"
 #include "settings_manager.hh"
-#include "vkhook_internal.hh"
+#include "layer/state.hh"
+#include "depth/tracker.hh"
 #include "logger.hh"
 #include "overlay/ui_theme.hh"
 

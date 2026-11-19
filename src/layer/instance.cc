@@ -1,0 +1,219 @@
+#include "layer/entry.hh"
+#include "layer/state.hh"
+
+#include "keyboard_input_wayland.hh"
+#include "mouse_input_wayland.hh"
+#include "wayland_display.hh"
+#include "wayland_interpose_patch.hh"
+#include "logger.hh"
+#include "util.hh"
+
+#include <algorithm>
+
+#define VK_USE_PLATFORM_WAYLAND_KHR
+#define VK_USE_PLATFORM_XLIB_KHR
+#define VK_USE_PLATFORM_XCB_KHR
+#include <X11/Xlib.h>
+#include <xcb/xcb.h>
+#include <wayland-client.h>
+#include "vulkan/vulkan_wayland.h"
+#include "vulkan/vulkan_xlib.h"
+#include "vulkan/vulkan_xcb.h"
+
+namespace VkHook
+{
+namespace
+{
+    VkResult VKAPI_CALL VkHook_CreateInstance(const VkInstanceCreateInfo*  pCreateInfo,
+                                                const VkAllocationCallbacks* pAllocator,
+                                                VkInstance*                  pInstance)
+    {
+        VkLayerInstanceCreateInfo* layerCreateInfo = (VkLayerInstanceCreateInfo*) pCreateInfo->pNext;
+
+        // step through the chain of pNext until we get to the link info
+        while (layerCreateInfo
+               && (layerCreateInfo->sType != VK_STRUCTURE_TYPE_LOADER_INSTANCE_CREATE_INFO || layerCreateInfo->function != VK_LAYER_LINK_INFO))
+        {
+            layerCreateInfo = (VkLayerInstanceCreateInfo*) layerCreateInfo->pNext;
+        }
+
+        Logger::trace("vkCreateInstance");
+
+        // reach the app's wayland marshalling before any window commit can race
+        installWaylandInterposeHooks();
+
+        if (layerCreateInfo == nullptr)
+        {
+            // No loader instance create info
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+
+        PFN_vkGetInstanceProcAddr gpa = layerCreateInfo->u.pLayerInfo->pfnNextGetInstanceProcAddr;
+        // move chain on for next layer
+        layerCreateInfo->u.pLayerInfo = layerCreateInfo->u.pLayerInfo->pNext;
+
+        PFN_vkCreateInstance createFunc = (PFN_vkCreateInstance) gpa(VK_NULL_HANDLE, "vkCreateInstance");
+
+        VkInstanceCreateInfo modifiedCreateInfo = *pCreateInfo;
+        VkApplicationInfo    appInfo;
+        if (modifiedCreateInfo.pApplicationInfo)
+        {
+            appInfo = *(modifiedCreateInfo.pApplicationInfo);
+            if (appInfo.apiVersion < VK_API_VERSION_1_1)
+            {
+                appInfo.apiVersion = VK_API_VERSION_1_1;
+            }
+        }
+        else
+        {
+            appInfo.sType              = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+            appInfo.pNext              = nullptr;
+            appInfo.pApplicationName   = nullptr;
+            appInfo.applicationVersion = 0;
+            appInfo.pEngineName        = nullptr;
+            appInfo.engineVersion      = 0;
+            appInfo.apiVersion         = VK_API_VERSION_1_1;
+        }
+
+#ifdef VKHOOK_DLSS5
+        auto enumerateVersion = reinterpret_cast<PFN_vkEnumerateInstanceVersion>(gpa(VK_NULL_HANDLE, "vkEnumerateInstanceVersion"));
+        uint32_t loaderVersion = VK_API_VERSION_1_0;
+        if (enumerateVersion && enumerateVersion(&loaderVersion) == VK_SUCCESS && loaderVersion >= VK_API_VERSION_1_3)
+            appInfo.apiVersion = std::max(appInfo.apiVersion, VK_API_VERSION_1_3);
+#endif
+
+        modifiedCreateInfo.pApplicationInfo = &appInfo;
+        VkResult ret                        = createFunc(&modifiedCreateInfo, pAllocator, pInstance);
+
+        if (ret != VK_SUCCESS)
+        {
+            // *pInstance is only valid on VK_SUCCESS, and the maps key on the handle
+            Logger::err("vkCreateInstance failed: " + std::to_string(ret));
+            return ret;
+        }
+
+        // fetch our own dispatch table for the functions we need, into the next layer
+        InstanceDispatch dispatchTable;
+        fillDispatchTableInstance(*pInstance, gpa, &dispatchTable);
+
+        // store the table by key
+        {
+            scoped_lock l(globalLock);
+            instanceDispatchMap[GetKey(*pInstance)] = dispatchTable;
+            instanceMap[GetKey(*pInstance)]         = *pInstance;
+            instanceVersionMap[GetKey(*pInstance)]  = modifiedCreateInfo.pApplicationInfo->apiVersion;
+        }
+
+        return ret;
+    }
+
+    void VKAPI_CALL VkHook_DestroyInstance(VkInstance instance, const VkAllocationCallbacks* pAllocator)
+    {
+        if (!instance)
+            return;
+
+        Logger::trace("vkDestroyInstance");
+
+        const InstanceSnapshot snapshot = snapshotInstance(GetKey(instance));
+        if (!snapshot.found)
+        {
+            // Not created through this layer; nothing we can safely do
+            Logger::trace("vkDestroyInstance: instance not tracked by this layer, skipping");
+            return;
+        }
+
+        // forward with the lock released, then forget the instance
+        snapshot.dispatch.DestroyInstance(instance, pAllocator);
+
+        scoped_lock l(globalLock);
+        instanceDispatchMap.erase(GetKey(instance));
+        instanceMap.erase(GetKey(instance));
+        instanceVersionMap.erase(GetKey(instance));
+    }
+
+    // Looks the instance up under the lock and resolves the next layer's
+    // implementation of `name`; the lock is released before the caller uses it.
+    PFN_vkVoidFunction resolveNextInstanceProc(VkInstance instance, const char* name)
+    {
+        const InstanceSnapshot snapshot = snapshotInstance(GetKey(instance));
+        if (!snapshot.found)
+        {
+            failUnknownObject(name, VK_ERROR_INITIALIZATION_FAILED);
+            return nullptr;
+        }
+        return snapshot.dispatch.GetInstanceProcAddr(snapshot.instance, name);
+    }
+
+    ///////////////////////////////////////////////////////////////////////////////////////////
+    // Wayland / X11 surface interception: capture the window for input
+
+    VKAPI_ATTR VkResult VKAPI_CALL VkHook_CreateWaylandSurfaceKHR(
+        VkInstance                              instance,
+        const VkWaylandSurfaceCreateInfoKHR*    pCreateInfo,
+        const VkAllocationCallbacks*            pAllocator,
+        VkSurfaceKHR*                           pSurface)
+    {
+        Logger::trace("vkCreateWaylandSurfaceKHR");
+
+        // Capture the wl_display and wl_surface for Wayland input
+        if (pCreateInfo && pCreateInfo->display)
+            setWaylandDisplay(pCreateInfo->display);
+        if (pCreateInfo && pCreateInfo->surface)
+            setWaylandSurface(pCreateInfo->surface);
+
+        // Forward to the real implementation via the next layer
+        auto nextFunc = (PFN_vkCreateWaylandSurfaceKHR) resolveNextInstanceProc(instance, "vkCreateWaylandSurfaceKHR");
+        if (!nextFunc)
+            return VK_ERROR_EXTENSION_NOT_PRESENT;
+
+        return nextFunc(instance, pCreateInfo, pAllocator, pSurface);
+    }
+
+    VKAPI_ATTR VkResult VKAPI_CALL VkHook_CreateXlibSurfaceKHR(
+        VkInstance                           instance,
+        const VkXlibSurfaceCreateInfoKHR*    pCreateInfo,
+        const VkAllocationCallbacks*         pAllocator,
+        VkSurfaceKHR*                        pSurface)
+    {
+        Logger::trace("vkCreateXlibSurfaceKHR");
+        if (pCreateInfo && pCreateInfo->window)
+            setX11Window((unsigned long)pCreateInfo->window);
+
+        auto nextFunc = (PFN_vkCreateXlibSurfaceKHR) resolveNextInstanceProc(instance, "vkCreateXlibSurfaceKHR");
+        if (!nextFunc)
+            return VK_ERROR_EXTENSION_NOT_PRESENT;
+
+        return nextFunc(instance, pCreateInfo, pAllocator, pSurface);
+    }
+
+    VKAPI_ATTR VkResult VKAPI_CALL VkHook_CreateXcbSurfaceKHR(
+        VkInstance                          instance,
+        const VkXcbSurfaceCreateInfoKHR*    pCreateInfo,
+        const VkAllocationCallbacks*        pAllocator,
+        VkSurfaceKHR*                       pSurface)
+    {
+        Logger::trace("vkCreateXcbSurfaceKHR");
+        if (pCreateInfo && pCreateInfo->window)
+            setX11Window((unsigned long)pCreateInfo->window);
+
+        auto nextFunc = (PFN_vkCreateXcbSurfaceKHR) resolveNextInstanceProc(instance, "vkCreateXcbSurfaceKHR");
+        if (!nextFunc)
+            return VK_ERROR_EXTENSION_NOT_PRESENT;
+
+        return nextFunc(instance, pCreateInfo, pAllocator, pSurface);
+    }
+
+    const InterceptEntry kInstanceIntercepts[] = {
+        VKHOOK_INTERCEPT(Unconditional, CreateInstance),
+        VKHOOK_INTERCEPT(Unconditional, DestroyInstance),
+        VKHOOK_INTERCEPT(Unconditional, CreateWaylandSurfaceKHR),
+        VKHOOK_INTERCEPT(Unconditional, CreateXlibSurfaceKHR),
+        VKHOOK_INTERCEPT(Unconditional, CreateXcbSurfaceKHR),
+    };
+} // namespace
+
+    InterceptTable instanceInterceptTable()
+    {
+        return makeInterceptTable(kInstanceIntercepts);
+    }
+} // namespace VkHook

@@ -1,4 +1,7 @@
-#include "vkhook_internal.hh"
+#include "depth/tracker.hh"
+
+#include "layer/state.hh"
+#include "diag/gpu_crash.hh"
 
 #include "image_view.hh"
 #include "image.hh"
@@ -6,15 +9,16 @@
 #include "vk_handle.hh"
 #include "util.hh"
 #include "format.hh"
-#include "keyboard_input.hh"
 #include "renderpass.hh"
 #include "framebuffer.hh"
 #include "sampler.hh"
 #include "descriptor_set.hh"
 #include "graphics_pipeline.hh"
 #include "buffer.hh"
+#include "settings_manager.hh"
 #include "shader_sources.hh"
 #include "shader.hh"
+#include "logger.hh"
 
 #include <algorithm>
 #include <cstring>
@@ -22,42 +26,12 @@
 
 namespace VkHook
 {
-
-// Extracted from vkhook.cc. Everything below is the depth subsystem: tracking
-// the application's depth attachment as commands are recorded, choosing a
-// presentable snapshot target for it, resolving it, and retrying when the
-// attachment is not yet usable.
-//
-// The extraction is deliberately mechanical. No behaviour changed, no logic was
-// reorganised, and the only edits are that the functions the interceptors call
-// lost their `static` so they can be declared in vkhook_internal.hh, and the
-// three names the block shares with vkhook.cc became extern.
-
-    bool handleKeyPress(uint32_t keySymbol, bool& wasPressed)
-    {
-        if (isKeyPressed(keySymbol))
-        {
-            if (!wasPressed)
-            {
-                wasPressed = true;
-                return true;
-            }
-        }
-        else
-        {
-            wasPressed = false;
-        }
-        return false;
-    }
+    std::unordered_map<LogicalDevice*, DepthRetryState> depthRetryStates;
 
     bool hasDepthState(const DepthState& state)
     {
         return state.image != VK_NULL_HANDLE && state.imageView != VK_NULL_HANDLE && state.format != VK_FORMAT_UNDEFINED;
     }
-
-    // Forward declaration — defined later, after DepthImageMetadata helpers.
-    // Used to gate depth-resolve recording against destroyed/invalid depth images.
-    bool validateDepthStateForResolve(LogicalDevice* logicalDevice, const DepthState& depth);
 
     bool isDepthStencilAttachmentFormat(VkFormat format)
     {
@@ -603,15 +577,6 @@ namespace VkHook
         });
     }
 
-    void updateDeviceDepthStateLocked(LogicalDevice* logicalDevice, const DepthState& depth, const char* reason);
-    void recordDepthResolveSnapshotForCommandBuffer(LogicalDevice* logicalDevice,
-                                                    VkCommandBuffer commandBuffer,
-                                                    const DepthState& depthState,
-                                                    const DepthSnapshotTarget* snapshotTarget);
-    void recordDepthResolveSnapshotForAllSwapchains(LogicalDevice* logicalDevice,
-                                                    VkCommandBuffer commandBuffer,
-                                                    const DepthState& depthState);
-
     void armDepthTransitionHoldLocked(LogicalDevice* logicalDevice, const char* reason)
     {
         if (!logicalDevice)
@@ -904,9 +869,6 @@ namespace VkHook
         return trackedView;
     }
 
-    void updateDeviceDepthStateLocked(LogicalDevice* logicalDevice, const DepthState& depth, const char* reason);
-    void reallocateCommandBuffers(LogicalDevice* logicalDevice, LogicalSwapchain* logicalSwapchain, const DepthState& depth);
-
     void destroyDepthResolveResources(LogicalSwapchain* logicalSwapchain)
     {
         logicalSwapchain->depthResolveSourceView = VK_NULL_HANDLE;
@@ -1064,11 +1026,13 @@ namespace VkHook
         logicalSwapchain->depthResolveIsMsaa = useMsaaResolve;
         logicalSwapchain->depthResolveMsaaTransform = useMsaaTransform;
         logicalSwapchain->depthResolveSourceSamples = depth.samples;
-        Logger::debug("depth resolve path: "
-                      + std::string(useShaderResolve ? "shader" : (useMsaaTransform ? "msaa+transform" : (useMsaaResolve ? "msaa" : "copy")))
-                      + " observedLayout=" + convertToString(depth.observedLayout)
-                      + " samples=" + std::to_string(depth.samples)
-                      + " transform=" + std::string(depthTransformRequested() ? "yes" : "no"));
+        VKHOOK_LOG_DEBUG([&](std::string& s) {
+            s = "depth resolve path: "
+                + std::string(useShaderResolve ? "shader" : (useMsaaTransform ? "msaa+transform" : (useMsaaResolve ? "msaa" : "copy")))
+                + " observedLayout=" + convertToString(depth.observedLayout)
+                + " samples=" + std::to_string(depth.samples)
+                + " transform=" + std::string(depthTransformRequested() ? "yes" : "no");
+        });
         // The MSAA subpass and 1-sample transfer-copy paths keep the native depth
         // format. Only the 1-sample+GENERAL shader fallback uses R32_SFLOAT.
         logicalSwapchain->depthResolveFormat = useShaderResolve ? VK_FORMAT_R32_SFLOAT : depth.format;
@@ -1689,7 +1653,7 @@ namespace VkHook
             if (fence == VK_NULL_HANDLE)
                 continue;
 
-            VkResult vr = reinterpret_cast<PFN_vkGetFenceStatus>(logicalDevice->vkd.GetDeviceProcAddr(logicalDevice->device, "vkGetFenceStatus"))(logicalDevice->device, fence);
+            VkResult vr = logicalDevice->vkd.GetFenceStatus(logicalDevice->device, fence);
             if (vr == VK_NOT_READY)
                 return false;
             if (vr == VK_ERROR_DEVICE_LOST)
@@ -1742,61 +1706,6 @@ namespace VkHook
             return {};
         }
         return logicalDevice->activeDepthState;
-    }
-
-    // Perform the actual command buffer reallocation for all swapchains on a device.
-    // MUST be called from a safe context (QueuePresentKHR or reload path) where the
-    // GPU has been idle'd first, to avoid freeing in-flight command buffers.
-    void performDeferredDepthRealloc(LogicalDevice* logicalDevice)
-    {
-        // clear ALL swapchain resolve views FIRST, before any validation
-        for (auto& [handle, sc] : swapchainMap)
-        {
-            if (sc && sc->logicalDevice == logicalDevice)
-            {
-                sc->depthResolveSourceView = VK_NULL_HANDLE;
-                for (auto& img : sc->depthResolvePerImage)
-                    img.image = VK_NULL_HANDLE;
-                for (auto& img : sc->depthResolveTransformedPerImage)
-                    img.image = VK_NULL_HANDLE;
-            }
-        }
-
-        DepthState effectiveDepth = getDepthState(logicalDevice);
-
-        // VALIDATE before rebuilding resolve resources. If the depth state is
-        // stale (image destroyed, missing usage flags, zero extent), we tear
-        // down any existing resolve resources for each swapchain instead of
-        // rebuilding against garbage. This is the chokepoint for the
-        // "depth buffer doesn't work in Roblox" symptom: if the active depth
-        // view points at a destroyed image, we must not let ensureDepthResolveResources
-        // build descriptor sets against it.
-        const bool depthValid = validateDepthStateForResolve(logicalDevice, effectiveDepth);
-        if (hasDepthState(effectiveDepth) && !depthValid)
-        {
-            Logger::warn("performDeferredDepthRealloc: effective depth state failed validation; "
-                         "tearing down resolve resources and clearing active state");
-            // Clear the active state so getDepthState() returns empty next time
-            // (otherwise we'd keep retrying with the same invalid state).
-            logicalDevice->activeDepthState = {};
-            if (logicalDevice->pinnedDepthImageView != VK_NULL_HANDLE)
-                logicalDevice->pinnedDepthImageView = VK_NULL_HANDLE;
-            effectiveDepth = DepthState{};
-        }
-
-        for (auto& [swapchainHandle, logicalSwapchain] : swapchainMap)
-        {
-            if (logicalSwapchain->logicalDevice != logicalDevice)
-                continue;
-            if (logicalSwapchain->commandBuffersEffect.empty())
-                continue;
-
-            reallocateCommandBuffers(logicalDevice, logicalSwapchain.get(), effectiveDepth);
-            VKHOOK_LOG_DEBUG([&](std::string& s) {
-                s = "reallocated command buffers for swapchain " + convertToString(swapchainHandle) + " (deferred depth change)";
-            });
-        }
-        logicalDevice->depthReallocPending = false;
     }
 
     void updateDeviceDepthStateLocked(LogicalDevice* logicalDevice, const DepthState& depth, const char* reason)

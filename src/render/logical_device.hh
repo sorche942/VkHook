@@ -17,10 +17,6 @@ namespace VkHook
 {
     struct LogicalSwapchain;  // Forward declaration
 
-    // Global lock guarding all layer state (defined in vkhook.cpp). Shared with
-    // the overlay so it can read LogicalDevice state for the Advanced tab.
-    extern std::mutex globalLock;
-
     struct DepthSnapshotTarget
     {
         VkSwapchainKHR  swapchain = VK_NULL_HANDLE;
