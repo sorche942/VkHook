@@ -20,8 +20,8 @@
 
 namespace VkHook
 {
-    OverlayControl::OverlayControl(LogicalDevice* device)
-        : logicalDevice(device), effectRegistry(&VkHook::effectRegistry)
+    OverlayControl::OverlayControl(LogicalDevice* device, EffectRegistry* registry)
+        : logicalDevice(device), effectRegistry(registry)
     {
     }
 

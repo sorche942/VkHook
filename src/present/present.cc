@@ -212,6 +212,12 @@ namespace
             slots[i].swapchain = findSwapchain(*logicalDevice, pPresentInfo->pSwapchains[i]);
         }
 
+        // a chain whose shaders finished compiling is built and swapped in; it is
+        // the next present that uses it
+        if (!softDisabled)
+            for (const PresentSlot& slot : slots)
+                advanceChainBuild(logicalDevice, slot.swapchain);
+
         // Test hook: rebuilds the depth path while the app keeps presenting.
         maybeForceSmokeDepthRefresh(logicalDevice, control.diag);
 

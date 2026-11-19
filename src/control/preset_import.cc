@@ -16,7 +16,7 @@
 
 namespace VkHook
 {
-    void applyShaderProfile(Config* config, const std::string& path)
+    void applyShaderProfile(Config* config, EffectRegistry& registry, const std::string& path)
     {
         if (!config)
             return;
@@ -27,8 +27,8 @@ namespace VkHook
 
             ParseOptions options;
             options.maxEffects = static_cast<size_t>(std::max(0, ConfigStore::instance().getMaxEffects()));
-            const PathResolver resolve = [config](std::string_view key) {
-                return effectRegistry.resolveEffectPath(std::string(key), config);
+            const PathResolver resolve = [config, &registry](std::string_view key) {
+                return registry.resolveEffectPath(std::string(key), config);
             };
 
             Diagnostics diagnostics;

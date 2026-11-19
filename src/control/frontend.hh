@@ -32,7 +32,6 @@ namespace VkHook
 
     extern std::shared_ptr<Config> baseConfig;  // always VkHook.conf
     extern std::shared_ptr<Config> config;      // current config (base + overlay)
-    extern EffectRegistry          effectRegistry;  // single source of truth for effect configs
 
     // detected game and the active profile files (set by initConfigs / the overlay)
     extern std::string detectedGameName;
@@ -41,7 +40,9 @@ namespace VkHook
     extern std::string activeShaderProfilePath;
 
     void initConfigs();
-    void switchConfig(const std::string& configPath, const std::string& shaderPath = "");
+    // Makes `configPath` (and the shader profile at `shaderPath`) the process's config and
+    // rebuilds `registry` for it on its compile worker.
+    void switchConfig(EffectRegistry& registry, const std::string& configPath, const std::string& shaderPath = "");
 
     // available effects by source (cached until invalidateAvailableEffects)
     void getAvailableEffects(Config* config,
@@ -79,6 +80,19 @@ namespace VkHook
         std::string cachedConfigName;
 
         DiagState diag;
+
+        // A chain reload asked for while the registry was still building its entries;
+        // the control step makes it once they exist.
+        bool reloadAfterInitialize = false;
+
+        // The device's first swapchain has asked for its chain (later swapchains are
+        // resizes and rebuild after the debounce instead).
+        std::atomic<bool> firstChainStarted{false};
+
+        // The device's effect registry: the single source of truth for its effect
+        // entries, parameters and macros, with its own compile cache and worker. Its
+        // codegen options are this device's. Declared before `overlay`, which uses it.
+        EffectRegistry effectRegistry;
 
         // last effects-on decision, published at the end of every control step
         std::atomic<bool> lastEffectsOn{true};

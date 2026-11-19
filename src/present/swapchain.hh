@@ -23,13 +23,23 @@ namespace VkHook
     // `activeEffects`. No layer lock may be held; never waits for the GPU.
     void reloadAllSwapchains(LogicalDevice* logicalDevice, const std::vector<std::string>& activeEffects);
 
-    // Rebuilds one swapchain's chain from `current` (same effects when
-    // `effects` is null) against the device's current depth state. False when
-    // nothing was swapped in: another rebuild of that swapchain is running, the
-    // swapchain was replaced meanwhile, or the build failed. No lock may be held.
+    // Starts the rebuild of one swapchain's chain from `current` (same effects when
+    // `effects` is null) against the device's current depth state. The effects'
+    // shaders compile on the device's registry worker; advanceChainBuild swaps the
+    // new generation in at a later present. A chain with nothing to compile is
+    // swapped in before this returns. False when nothing was started or swapped in:
+    // another rebuild of that swapchain is finishing, the swapchain was replaced
+    // meanwhile, or the build failed. A newer request replaces one still compiling.
+    // No lock may be held.
     bool rebuildSwapchainChain(LogicalDevice* logicalDevice,
                                const std::shared_ptr<LogicalSwapchain>& current,
                                const std::vector<std::string>* effects);
+
+    // Present-boundary step of one swapchain's chain: requests the first chain once
+    // the registry has its selection, and finishes a compiled one (constructs the
+    // effects from the worker's results and swaps the generation in, with no lock
+    // held). Cheap when nothing is pending. Never waits.
+    void advanceChainBuild(LogicalDevice* logicalDevice, const std::shared_ptr<LogicalSwapchain>& current);
 
     // Extent of a live, non-passthrough swapchain for this device (the window
     // size), for UI defaults such as the manual depth pin. Caller holds stateLock.

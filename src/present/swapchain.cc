@@ -36,19 +36,82 @@
 #include <limits>
 #include <string>
 #include <vector>
+#include <chrono>
+#include <future>
+#include <optional>
 
 namespace VkHook
 {
-    // Helper function to create effects for a swapchain
+    // One chain entry, after its one id parse.
+    struct ChainEntry
+    {
+        std::string             name;
+        std::optional<EffectId> id;       // nullopt: a legacy name
+        bool                    dlss5 = false;
+        // index in the compile result when the entry was submitted, else -1
+        int                     compileIndex = -1;
+        std::shared_ptr<const EffectCompileResult> compiled;
+    };
+    using ChainPlan = std::vector<ChainEntry>;
+
+    // A chain build whose ReShade effects are compiling on the registry's worker;
+    // see advanceChainBuild.
+    struct PendingChain
+    {
+        ChainPlan                              plan;
+        std::shared_future<ChainCompileResult> future;
+    };
+
+    ChainPlan planChain(const std::vector<std::string>& names, Config* config)
+    {
+        ChainPlan plan;
+        plan.reserve(names.size());
+        for (const std::string& name : names)
+        {
+            ChainEntry entry;
+            entry.name  = name;
+            entry.id    = EffectId::parse(name);
+            entry.dlss5 = entry.id ? entry.id->isBuiltin() : isDlss5Effect(name, config);
+            plan.push_back(std::move(entry));
+        }
+        return plan;
+    }
+
+    // The compile request for the ReShade entries of `plan` that will be built (not
+    // disabled, not failed, shader found), at `swapchain`'s extent and colour depth;
+    // each submitted entry records its index in the result.
+    ChainCompileSpec compileSpecFor(EffectRegistry& registry, const LogicalSwapchain& swapchain, ChainPlan& plan)
+    {
+        const uint32_t colorBitDepth = convertToUNORM(swapchain.format) == VK_FORMAT_A2R10G10B10_UNORM_PACK32 ? 10 : 8;
+        ChainCompileSpec spec;
+        for (ChainEntry& entry : plan)
+        {
+            if (entry.dlss5 || !entry.id || registry.hasEffectFailed(entry.name) || !registry.isEffectEnabled(entry.name))
+                continue;
+            EffectCompileSpec effect;
+            effect.path = registry.getEffectFilePath(entry.name);
+            if (effect.path.empty())
+                continue;  // the effect looks for the file itself and reports it
+            effect.id    = *entry.id;
+            effect.setup = registry.preprocessSetup(swapchain.imageExtent.width, swapchain.imageExtent.height,
+                                                    colorBitDepth, registry.getPreprocessorDefs(entry.name));
+            effect.codegen = registry.codegenOptions();
+            entry.compileIndex = static_cast<int>(spec.effects.size());
+            spec.effects.push_back(std::move(effect));
+        }
+        return spec;
+    }
+
+    // Creates the effects of a swapchain's chain from `plan`.
     // This centralizes the effect creation logic used by both initial swapchain setup and hot-reload
     static void createEffectsForSwapchain(
         LogicalSwapchain* logicalSwapchain,
         LogicalDevice* logicalDevice,
         Config* config,
-        const std::vector<std::string>& effectStrings,
-        bool checkEnabledState = true)
+        const ChainPlan& plan)
     {
         const bool useMutableFormat = logicalSwapchain->useMutableFormat;
+        EffectRegistry& effectRegistry = deviceControl(logicalDevice).effectRegistry;
 
         if (logicalSwapchain->imageCount == 0)
         {
@@ -57,7 +120,7 @@ namespace VkHook
         }
 
         // If no effects, add pass-through so rendering still works
-        if (effectStrings.empty())
+        if (plan.empty())
         {
             logicalSwapchain->effects.push_back(std::make_shared<TransferEffect>(
                 logicalDevice, logicalSwapchain->format, logicalSwapchain->imageExtent,
@@ -76,28 +139,30 @@ namespace VkHook
         const auto pingPong = [&](size_t effect) -> const std::vector<VkImage>& {
             return effect % 2 == 0 ? logicalSwapchain->pingImages : logicalSwapchain->pongImages;
         };
-        for (uint32_t i = 0; i < effectStrings.size(); i++)
+        for (uint32_t i = 0; i < plan.size(); i++)
         {
-            VKHOOK_LOG_DEBUG([&](std::string& s) { s = "creating effect " + std::to_string(i) + ": " + effectStrings[i]; });
+            const ChainEntry& entry = plan[i];
+            const std::string& effectName = entry.name;
+            VKHOOK_LOG_DEBUG([&](std::string& s) { s = "creating effect " + std::to_string(i) + ": " + effectName; });
 
             const std::vector<VkImage>& firstImages = i == 0 ? logicalSwapchain->fakeImages : pingPong(i - 1);
             const std::vector<VkImage>& secondImages =
-                (i == effectStrings.size() - 1 && useMutableFormat) ? logicalSwapchain->images : pingPong(i);
+                (i == plan.size() - 1 && useMutableFormat) ? logicalSwapchain->images : pingPong(i);
 
             // Check if effect should be skipped (disabled or failed)
-            bool effectFailed = effectRegistry.hasEffectFailed(effectStrings[i]);
-            bool effectDisabled = checkEnabledState && !effectRegistry.isEffectEnabled(effectStrings[i]);
+            bool effectFailed = effectRegistry.hasEffectFailed(effectName);
+            bool effectDisabled = !effectRegistry.isEffectEnabled(effectName);
 
             if (effectFailed || effectDisabled)
             {
                 VKHOOK_LOG_DEBUG([&](std::string& s) {
-                    s = "effect " + std::string(effectFailed ? "failed" : "disabled") + ", using pass-through: " + effectStrings[i];
+                    s = "effect " + std::string(effectFailed ? "failed" : "disabled") + ", using pass-through: " + effectName;
                 });
                 logicalSwapchain->effects.push_back(std::make_shared<TransferEffect>(logicalDevice, logicalSwapchain->format, logicalSwapchain->imageExtent, firstImages, secondImages, config));
                 continue;
             }
 
-            if (isDlss5Effect(effectStrings[i], config))
+            if (entry.dlss5)
             {
                 try
                 {
@@ -107,7 +172,7 @@ namespace VkHook
                     logicalSwapchain->effects.push_back(std::make_shared<Dlss5Effect>(
                         logicalDevice, logicalSwapchain->format, logicalSwapchain->swapchainCreateInfo.imageColorSpace,
                         logicalSwapchain->imageExtent, firstImages, secondImages, motionSources,
-                        &effectRegistry, config, effectStrings[i]));
+                        &effectRegistry, config, effectName));
 #else
                     throw std::runtime_error("DLSS5 backend not built; configure Meson with -Ddlss5=enabled and its build dependencies");
 #endif
@@ -115,7 +180,7 @@ namespace VkHook
                 catch (const std::exception& e)
                 {
                     Logger::err("Failed to create DLSS5 effect: " + std::string(e.what()));
-                    effectRegistry.setEffectError(effectStrings[i], e.what());
+                    effectRegistry.setEffectError(effectName, e.what());
                     logicalSwapchain->effects.push_back(std::make_shared<TransferEffect>(
                         logicalDevice, logicalSwapchain->format, logicalSwapchain->imageExtent, firstImages, secondImages, config));
                 }
@@ -126,26 +191,29 @@ namespace VkHook
             // exception) disables this effect only: it is replaced by a
             // pass-through and the registry records why. Nothing here may take the
             // process down; the embedded compiler reports failures as errors.
-            std::string effectPath = effectRegistry.getEffectFilePath(effectStrings[i]);
-            auto customDefs = effectRegistry.getPreprocessorDefs(effectStrings[i]);
+            std::string effectPath = effectRegistry.getEffectFilePath(effectName);
+            auto customDefs = effectRegistry.getPreprocessorDefs(effectName);
 
             auto disableEffect = [&](const std::string& why)
             {
-                Logger::err("Failed to create ReshadeEffect " + effectStrings[i] + ": " + why);
-                effectRegistry.setEffectError(effectStrings[i], why);
+                Logger::err("Failed to create ReshadeEffect " + effectName + ": " + why);
+                effectRegistry.setEffectError(effectName, why);
                 logicalSwapchain->effects.push_back(std::make_shared<TransferEffect>(
                     logicalDevice, logicalSwapchain->format, logicalSwapchain->imageExtent, firstImages, secondImages, config));
             };
 
             try
             {
+                // `entry.compiled` is what the registry's worker compiled for this entry
+                // (null: the effect compiles it itself through the registry's cache)
                 auto reshadeEffect = std::make_shared<ReshadeEffect>(
                     logicalDevice, logicalSwapchain->format, logicalSwapchain->imageExtent,
-                    firstImages, secondImages, &effectRegistry, texturePool, effectStrings[i], effectPath, customDefs);
+                    firstImages, secondImages, &effectRegistry, texturePool, effectName, effectPath, customDefs,
+                    entry.compiled);
                 logicalSwapchain->effects.push_back(reshadeEffect);
                 if (reshadeEffect->requiresOutputForward())
                 {
-                    Logger::debug("forwarding the in-place result of effect: " + effectStrings[i]);
+                    Logger::debug("forwarding the in-place result of effect: " + effectName);
                     logicalSwapchain->effects.push_back(std::make_shared<TransferEffect>(logicalDevice, logicalSwapchain->format, logicalSwapchain->imageExtent,
                                            firstImages, secondImages, config));
                 }
@@ -165,9 +233,10 @@ namespace VkHook
         {
             logicalSwapchain->effects.push_back(std::make_shared<TransferEffect>(
                 logicalDevice, logicalSwapchain->format, logicalSwapchain->imageExtent,
-                pingPong(effectStrings.size() - 1), logicalSwapchain->images, config));
+                pingPong(plan.size() - 1), logicalSwapchain->images, config));
         }
     }
+
 
 namespace
 {
@@ -176,7 +245,7 @@ namespace
     // copy-only command buffers. No lock is held and nothing waits for the GPU.
     // On false, `next` is incomplete and must be dropped (its destructor retires
     // whatever was created).
-    bool buildGeneration(LogicalDevice* logicalDevice, LogicalSwapchain& next, std::vector<std::string> effectNames)
+    bool buildGeneration(LogicalDevice* logicalDevice, LogicalSwapchain& next, ChainPlan plan)
     {
         if (next.imageCount == 0 || next.fakeImages.empty())
             return false;
@@ -193,8 +262,10 @@ namespace
             return false;
         }
 
-        createEffectsForSwapchain(&next, logicalDevice, config.get(), effectNames, true);
-        next.effectNames = std::move(effectNames);
+        createEffectsForSwapchain(&next, logicalDevice, config.get(), plan);
+        next.effectNames.clear();
+        for (const ChainEntry& entry : plan)
+            next.effectNames.push_back(entry.name);
         if (next.effects.empty())
             return false;
 
@@ -214,6 +285,65 @@ namespace
 
         writeCommandBuffers(logicalDevice, &next, next.effects, next.commandBuffersEffect);
         writeCommandBuffers(logicalDevice, &next, {next.defaultTransfer}, next.commandBuffersNoEffect);
+        return true;
+    }
+
+    bool installGeneration(LogicalDevice& logicalDevice, VkSwapchainKHR handle,
+                           const std::shared_ptr<LogicalSwapchain>& expected, std::shared_ptr<LogicalSwapchain> next);
+
+    // Builds the next generation from `plan` and swaps it in; the caller holds
+    // `rebuildBusy`. No lock is held while building and nothing waits for the GPU.
+    bool installChain(LogicalDevice* logicalDevice, const std::shared_ptr<LogicalSwapchain>& current, ChainPlan plan)
+    {
+        bool swapped = false;
+        guardLayerWork(logicalDevice, "chain rebuild", [&] {
+            auto next = current->cloneBase();
+            Logger::info("rebuilding the chain: " + std::to_string(plan.size()) + " effects, generation "
+                         + std::to_string(next->generation));
+            if (!buildGeneration(logicalDevice, *next, std::move(plan)))
+            {
+                Logger::err("chain rebuild failed; keeping the current generation");
+                return;
+            }
+            swapped = installGeneration(*logicalDevice, current->handle, current, std::move(next));
+        });
+        return swapped;
+    }
+
+    // Starts the build of `names` for `current`'s swapchain. The ReShade effects
+    // compile on the registry's worker; advanceChainBuild finishes the build at a
+    // later present, once the compile is done. A chain with nothing to compile is
+    // built at once. A newer request replaces an unfinished one.
+    bool beginChainBuild(LogicalDevice* logicalDevice, const std::shared_ptr<LogicalSwapchain>& current,
+                         const std::vector<std::string>& names)
+    {
+        SwapchainShared& shared = *current->shared;
+        EffectRegistry& registry = deviceControl(logicalDevice).effectRegistry;
+
+        auto pending = std::make_shared<PendingChain>();
+        pending->plan = planChain(names, config.get());
+        ChainCompileSpec spec = compileSpecFor(registry, *current, pending->plan);
+        // one channel per swapchain: a newer request supersedes this swapchain's older one only
+        spec.channel = reinterpret_cast<uint64_t>(&shared);
+
+        {
+            std::lock_guard<std::mutex> l(shared.pendingLock);
+            shared.pendingChain.reset();
+            shared.chainPending.store(false, std::memory_order_release);
+        }
+        if (spec.effects.empty())
+        {
+            if (shared.rebuildBusy.exchange(true, std::memory_order_acq_rel))
+                return false;  // another thread is finishing a chain of this swapchain
+            const bool swapped = installChain(logicalDevice, current, std::move(pending->plan));
+            shared.rebuildBusy.store(false, std::memory_order_release);
+            return swapped;
+        }
+
+        pending->future = registry.compiler().submit(std::move(spec));
+        std::lock_guard<std::mutex> l(shared.pendingLock);
+        shared.pendingChain = std::move(pending);
+        shared.chainPending.store(true, std::memory_order_release);
         return true;
     }
 
@@ -248,26 +378,57 @@ namespace
     {
         if (!logicalDevice || !current || !current->faked() || !current->shared)
             return false;
+        return beginChainBuild(logicalDevice, current, effects ? *effects : current->effectNames);
+    }
 
-        std::atomic<bool>& busy = current->shared->rebuildBusy;
-        if (busy.exchange(true, std::memory_order_acq_rel))
-            return false;  // another thread is already rebuilding this swapchain
+    void advanceChainBuild(LogicalDevice* logicalDevice, const std::shared_ptr<LogicalSwapchain>& current)
+    {
+        if (!logicalDevice || !current || !current->faked() || !current->shared)
+            return;
+        SwapchainShared& shared = *current->shared;
 
-        bool swapped = false;
-        guardLayerWork(logicalDevice, "chain rebuild", [&] {
-            auto next = current->cloneBase();
-            const std::vector<std::string>& names = effects ? *effects : current->effectNames;
-            Logger::info("rebuilding the chain: " + std::to_string(names.size()) + " effects, generation "
-                         + std::to_string(next->generation));
-            if (!buildGeneration(logicalDevice, *next, names))
+        // The first chain waits for the registry's initial build: its selection is not
+        // known before.
+        if (shared.chainWanted.load(std::memory_order_acquire))
+        {
+            EffectRegistry& registry = deviceControl(logicalDevice).effectRegistry;
+            if (registry.isInitializedFromConfig() && !registry.initializing() &&
+                shared.chainWanted.exchange(false, std::memory_order_acq_rel))
+                beginChainBuild(logicalDevice, current, registry.getSelectedEffects());
+        }
+
+        if (!shared.chainPending.load(std::memory_order_acquire))
+            return;
+        std::shared_ptr<PendingChain> pending;
+        {
+            std::lock_guard<std::mutex> l(shared.pendingLock);
+            pending = shared.pendingChain;
+        }
+        if (!pending || pending->future.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+            return;
+
+        // another thread finishing this swapchain's chain right now: try next present
+        if (shared.rebuildBusy.exchange(true, std::memory_order_acq_rel))
+            return;
+        {
+            std::lock_guard<std::mutex> l(shared.pendingLock);
+            if (shared.pendingChain != pending)
             {
-                Logger::err("chain rebuild failed; keeping the current generation");
-                return;
+                shared.rebuildBusy.store(false, std::memory_order_release);
+                return;  // replaced by a newer request meanwhile
             }
-            swapped = installGeneration(*logicalDevice, current->handle, current, std::move(next));
-        });
-        busy.store(false, std::memory_order_release);
-        return swapped;
+            shared.pendingChain.reset();
+            shared.chainPending.store(false, std::memory_order_release);
+        }
+        const ChainCompileResult& compiled = pending->future.get();
+        if (!compiled.cancelled)
+        {
+            for (ChainEntry& entry : pending->plan)
+                if (entry.compileIndex >= 0 && static_cast<size_t>(entry.compileIndex) < compiled.effects.size())
+                    entry.compiled = std::make_shared<const EffectCompileResult>(compiled.effects[entry.compileIndex]);
+            installChain(logicalDevice, current, std::move(pending->plan));
+        }
+        shared.rebuildBusy.store(false, std::memory_order_release);
     }
 
     void reloadAllSwapchains(LogicalDevice* logicalDevice, const std::vector<std::string>& activeEffects)
@@ -425,12 +586,10 @@ namespace
                 Logger::err("Failed to create swapchain image view " + std::to_string(i) + ": " + std::to_string(viewResult));
         }
 
-        // Initialize registry from config on first run (before calculating effect slots)
-        const bool isFirstRun = !effectRegistry.isInitializedFromConfig();
-        if (isFirstRun)
-            effectRegistry.initializeSelectedEffectsFromConfig();
-
-        const auto selectedEffects = effectRegistry.getSelectedEffects();
+        // The first swapchain of the device starts its chain as soon as the registry's
+        // initial build (on its worker) has the selection; later ones are resizes
+        DeviceControlState& control = deviceControl(logicalDevice);
+        const bool isFirstRun = !control.firstChainStarted.exchange(true, std::memory_order_acq_rel);
 
         // Three sets of images however long the chain is: the game-facing fakes and
         // the two ping-pong images the effects alternate between (H21).
@@ -487,23 +646,25 @@ namespace
         next->overlaySemaphores  = shared.overlaySemaphores;
         next->effectSubmitFences = shared.effectFences;
 
-        std::vector<std::string> effectNames;
-        if (!isFirstRun && !selectedEffects.empty())
+        // The first generation carries no effects (a pass-through chain): their
+        // shaders compile on the registry's worker and present swaps the chain in
+        // when they are done. A later swapchain (a resize) waits out the debounce.
+        if (isFirstRun)
+        {
+            shared.chainWanted.store(true, std::memory_order_release);
+        }
+        else if (!control.effectRegistry.getSelectedEffects().empty())
         {
             // Resize with effects - use pass-through and debounce for smooth resize
             Logger::debug("using pass-through during resize, will restore effects after debounce");
-            deviceControl(logicalDevice).noteResize();
-        }
-        else
-        {
-            effectNames = selectedEffects;
+            control.noteResize();
         }
 
         // the capture targets the effects will sample (only while depth capture is on)
         if (logicalDevice->depth)
             shared.depthCapture = DepthCapture::create(logicalDevice, next->imageExtent, next->imageCount);
 
-        if (!buildGeneration(logicalDevice, *next, std::move(effectNames)))
+        if (!buildGeneration(logicalDevice, *next, ChainPlan{}))
             return passthroughGeneration("the effect chain could not be built");
 
         Logger::debug("built chain generation " + std::to_string(next->generation) + " with "
@@ -658,7 +819,7 @@ namespace
             skeleton->handle = *swapchain;
 
             // The usable extent is known now; effects compile against it.
-            effectRegistry.setCompileExtent(skeleton->imageExtent.width, skeleton->imageExtent.height);
+            deviceControl(logicalDevice).effectRegistry.setCompileExtent(skeleton->imageExtent.width, skeleton->imageExtent.height);
 
             std::shared_ptr<LogicalSwapchain> replaced;
             {

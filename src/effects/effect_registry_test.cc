@@ -83,12 +83,16 @@ int main(int argc, char** argv)
                             << "MultiTechnique.BaseGain = 0.8\n"
                             << "MultiTechnique@MULTI_EXTRA = 1\n"
                             << "MultiTechnique.2.BaseGain = 0.1\n";
-    Config config(confPath.string());
+    const auto configOwner = std::make_shared<Config>(confPath.string());
+    Config& config = *configOwner;
 
     {
         EffectRegistry registry;
         registry.setCompileExtent(640, 360);
-        registry.initialize(&config);
+        registry.initialize(configOwner);
+        // the build runs on the registry's worker; the entries are there once it is idle
+        expect(registry.waitForParses(std::chrono::seconds(120)) && !registry.initializing() && registry.isInitializedFromConfig(),
+               "initialize finishes and seeds the selection");
 
         // migration: the first technique of the file, copy numbers kept
         const auto all = registry.getAllEffects();
@@ -236,9 +240,9 @@ int main(int argc, char** argv)
 
     // a registry destroyed with a re-parse in flight must not hang or crash
     {
-        Config again(confPath.string());
+        const auto again = std::make_shared<Config>(confPath.string());
         EffectRegistry registry;
-        registry.initialize(&again);
+        registry.initialize(again);
         registry.setPreprocessorDefValue(single, "MULTI_EXTRA", "0");
     }
 

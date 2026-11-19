@@ -56,7 +56,7 @@ namespace VkHook
     class OverlayControl
     {
     public:
-        explicit OverlayControl(LogicalDevice* device);
+        OverlayControl(LogicalDevice* device, EffectRegistry* registry);
         // Destroys the UI: every OverlayRenderer made from it must be gone.
         ~OverlayControl();
         OverlayControl(const OverlayControl&) = delete;

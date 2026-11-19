@@ -51,13 +51,19 @@ namespace VkHook
     class EffectRegistry
     {
     public:
-        EffectRegistry();
+        // `config` is the root config entries and parameters read saved values from;
+        // nothing is parsed until initialize().
+        explicit EffectRegistry(std::shared_ptr<Config> config = nullptr);
         ~EffectRegistry();
         EffectRegistry(const EffectRegistry&) = delete;
         EffectRegistry& operator=(const EffectRegistry&) = delete;
 
-        // Initialize registry from config file
-        void initialize(Config* config);
+        // Makes `config` the registry's root config and rebuilds every entry from its
+        // `effects` list. Returns at once: the parses and compile checks run on the
+        // compile worker, which swaps the finished list in. The first build also seeds
+        // the selected chain from the config. A newer call supersedes a build still
+        // queued; see initializing() and waitForParses().
+        void initialize(std::shared_ptr<Config> config);
 
         // A snapshot of every entry (enabled + disabled), without parameters.
         std::vector<EffectConfig> getAllEffects() const;
@@ -166,8 +172,10 @@ namespace VkHook
         // Check if effects have been initialized from config (first load complete)
         bool isInitializedFromConfig() const { return initializedFromConfig.load(std::memory_order_acquire); }
 
-        // Initialize selected effects from config (call once at startup)
-        void initializeSelectedEffectsFromConfig();
+        // True while an initialize() has not finished building. The entries are
+        // those of the previous config until it has; callers that need the new
+        // ones (or must not re-parse what the build is about to provide) wait.
+        bool initializing() const;
 
         // The codegen options parses and re-parses compile with. They are part of
         // the compile cache's key, so a chain build that compiled with a device's
@@ -198,6 +206,12 @@ namespace VkHook
         // EffectConfig called config, and this is a different type entirely --
         // the parsed VkHook.conf.
         std::atomic<Config*> rootConfig{nullptr};
+        // keeps rootConfig alive (the control step replaces its Config on a profile
+        // switch); the previous ones linger like retired parameter sets
+        std::shared_ptr<Config> rootOwner;
+        std::deque<std::shared_ptr<Config>> retiredRoots;
+        uint64_t initVersion = 0;   // newest initialize(), guarded by mutex
+        int initsPending = 0;       // initialize() calls not yet finished, guarded by parseMutex
         ReshadeCodegenOptions codegen;
         uint32_t compileWidth = 1920;
         uint32_t compileHeight = 1080;
@@ -210,7 +224,7 @@ namespace VkHook
         mutable std::set<std::string> warnedMissing;
 
         // macro re-parses in flight
-        std::mutex              parseMutex;
+        mutable std::mutex      parseMutex;
         std::condition_variable parseIdle;
         int                     parsesPending = 0;
 
@@ -251,6 +265,8 @@ namespace VkHook
         static const EffectParam* findParam(const EffectEntry& effect, const std::string& paramName);
 
         void applyReparse(const std::string& name, uint64_t version, const EffectCompileResult& result);
+        void buildAll(const std::shared_ptr<Config>& config, uint64_t version);
+        void setRootLocked(std::shared_ptr<Config> config);
     };
 
 } // namespace VkHook

@@ -22,6 +22,9 @@ namespace VkHook
         // (ReshadeEffect::updateFrame) re-resolve their pointers on the next
         // frame after a bump; this is far more than one frame.
         constexpr size_t kRetiredParameterSets = 32;
+        // Compile-worker channels: reparses use odd ones (hash << 1 | 1), chain
+        // builds multiples of four, initialize this one.
+        constexpr uint64_t kInitializeChannel = 2;
 
         bool hasFxExtension(const std::filesystem::path& path)
         {
@@ -129,9 +132,11 @@ namespace VkHook
         }
     } // anonymous namespace
 
-    EffectRegistry::EffectRegistry()
+    EffectRegistry::EffectRegistry(std::shared_ptr<Config> config)
         : cache(makeDefaultShaderCache()), worker(std::make_unique<EffectCompiler>(*cache))
     {
+        std::lock_guard<std::mutex> lock(mutex);
+        setRootLocked(std::move(config));
     }
 
     EffectRegistry::~EffectRegistry()
@@ -420,8 +425,61 @@ namespace VkHook
 
     // --- initialization --------------------------------------------------------------
 
-    void EffectRegistry::initialize(Config* config)
+    void EffectRegistry::setRootLocked(std::shared_ptr<Config> config)
     {
+        // A reader may have loaded the raw pointer an instant before the swap; the
+        // old owner lingers for a few swaps, like retired parameter sets.
+        if (rootOwner)
+        {
+            retiredRoots.push_back(std::move(rootOwner));
+            while (retiredRoots.size() > kRetiredParameterSets)
+                retiredRoots.pop_front();
+        }
+        rootOwner = std::move(config);
+        rootConfig.store(rootOwner.get(), std::memory_order_release);
+    }
+
+    void EffectRegistry::initialize(std::shared_ptr<Config> config)
+    {
+        if (!config)
+            return;
+        uint64_t version;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            setRootLocked(config);
+            version = ++initVersion;
+            pendingEnabled.clear();
+        }
+        {
+            std::lock_guard<std::mutex> lock(parseMutex);
+            ++parsesPending;
+            ++initsPending;
+        }
+        // The work runs in the completion callback of an empty chain: the worker
+        // is the one thread allowed to parse and compile. A newer initialize
+        // supersedes a queued one on this channel (its callback sees `cancelled`).
+        ChainCompileSpec chain;
+        chain.channel = kInitializeChannel;
+        worker->submit(std::move(chain), [this, config = std::move(config), version](const ChainCompileResult& result) {
+            if (!result.cancelled)
+                buildAll(config, version);
+            std::lock_guard<std::mutex> lock(parseMutex);
+            --initsPending;
+            if (--parsesPending == 0)
+                parseIdle.notify_all();
+        });
+    }
+
+    bool EffectRegistry::initializing() const
+    {
+        std::lock_guard<std::mutex> lock(parseMutex);
+        return initsPending > 0;
+    }
+
+    // Runs on the compile worker.
+    void EffectRegistry::buildAll(const std::shared_ptr<Config>& configOwner, uint64_t version)
+    {
+        Config* config = configOwner.get();
         uint32_t width;
         uint32_t height;
         {
@@ -438,6 +496,9 @@ namespace VkHook
         // is held, and the finished list replaces the old one in one step.
         std::list<EffectEntry> built;
         std::unordered_map<std::string, std::string> builtAliases;
+        // the chain the config names, minus the names with no installed shader (a
+        // stale config must not seed a ghost), as the entries' ids
+        std::vector<std::string> seeded;
         auto taken = [&](const EffectId& id) {
             return std::any_of(built.begin(), built.end(), [&](const EffectEntry& e) { return e.info.id == id; });
         };
@@ -466,22 +527,33 @@ namespace VkHook
             // Set enabled state based on disabledEffects list
             if (disabledSet.count(name) || disabledSet.count(entry->info.name))
                 entry->info.enabled = false;
+            seeded.push_back(entry->info.name);
             built.push_back(std::move(*entry));
         }
 
+        std::lock_guard<std::mutex> lock(mutex);
+        if (version != initVersion)
+            return;  // a newer initialize is already on its way
+        for (auto& old : entries)
+            retireParameters(std::move(old.parameters));
+        entries.swap(built);
+        aliases.swap(builtAliases);
+        // enabled states the control step set while this was building
+        for (const auto& [key, enabled] : pendingEnabled)
+            if (EffectEntry* entry = findEntry(key))
+                entry->info.enabled = enabled;
+        pendingEnabled.clear();
+        // the first build also seeds the chain; later ones keep the selection the
+        // control step made for the new config
+        if (!initializedFromConfig.load(std::memory_order_acquire))
         {
-            std::lock_guard<std::mutex> lock(mutex);
-            rootConfig.store(config, std::memory_order_release);
-            for (auto& old : entries)
-                retireParameters(std::move(old.parameters));
-            entries.swap(built);
-            aliases.swap(builtAliases);
-            pendingEnabled.clear();
-            for (auto& name : selectedEffects)
-                name = canonicalLocked(name);
-            paramGeneration.fetch_add(1, std::memory_order_release);
-            Logger::debug("EffectRegistry: initialized " + std::to_string(entries.size()) + " effects");
+            selectedEffects = std::move(seeded);
+            initializedFromConfig.store(true, std::memory_order_release);
         }
+        for (auto& name : selectedEffects)
+            name = canonicalLocked(name);
+        paramGeneration.fetch_add(1, std::memory_order_release);
+        Logger::debug("EffectRegistry: initialized " + std::to_string(entries.size()) + " effects");
     }
 
     ReshadePreprocessSetup EffectRegistry::preprocessSetup(uint32_t bufferWidth,
@@ -967,54 +1039,6 @@ namespace VkHook
     {
         std::lock_guard<std::mutex> lock(mutex);
         selectedEffects.clear();
-    }
-
-    void EffectRegistry::initializeSelectedEffectsFromConfig()
-    {
-        Config* root = rootConfig.load(std::memory_order_acquire);
-        if (initializedFromConfig.load(std::memory_order_acquire) || !root)
-            return;
-
-        // Read effects list from config
-        std::vector<std::string> configEffects = root->getOption<std::vector<std::string>>("effects", {});
-        std::vector<std::string> disabledEffects = root->getOption<std::vector<std::string>>("disabledEffects", {});
-
-        // drop the removed built-ins and anything with no installed .fx, so a
-        // stale config never seeds a ghost instance in the selected list
-        configEffects.erase(
-            std::remove_if(configEffects.begin(), configEffects.end(),
-                           [&](const std::string& name) {
-                               return resolveEffectPath(name, root).empty();
-                           }),
-            configEffects.end());
-
-        // Build set of disabled effects for quick lookup
-        std::set<std::string> disabledSet(disabledEffects.begin(), disabledEffects.end());
-
-        // Set selected effects
-        {
-            std::lock_guard<std::mutex> lock(mutex);
-            selectedEffects = configEffects;
-        }
-
-        // Ensure effects exist in registry before setting enabled states
-        for (const auto& effectName : configEffects)
-            ensureEffect(effectName);
-
-        // Set enabled states (disabled if in disabledEffects list)
-        for (const auto& effectName : configEffects)
-            setEffectEnabled(effectName, disabledSet.find(effectName) == disabledSet.end());
-
-        {
-            // legacy names in the list become the ids they migrated to
-            std::lock_guard<std::mutex> lock(mutex);
-            for (auto& name : selectedEffects)
-                name = canonicalLocked(name);
-        }
-
-        initializedFromConfig.store(true, std::memory_order_release);
-        Logger::debug("EffectRegistry: initialized " + std::to_string(configEffects.size()) +
-                      " effects from config (" + std::to_string(disabledEffects.size()) + " disabled)");
     }
 
 } // namespace VkHook

@@ -20,6 +20,7 @@ namespace VkHook
     class InputSession;
     class OverlayRenderer;
     class DepthCapture;  // depth/capture.hh
+    struct PendingChain;  // present/swapchain.cc
 
     // Swapchain-lifetime resources and the per-image frame ring, shared by every
     // chain generation of one swapchain. The game holds the fake images, and the
@@ -75,6 +76,17 @@ namespace VkHook
         // Held by the thread that is rebuilding this swapchain's chain; a second
         // rebuild request skips instead of waiting (it never blocks).
         std::atomic<bool> rebuildBusy{false};
+
+        // The chain being compiled on the effect registry's worker: present polls it
+        // (present/swapchain.cc advanceChainBuild) and swaps the generation in once
+        // it is done. `pendingLock` guards `pendingChain` only; `chainPending`
+        // mirrors it for a lock-free check.
+        std::mutex                    pendingLock;
+        std::shared_ptr<PendingChain> pendingChain;
+        std::atomic<bool>             chainPending{false};
+        // The swapchain's first chain is not requested yet: it needs the registry's
+        // initial build (the selected effects), which finishes on the worker.
+        std::atomic<bool>             chainWanted{false};
 
         // Releases every object now. `gpuIdle` says the caller proved the layer's
         // submissions on this swapchain complete (vkDestroySwapchainKHR waited
