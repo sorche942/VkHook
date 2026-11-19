@@ -1220,7 +1220,6 @@ namespace VkHook
                 createShaderModule(logicalDevice, full_screen_triangle_vert, &vertexModule);
                 createShaderModule(logicalDevice, depth_resolve_universal_frag, &fragmentModule);
 
-                VkExtent2D resolveExtent2D = {logicalSwapchain->depthResolveExtent.width, logicalSwapchain->depthResolveExtent.height};
                 logicalSwapchain->depthResolvePipeline = createGraphicsPipeline(logicalDevice,
                                                                                  vertexModule,
                                                                                  nullptr,
@@ -1228,10 +1227,8 @@ namespace VkHook
                                                                                  fragmentModule,
                                                                                  nullptr,
                                                                                  "main",
-                                                                                 resolveExtent2D,
                                                                                  logicalSwapchain->depthResolveTransformRenderPass,
                                                                                  logicalSwapchain->depthResolvePipelineLayout,
-                                                                                 false,
                                                                                  1);
                 logicalDevice->vkd.DestroyShaderModule(logicalDevice->device, fragmentModule, nullptr);
                 logicalDevice->vkd.DestroyShaderModule(logicalDevice->device, vertexModule, nullptr);
@@ -1287,7 +1284,6 @@ namespace VkHook
                                                                          fragmentModule,
                                                                          nullptr,
                                                                          "main",
-                                                                         resolveExtent2D,
                                                                          logicalSwapchain->depthResolveRenderPass,
                                                                          logicalSwapchain->depthResolvePipelineLayout);
         logicalDevice->vkd.DestroyShaderModule(logicalDevice->device, fragmentModule, nullptr);

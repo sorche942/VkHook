@@ -3,6 +3,7 @@
 #include <algorithm>
 
 #include "format.hh"
+#include "graphics_pipeline.hh"
 #include "image_view.hh"
 #include "logical_swapchain.hh"
 #include "settings_manager.hh"
@@ -300,6 +301,7 @@ namespace VkHook
                                                   0,
                                                   nullptr);
         logicalDevice->vkd.CmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, logicalSwapchain->depthResolvePipeline);
+        cmdSetViewportScissor(logicalDevice, commandBuffer, renderPassBeginInfo.renderArea.extent);
         
         pushDepthTransformConstants(logicalDevice, logicalSwapchain, commandBuffer);
         
@@ -568,6 +570,7 @@ namespace VkHook
                                                   0,
                                                   nullptr);
         logicalDevice->vkd.CmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, logicalSwapchain->depthResolvePipeline);
+        cmdSetViewportScissor(logicalDevice, commandBuffer, beginInfo.renderArea.extent);
         pushDepthTransformConstants(logicalDevice, logicalSwapchain, commandBuffer);
         logicalDevice->vkd.CmdDraw(commandBuffer, 3, 1, 0, 0);
         logicalDevice->vkd.CmdEndRenderPass(commandBuffer);

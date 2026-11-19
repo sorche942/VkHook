@@ -7,17 +7,21 @@ namespace VkHook
     VkDescriptorPool createDescriptorPool(LogicalDevice* logicalDevice, const std::vector<VkDescriptorPoolSize>& poolSizes)
     {
         uint32_t setCount = 0;
+        for (const VkDescriptorPoolSize& size : poolSizes)
+            setCount += size.descriptorCount;
+        return createDescriptorPool(logicalDevice, poolSizes, setCount);
+    }
 
+    VkDescriptorPool createDescriptorPool(LogicalDevice*                          logicalDevice,
+                                          const std::vector<VkDescriptorPoolSize>& poolSizes,
+                                          uint32_t                                maxSets)
+    {
         VkDescriptorPool descriptorPool;
-        for (uint32_t i = 0; i < poolSizes.size(); i++)
-        {
-            setCount += poolSizes[i].descriptorCount;
-        }
         VkDescriptorPoolCreateInfo descriptorPoolCreateInfo;
         descriptorPoolCreateInfo.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
         descriptorPoolCreateInfo.pNext         = nullptr;
         descriptorPoolCreateInfo.flags         = 0;
-        descriptorPoolCreateInfo.maxSets       = setCount;
+        descriptorPoolCreateInfo.maxSets       = maxSets;
         descriptorPoolCreateInfo.poolSizeCount = poolSizes.size();
         descriptorPoolCreateInfo.pPoolSizes    = poolSizes.data();
 
@@ -55,7 +59,9 @@ namespace VkHook
     VkDescriptorSet writeBufferDescriptorSet(LogicalDevice*        logicalDevice,
                                              VkDescriptorPool      descriptorPool,
                                              VkDescriptorSetLayout descriptorSetLayout,
-                                             VkBuffer              buffer)
+                                             VkBuffer              buffer,
+                                             VkDeviceSize          offset,
+                                             VkDeviceSize          range)
     {
         VkDescriptorSet descriptorSet;
 
@@ -71,8 +77,8 @@ namespace VkHook
 
         VkDescriptorBufferInfo bufferInfo;
         bufferInfo.buffer = buffer;
-        bufferInfo.offset = 0;
-        bufferInfo.range  = VK_WHOLE_SIZE;
+        bufferInfo.offset = offset;
+        bufferInfo.range  = range;
 
         VkWriteDescriptorSet writeDescriptorSet = {};
 
