@@ -30,7 +30,8 @@
 
           vkhook = pkgs.stdenv.mkDerivation {
             pname = "vkhook";
-            version = "0.1.0-unstable-${self.shortRev or "dirty"}";
+            # VERSION at the repository root is the one place the number lives
+            version = nixpkgs.lib.removePrefix "v" (nixpkgs.lib.fileContents (self + "/VERSION"));
 
             src = self;
 
