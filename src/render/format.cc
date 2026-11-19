@@ -89,11 +89,6 @@ namespace VkHook
         return convertToUNORM(format) != format;
     }
 
-    bool isUNORM(VkFormat format)
-    {
-        return convertToSRGB(format) != format;
-    }
-
     VkFormat getSupportedFormat(LogicalDevice* logicalDevice, std::vector<VkFormat> formats, VkFormatFeatureFlags features, VkImageTiling tiling)
     {
         for (auto& format : formats)

@@ -6,6 +6,94 @@
 
 namespace VkHook
 {
+    namespace
+    {
+        VkCommandBuffer allocateOneTimeCommandBuffer(LogicalDevice* logicalDevice, const char* what)
+        {
+            VkCommandBufferAllocateInfo allocInfo = {};
+            allocInfo.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+            allocInfo.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+            allocInfo.commandPool        = logicalDevice->commandPool;
+            allocInfo.commandBufferCount = 1;
+
+            VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
+            const VkResult result = logicalDevice->vkd.AllocateCommandBuffers(logicalDevice->device, &allocInfo, &commandBuffer);
+            if (result != VK_SUCCESS || commandBuffer == VK_NULL_HANDLE)
+            {
+                Logger::err(std::string(what) + ": vkAllocateCommandBuffers failed: " + std::to_string(result));
+                return VK_NULL_HANDLE;
+            }
+            // initialize dispatch table for commandBuffer since it is a dispatchable object
+            initializeDispatchTable(commandBuffer, logicalDevice->device);
+
+            VkCommandBufferBeginInfo beginInfo = {};
+            beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+            beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            const VkResult beginResult = logicalDevice->vkd.BeginCommandBuffer(commandBuffer, &beginInfo);
+            if (beginResult != VK_SUCCESS)
+            {
+                Logger::err(std::string(what) + ": vkBeginCommandBuffer failed: " + std::to_string(beginResult));
+                logicalDevice->vkd.FreeCommandBuffers(logicalDevice->device, logicalDevice->commandPool, 1, &commandBuffer);
+                return VK_NULL_HANDLE;
+            }
+            return commandBuffer;
+        }
+
+        // Ends, submits and synchronously waits for `commandBuffer`, then releases
+        // it together with the optional staging buffer and memory. Returns whether
+        // the work completed. When the GPU has not finished within the bounded
+        // wait, the objects it may still read are released behind a later idle.
+        bool finishOneTimeCommands(LogicalDevice* logicalDevice,
+                                   VkCommandBuffer commandBuffer,
+                                   const char* what,
+                                   const char* waitLabel,
+                                   VkBuffer stagingBuffer = VK_NULL_HANDLE,
+                                   VkDeviceMemory stagingMemory = VK_NULL_HANDLE)
+        {
+            const VkDevice device = logicalDevice->device;
+            const VkCommandPool pool = logicalDevice->commandPool;
+            const auto vkd = logicalDevice->vkd;
+            const auto releaseAll = [vkd, device, pool, commandBuffer, stagingBuffer, stagingMemory] {
+                vkd.FreeCommandBuffers(device, pool, 1, &commandBuffer);
+                if (stagingBuffer != VK_NULL_HANDLE)
+                    vkd.DestroyBuffer(device, stagingBuffer, nullptr);
+                if (stagingMemory != VK_NULL_HANDLE)
+                    vkd.FreeMemory(device, stagingMemory, nullptr);
+            };
+
+            const VkResult endResult = logicalDevice->vkd.EndCommandBuffer(commandBuffer);
+            if (endResult != VK_SUCCESS)
+            {
+                Logger::err(std::string(what) + ": vkEndCommandBuffer failed: " + std::to_string(endResult));
+                releaseAll();
+                return false;
+            }
+
+            VkSubmitInfo submitInfo       = {};
+            submitInfo.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            submitInfo.commandBufferCount = 1;
+            submitInfo.pCommandBuffers    = &commandBuffer;
+
+            const VkResult submitResult = logicalDevice->vkd.QueueSubmit(logicalDevice->queue, 1, &submitInfo, VK_NULL_HANDLE);
+            if (submitResult != VK_SUCCESS)
+            {
+                // Nothing was queued, so nothing can still be reading these.
+                Logger::err(std::string(what) + ": vkQueueSubmit failed: " + std::to_string(submitResult));
+                releaseAll();
+                return false;
+            }
+
+            if (!waitQueueIdleBounded(logicalDevice, waitLabel))
+            {
+                DeferredDestroyQueue::instance().push(DestroyPhase::Resource, releaseAll);
+                return false;
+            }
+
+            releaseAll();
+            return true;
+        }
+    } // namespace
+
     std::vector<VkImage> createImages(LogicalDevice*        logicalDevice,
                                       uint32_t              count,
                                       VkExtent3D            extent,
@@ -78,6 +166,14 @@ namespace VkHook
         memoryAllocateInfo.pNext           = nullptr;
         memoryAllocateInfo.allocationSize  = memoryRequirements.size * count;
         memoryAllocateInfo.memoryTypeIndex = findMemoryTypeIndex(logicalDevice, memoryRequirements.memoryTypeBits, properties);
+        if (memoryAllocateInfo.memoryTypeIndex == kInvalidMemoryTypeIndex)
+        {
+            Logger::err("createImages: no suitable memory type");
+            for (auto image : images)
+                logicalDevice->vkd.DestroyImage(logicalDevice->device, image, nullptr);
+            imageMemory = VK_NULL_HANDLE;
+            return {};
+        }
 
         result = logicalDevice->vkd.AllocateMemory(logicalDevice->device, &memoryAllocateInfo, nullptr, &imageMemory);
         if (result != VK_SUCCESS)
@@ -136,31 +232,13 @@ namespace VkHook
         std::memcpy(data, writeData, size);
         logicalDevice->vkd.UnmapMemory(logicalDevice->device, stagingMemory);
 
-        VkCommandBufferAllocateInfo allocInfo = {};
-
-        allocInfo.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-        allocInfo.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        allocInfo.commandPool        = logicalDevice->commandPool;
-        allocInfo.commandBufferCount = 1;
-
-        VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
-        result = logicalDevice->vkd.AllocateCommandBuffers(logicalDevice->device, &allocInfo, &commandBuffer);
-        if (result != VK_SUCCESS || commandBuffer == VK_NULL_HANDLE)
+        VkCommandBuffer commandBuffer = allocateOneTimeCommandBuffer(logicalDevice, "uploadToImage");
+        if (commandBuffer == VK_NULL_HANDLE)
         {
-            Logger::err("uploadToImage: vkAllocateCommandBuffers failed: " + std::to_string(result));
             logicalDevice->vkd.DestroyBuffer(logicalDevice->device, stagingBuffer, nullptr);
             logicalDevice->vkd.FreeMemory(logicalDevice->device, stagingMemory, nullptr);
             return;
         }
-        // initialize dispatch table for commandBuffer since it is a dispatchable object
-        initializeDispatchTable(commandBuffer, logicalDevice->device);
-
-        VkCommandBufferBeginInfo beginInfo = {};
-
-        beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-
-        logicalDevice->vkd.BeginCommandBuffer(commandBuffer, &beginInfo);
 
         VkImageMemoryBarrier memoryBarrier;
         memoryBarrier.sType                           = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -204,35 +282,7 @@ namespace VkHook
 
         generateMipMaps(logicalDevice, commandBuffer, image, extent, mipLevels);
 
-        logicalDevice->vkd.EndCommandBuffer(commandBuffer);
-
-        VkSubmitInfo submitInfo = {};
-
-        submitInfo.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        submitInfo.commandBufferCount = 1;
-        submitInfo.pCommandBuffers    = &commandBuffer;
-
-        logicalDevice->vkd.QueueSubmit(logicalDevice->queue, 1, &submitInfo, VK_NULL_HANDLE);
-        if (!waitQueueIdleBounded(logicalDevice, "image upload sync"))
-        {
-            // the upload may still be reading these; a later idle releases them
-            VkDevice device = logicalDevice->device;
-            VkCommandPool pool = logicalDevice->commandPool;
-            auto vkd = logicalDevice->vkd;
-            VkCommandBuffer cb = commandBuffer;
-            VkBuffer buf = stagingBuffer;
-            VkDeviceMemory mem = stagingMemory;
-            DeferredDestroyQueue::instance().push(DestroyPhase::Resource, [vkd, device, pool, cb, buf, mem] {
-                vkd.FreeCommandBuffers(device, pool, 1, &cb);
-                vkd.DestroyBuffer(device, buf, nullptr);
-                vkd.FreeMemory(device, mem, nullptr);
-            });
-            return;
-        }
-
-        logicalDevice->vkd.FreeCommandBuffers(logicalDevice->device, logicalDevice->commandPool, 1, &commandBuffer);
-        logicalDevice->vkd.FreeMemory(logicalDevice->device, stagingMemory, nullptr);
-        logicalDevice->vkd.DestroyBuffer(logicalDevice->device, stagingBuffer, nullptr);
+        finishOneTimeCommands(logicalDevice, commandBuffer, "uploadToImage", "image upload sync", stagingBuffer, stagingMemory);
     }
 
     VkImage createSingleImage(LogicalDevice*        logicalDevice,
@@ -254,24 +304,9 @@ namespace VkHook
 
     void changeImageLayout(LogicalDevice* logicalDevice, const std::vector<VkImage>& images, uint32_t mipLevels)
     {
-        VkCommandBufferAllocateInfo allocInfo = {};
-
-        allocInfo.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-        allocInfo.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        allocInfo.commandPool        = logicalDevice->commandPool;
-        allocInfo.commandBufferCount = 1;
-
-        VkCommandBuffer commandBuffer;
-        logicalDevice->vkd.AllocateCommandBuffers(logicalDevice->device, &allocInfo, &commandBuffer);
-        // initialize dispatch table for commandBuffer since it is a dispatchable object
-        initializeDispatchTable(commandBuffer, logicalDevice->device);
-
-        VkCommandBufferBeginInfo beginInfo = {};
-
-        beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-
-        logicalDevice->vkd.BeginCommandBuffer(commandBuffer, &beginInfo);
+        VkCommandBuffer commandBuffer = allocateOneTimeCommandBuffer(logicalDevice, "changeImageLayout");
+        if (commandBuffer == VK_NULL_HANDLE)
+            return;
 
         VkImageMemoryBarrier memoryBarrier;
         memoryBarrier.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -308,28 +343,7 @@ namespace VkHook
                 commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &memoryBarrier);
         }
 
-        logicalDevice->vkd.EndCommandBuffer(commandBuffer);
-
-        VkSubmitInfo submitInfo       = {};
-        submitInfo.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        submitInfo.commandBufferCount = 1;
-        submitInfo.pCommandBuffers    = &commandBuffer;
-
-        logicalDevice->vkd.QueueSubmit(logicalDevice->queue, 1, &submitInfo, VK_NULL_HANDLE);
-        if (!waitQueueIdleBounded(logicalDevice, "image layout sync"))
-        {
-            // the transition may still be pending; free the buffer behind a later idle
-            VkDevice device = logicalDevice->device;
-            VkCommandPool pool = logicalDevice->commandPool;
-            auto vkd = logicalDevice->vkd;
-            VkCommandBuffer cb = commandBuffer;
-            DeferredDestroyQueue::instance().push(DestroyPhase::Resource, [vkd, device, pool, cb] {
-                vkd.FreeCommandBuffers(device, pool, 1, &cb);
-            });
-            return;
-        }
-
-        logicalDevice->vkd.FreeCommandBuffers(logicalDevice->device, logicalDevice->commandPool, 1, &commandBuffer);
+        finishOneTimeCommands(logicalDevice, commandBuffer, "changeImageLayout", "image layout sync");
     }
 
     void generateMipMaps(LogicalDevice* logicalDevice, VkCommandBuffer commandBuffer, VkImage image, VkExtent3D extent, uint32_t mipLevels)
