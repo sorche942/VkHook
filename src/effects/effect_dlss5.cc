@@ -256,6 +256,8 @@ namespace VkHook
         // Record the expensive graph once. Swapchain command buffers reuse this
         // secondary; depth descriptor rebuilds never allocate another network.
         VkCommandPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+        // the command buffers are re-recorded, which needs the reset flag
+        poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
         poolInfo.queueFamilyIndex = device->queueFamilyIndex;
         VK_CHECK(device->vkd.CreateCommandPool(device->device, &poolInfo, nullptr, &s.commandPool));
         VkCommandBufferAllocateInfo allocation{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};

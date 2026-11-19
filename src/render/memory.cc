@@ -1,30 +1,19 @@
 #include "memory.hh"
 
-#include <mutex>
-#include <unordered_map>
 
 namespace VkHook
 {
     namespace
     {
         // A physical device's memory properties never change, and the lookup used
-        // to run a driver call for every buffer and image. Keyed by physical
-        // device so several devices (and instances) each keep their own entry.
+        // to run a driver call for every buffer and image. Cached per device.
         const VkPhysicalDeviceMemoryProperties& cachedMemoryProperties(LogicalDevice* logicalDevice)
         {
-            static std::mutex cacheMutex;
-            static std::unordered_map<VkPhysicalDevice, VkPhysicalDeviceMemoryProperties> cache;
-
-            std::lock_guard<std::mutex> lock(cacheMutex);
-            auto it = cache.find(logicalDevice->physicalDevice);
-            if (it == cache.end())
-            {
-                VkPhysicalDeviceMemoryProperties properties = {};
-                logicalDevice->vki.GetPhysicalDeviceMemoryProperties(logicalDevice->physicalDevice, &properties);
-                it = cache.emplace(logicalDevice->physicalDevice, properties).first;
-            }
-            // unordered_map references stay valid across later insertions.
-            return it->second;
+            std::call_once(logicalDevice->memoryPropertiesOnce, [logicalDevice] {
+                logicalDevice->vki.GetPhysicalDeviceMemoryProperties(logicalDevice->physicalDevice,
+                                                                     &logicalDevice->memoryProperties);
+            });
+            return logicalDevice->memoryProperties;
         }
     } // namespace
 

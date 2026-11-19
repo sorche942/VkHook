@@ -97,7 +97,7 @@ namespace
         }
         if (!depthValid)
         {
-            Logger::debug("QueueSubmit v3: skipping invalid/stale depth state");
+            VKHOOK_LOG_DEBUG([](std::string& s) { s = "QueueSubmit v3: skipping invalid/stale depth state"; });
             return forwardSubmit(logicalDevice, app, queue, submitCount, pSubmits, fence, "vkQueueSubmit(passthrough-invalid-depth)");
         }
 

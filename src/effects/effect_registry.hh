@@ -137,8 +137,10 @@ namespace VkHook
         mutable std::mutex mutex;
         std::atomic<uint64_t> paramGeneration{0};
 
-        // Initialize ReShade effect config
-        void initReshadeEffect(const std::string& name, const std::string& path);
+        // Parses and compile-checks one ReShade effect into a config. Reads files
+        // and runs the compiler: call it with no lock held.
+        EffectConfig buildReshadeEffect(const std::string& name, const std::string& path, Config* root,
+                                        uint32_t width, uint32_t height) const;
 
         // Internal helpers (assume mutex is held)
         // optional, not a raw pointer: a null here genuinely means "no such

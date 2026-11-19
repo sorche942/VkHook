@@ -111,9 +111,11 @@ namespace
 
         unregisterInstance(GetKey(instance));
 
-        // final teardown: no instance left, so no device can queue a write again
+        // Last instance gone: every queued write lands before the application can
+        // exit. The writer keeps running, so an instance the application creates
+        // afterwards still persists its settings.
         if (noInstancesRegistered())
-            PersistenceQueue::instance().shutdown();
+            PersistenceQueue::instance().waitForIdle();
     }
 
     // Looks the instance up under the lock and resolves the next layer's

@@ -115,6 +115,9 @@ namespace VkHook
         uint32_t                 gpuVendorId = 0;
         // Physical device properties, filled at vkCreateDevice (pipeline cache key)
         VkPhysicalDeviceProperties gpuProperties = {};
+        // Memory types never change; read from the driver on the first allocation (render/memory.cc)
+        std::once_flag             memoryPropertiesOnce;
+        VkPhysicalDeviceMemoryProperties memoryProperties = {};
         bool                     gpuCrashDiagnosticsEnabled = false;
         bool                     supportsNvDiagnosticCheckpoints = false;
         bool                     supportsNvDiagnosticsConfig = false;

@@ -209,10 +209,13 @@ namespace VkHook
 
     void EffectRegistry::initialize(Config* config)
     {
-        std::lock_guard<std::mutex> lock(mutex);
-        this->rootConfig = config;
-        effects.clear();
-        paramGeneration.fetch_add(1, std::memory_order_release);
+        uint32_t width;
+        uint32_t height;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            width  = compileWidth;
+            height = compileHeight;
+        }
 
         std::vector<std::string> effectNames = config->getOption<std::vector<std::string>>("effects");
         std::vector<std::string> disabledEffects = config->getOption<std::vector<std::string>>("disabledEffects");
@@ -220,6 +223,9 @@ namespace VkHook
         // Build set for quick lookup
         std::set<std::string> disabledSet(disabledEffects.begin(), disabledEffects.end());
 
+        // Every effect is parsed and compile-checked here, which reads files: no lock
+        // is held, and the finished list replaces the old one in one step.
+        std::list<EffectConfig> built;
         for (const auto& name : effectNames)
         {
             std::string effectPath = findEffectPath(name, config);
@@ -233,22 +239,28 @@ namespace VkHook
                 continue;
             }
             if (isDlss5Effect(name, config))
-            {
-                effects.push_back(dlss5EffectConfig(name, config));
-                paramGeneration.fetch_add(1, std::memory_order_release);
-            }
+                built.push_back(dlss5EffectConfig(name, config));
             else
-                initReshadeEffect(name, effectPath);
+                built.push_back(buildReshadeEffect(name, effectPath, config, width, height));
 
             // Set enabled state based on disabledEffects list
-            if (!effects.empty() && disabledSet.count(name))
-                effects.back().enabled = false;
+            if (disabledSet.count(name))
+                built.back().enabled = false;
         }
 
-        Logger::debug("EffectRegistry: initialized " + std::to_string(effects.size()) + " effects");
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            this->rootConfig = config;
+            effects.swap(built);
+            paramGeneration.fetch_add(1, std::memory_order_release);
+            Logger::debug("EffectRegistry: initialized " + std::to_string(effects.size()) + " effects");
+        }
     }
 
-    void EffectRegistry::initReshadeEffect(const std::string& name, const std::string& path)
+    // Parses and compile-checks one ReShade effect. Reads files and runs the compiler,
+    // so the caller holds no lock; nothing here touches the registry's state.
+    EffectConfig EffectRegistry::buildReshadeEffect(const std::string& name, const std::string& path, Config* root,
+                                                    uint32_t width, uint32_t height) const
     {
         EffectConfig config;
         config.name = name;
@@ -269,11 +281,11 @@ namespace VkHook
         // macro-gated uniforms show up when their macro is set.
         // Config format: effectName@MACRO = value
         config.preprocessorDefs =
-            extractPreprocessorDefinitions(name, path, preprocessSetup(compileWidth, compileHeight, 8, {}));
+            extractPreprocessorDefinitions(name, path, preprocessSetup(width, height, 8, {}));
         for (auto& def : config.preprocessorDefs)
         {
             std::string configKey = name + "@" + def.name;
-            std::string savedValue = rootConfig->getOption<std::string>(configKey, "");
+            std::string savedValue = root->getOption<std::string>(configKey, "");
             if (!savedValue.empty())
             {
                 def.value = savedValue;
@@ -285,8 +297,8 @@ namespace VkHook
         // is already the compile check.
         std::string parseError;
         config.parameters = parseReshadeEffect(
-            name, path, rootConfig,
-            preprocessSetup(compileWidth, compileHeight, 8, config.preprocessorDefs),
+            name, path, root,
+            preprocessSetup(width, height, 8, config.preprocessorDefs),
             &config.techniqueNames, &parseError);
         if (!parseError.empty())
         {
@@ -302,8 +314,7 @@ namespace VkHook
                           std::to_string(config.preprocessorDefs.size()) + " preprocessor defs");
         }
 
-        effects.push_back(std::move(config));
-        paramGeneration.fetch_add(1, std::memory_order_release);
+        return config;
     }
 
     ReshadePreprocessSetup EffectRegistry::preprocessSetup(uint32_t bufferWidth,
@@ -508,31 +519,35 @@ namespace VkHook
             return;
         }
 
-        // Lock for the check-and-mutate as a single critical section
-        std::lock_guard<std::mutex> lock(mutex);
+        // The file's timestamp is read before the lock: it is I/O
+        std::error_code ec;
+        const auto currentModTime = std::filesystem::last_write_time(path, ec);
 
-        auto existing = findEffect(instanceName);
-        if (existing)
+        uint32_t width;
+        uint32_t height;
+        Config*  root;
         {
-            // check if the file changed on disk since we last parsed it
-            std::error_code ec;
-            auto currentModTime = std::filesystem::last_write_time(path, ec);
-            if (!ec && currentModTime != (*existing)->fileModTime)
-            {
-                Logger::info("EffectRegistry: shader file changed on disk, re-parsing: " + instanceName);
-                // Remove the stale entry so we re-parse below
-                effects.remove_if(
-                    [&](const EffectConfig& e) { return e.name == instanceName; });
-                // the removed config freed its params; readers must rebuild
-                paramGeneration.fetch_add(1, std::memory_order_release);
-            }
-            else
-            {
-                return;  // File unchanged, keep existing
-            }
+            std::lock_guard<std::mutex> lock(mutex);
+            auto existing = findEffect(instanceName);
+            // File unchanged, keep existing
+            if (existing && (ec || currentModTime == (*existing)->fileModTime))
+                return;
+            width  = compileWidth;
+            height = compileHeight;
+            root   = rootConfig;
         }
 
-        initReshadeEffect(instanceName, path);
+        // Parse and compile-check with no lock held, then swap the result in. Two
+        // threads can both get here for one name; the later insert wins.
+        EffectConfig built = buildReshadeEffect(instanceName, path, root, width, height);
+
+        std::lock_guard<std::mutex> lock(mutex);
+        if (findEffect(instanceName))
+            Logger::info("EffectRegistry: shader file changed on disk, re-parsed: " + instanceName);
+        // the replaced config frees its params; readers must rebuild
+        effects.remove_if([&](const EffectConfig& e) { return e.name == instanceName; });
+        effects.push_back(std::move(built));
+        paramGeneration.fetch_add(1, std::memory_order_release);
     }
 
     void EffectRegistry::removeEffect(const std::string& name)

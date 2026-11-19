@@ -567,7 +567,7 @@ qualified name within an effect-chain build. Dimensions, format, mip count and
 view type must agree; incompatible declarations report an error instead of
 aliasing incompatible images. Effects retain shared ownership of image, views
 and memory. A reload or another swapchain gets a fresh pool, and the last owner
-hands destruction to the existing GPU-safe deferred queue.
+hands destruction to the device's `RetireQueue`.
 
 The motion producer's `texMotionVectors` and Uber RT's sampler now refer to the
 same image. Mipmap barriers include rendering and transfer writes, attachment
@@ -663,21 +663,27 @@ The overlay views never touch layer state. Each frame they read an immutable
 `CoreSnapshot` (effect chain with parameter copies, profiles, depth buffers,
 device info, settings) and answer with `Command`s (`src/overlay/commands.hh`):
 parameter edits, chain edits, profile and config operations, depth pins, and
-setting changes. The layer drains the queue once per present and applies them.
+setting changes. The layer (`src/control/commands_apply.cc`) drains the queue once
+per present, applies them (depth commands go to the depth tracker's own entry
+points) and publishes the next snapshot.
 Parameter widgets edit a per-effect buffer inside the overlay, so a slider drag
 never races the render thread. `OverlayUi` is one per device (ImGui context,
-views, input state); `OverlayRenderer` is one per swapchain (render pass,
-command buffers, fences, framebuffers).
+views, input state), owned by the device's `DeviceControlState`;
+`OverlayRenderer` is one per swapchain (render pass, command buffers, fences,
+framebuffers), created with the swapchain and destroyed before the UI. Each
+swapchain also holds the `InputSession` of the surface it presents to
+(`vkCreate*SurfaceKHR` creates it, `vkDestroySurfaceKHR` destroys it).
 
 `VkHook.conf` is described by one schema table (`src/core/config/settings_schema.cc`):
 the same row drives loading, saving, clamping and the Settings tab's controls,
 so a value is clamped once, on write (`autoApplyDelay` is 0-1000 ms,
-`maxEffects` 1-200). Hot threads read `settingsManager.snapshot()`. Saving
+`maxEffects` 1-200). Hot threads read `ConfigStore::instance().snapshot()`. Saving
 rewrites only the keys the schema owns and keeps unknown keys and comments.
 The Settings tab has a **Reload config from disk** button. Config files carry a
 `schemaVersion`; on first start after an upgrade the migrations run once, in
 order: legacy `reshade/packages` merge, `<game>@default.conf` renamed to
-`<game>.conf`, comma-separated shader/texture paths split.
+`<game>.conf`, comma-separated shader/texture paths split. Version 2 drops the
+obsolete `depthRebuildMode` key (depth rebuilds never idle the queue now).
 
 Shader presets are read and written by the pure model in
 `src/control/preset_model.cc`. A saved preset now lists keys in ReShade order
@@ -849,7 +855,7 @@ Each test is a small `main()` that prints `N checks, M failures` and exits non-z
 
 **input session** (`src/tests/input_session_test.cc`), **wayland capture attachment and teardown order** (`src/tests/wayland_capture_test.cc`) and **wayland input teardown** (`src/tests/wayland_input_teardown_test.cc`). Exercise the per-surface `InputSession`: focus policy, the capture subsurface re-attaching when the game recreates its surface, and protocol objects released newest-first so the event queue goes last (the last one runs against an in-process fake Wayland server).
 
-**vk handle ordering** (`src/render/vk_handle_test.cc`). Exercises `DeferredDestroyQueue`: releases run in ascending phase order, within a phase in reverse registration order, `flush` drains exactly once, and `discard` drops without running. Tells you that a view is destroyed before the image it was made from and device memory is freed last — the order that keeps a driver from faulting during teardown, which a headless test cannot observe through a real GPU.
+**retire queue** (`src/gpu/retire_test.cc`). Exercises the per-device `RetireQueue`: an object is destroyed only once its serial completed, dependents (views, framebuffers) go before what they depend on, and `drainAll` empties it after the device is idle. Tells you that a layer object is never destroyed under the GPU, and the order that keeps a driver from faulting during teardown, which a headless test cannot observe through a real GPU.
 
 **persistence queue** (`src/tests/persist_test.cc`). Exercises `PersistenceQueue`, the one writer for every user-file mutation: jobs run FIFO, repeated writes to one key coalesce to the newest, a throwing job does not poison the queue, shutdown drains and later submits resolve `false`, and a queued autosave can never resurrect a deleted preset. Tells you that profile and settings writes leave the present thread without being dropped, reordered or undone.
 
