@@ -1,5 +1,4 @@
-#include "imgui_overlay.hh"
-#include "persist.hh"
+#include "overlay_ui.hh"
 #include "config_serializer.hh"
 #include "overlay/ui_theme.hh"
 
@@ -9,7 +8,10 @@
 
 namespace VkHook
 {
-    void ImGuiOverlay::renderConfigManagerView()
+    // The per-game config files under configs/ (Config bar in the Effects tab
+    // when the executable has no profile of its own). The listing is read here;
+    // loading, deleting and the default-on-launch choice are commands.
+    void OverlayUi::renderConfigManagerView()
     {
         ImGui::SeparatorText("Manage Configs");
         UI::TextSupport("Click a config to load it. The default one is applied on launch.");
@@ -37,18 +39,14 @@ namespace VkHook
             ImGui::BeginDisabled(isDefault);
             if (ImGui::Button("Set default"))
             {
-                if (PersistenceQueue::instance().write(ConfigSerializer::getDefaultConfigPath(), [cfg] {
-                        return ConfigSerializer::setDefaultConfig(cfg);
-                    }).get())
-                    configListDefault = cfg;
+                emit(SetDefaultConfig{cfg});
+                configListDefault = cfg;
             }
             ImGui::EndDisabled();
             ImGui::SameLine();
             if (ImGui::Button("Delete"))
             {
-                PersistenceQueue::instance().remove(ConfigSerializer::getConfigsDir() + "/" + cfg + ".conf", [cfg] {
-                    return ConfigSerializer::deleteConfig(cfg);
-                }).wait();
+                emit(DeleteConfig{cfg});
                 configListRefreshPending = true;
                 ImGui::PopID();
                 continue;
@@ -57,10 +55,8 @@ namespace VkHook
 
             if (load)
             {
-                // Signal to vkhook.cpp to load this config
-                pendingConfigPath = ConfigSerializer::getConfigsDir() + "/" + cfg + ".conf";
-                strncpy(saveConfigName, cfg.c_str(), sizeof(saveConfigName) - 1);
-                applyRequested = true;
+                emit(LoadConfig{ConfigSerializer::getConfigsDir() + "/" + cfg + ".conf"});
+                std::strncpy(saveConfigName, cfg.c_str(), sizeof(saveConfigName) - 1);
                 inConfigManageMode = false;
             }
 

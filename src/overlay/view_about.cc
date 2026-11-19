@@ -1,4 +1,4 @@
-#include "imgui_overlay.hh"
+#include "overlay_ui.hh"
 #include "version.hh"
 
 #include "vendor/imgui/imgui.h"
@@ -16,7 +16,7 @@ namespace VkHook
         }
     }
 
-    void ImGuiOverlay::renderAboutView()
+    void OverlayUi::renderAboutView()
     {
         ImGui::BeginChild("about_content");
         ImGui::SeparatorText("VkHook");

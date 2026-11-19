@@ -1,6 +1,4 @@
-#include "imgui_overlay.hh"
-#include "effects/effect_registry.hh"
-#include "settings_manager.hh"
+#include "overlay_ui.hh"
 #include "reshade_parser.hh"
 #include "config_serializer.hh"
 
@@ -87,12 +85,12 @@ namespace VkHook
         return (shaders + 2 < parts.size()) ? parts[shaders + 1] : std::string();
     }
 
-    void ImGuiOverlay::renderAddEffectsView()
+    void OverlayUi::renderAddEffectsView()
     {
-        if (!effectRegistry)
-            return;
-
-        std::vector<std::string> selectedEffects = effectRegistry->getSelectedEffects();
+        std::vector<std::string> selectedEffects;
+        selectedEffects.reserve(snapshot->effects.chain.size());
+        for (const EffectView& effect : snapshot->effects.chain)
+            selectedEffects.push_back(effect.name);
 
         // ESC clears the search (and, when already empty, leaves the view).
         if (ImGui::IsKeyPressed(ImGuiKey_Escape) && addEffectsSearch[0] != '\0')
@@ -127,7 +125,7 @@ namespace VkHook
             }
         }
 
-        const size_t maxEffectsLimit = static_cast<size_t>(settingsManager.getMaxEffects());
+        const size_t maxEffectsLimit = static_cast<size_t>(settings().maxEffects);
         const size_t currentCount = selectedEffects.size();
         const size_t pendingCount = pendingAddEffects.size();
         // removals free slots, so they count against the limit too
@@ -222,14 +220,15 @@ namespace VkHook
         // Rebuilding and re-sorting 300+ shaders every frame is wasted when the
         // inputs rarely move, so cache the result until state, search or package
         // tab actually changes.
-        if (overlayStateVersion != addEffectsCacheVersion
+        if (snapshot->effects.availableVersion != addEffectsCacheVersion
             || std::string(addEffectsSearch) != addEffectsCacheSearch
             || addEffectsFilterPackage != addEffectsCacheFilter)
         {
             addEffectsEntries.clear();
 
-            std::vector<std::string> sortedCurrent = state.currentConfigEffects;
-            std::vector<std::string> sortedDefault = state.defaultConfigEffects;
+            std::vector<std::string> sortedCurrent = snapshot->effects.currentConfigEffects;
+            std::vector<std::string> sortedDefault = snapshot->effects.defaultConfigEffects;
+            const auto& effectPaths = snapshot->effects.effectPaths;
             std::sort(sortedCurrent.begin(), sortedCurrent.end());
             std::sort(sortedDefault.begin(), sortedDefault.end());
 
@@ -240,15 +239,15 @@ namespace VkHook
             };
             for (const auto& et : sortedCurrent)
             {
-                auto it = state.effectPaths.find(et);
-                addEntry(et, (it != state.effectPaths.end()) ? it->second : "", 0);
+                auto it = effectPaths.find(et);
+                addEntry(et, (it != effectPaths.end()) ? it->second : "", 0);
             }
             for (const auto& et : sortedDefault)
             {
                 if (std::find(sortedCurrent.begin(), sortedCurrent.end(), et) != sortedCurrent.end())
                     continue;
-                auto it = state.effectPaths.find(et);
-                addEntry(et, (it != state.effectPaths.end()) ? it->second : "", 1);
+                auto it = effectPaths.find(et);
+                addEntry(et, (it != effectPaths.end()) ? it->second : "", 1);
             }
 
             // the tabs are the installed packages, not the working set: a package
@@ -256,7 +255,7 @@ namespace VkHook
             // duplicates can still be queued
             {
                 std::set<std::string> packages;
-                for (const auto& entry : state.effectPaths)
+                for (const auto& entry : effectPaths)
                 {
                     const std::string package = effectPackageForPath(entry.second);
                     if (!package.empty())
@@ -307,7 +306,7 @@ namespace VkHook
                 addEffectsRows.push_back({std::string(), i});
             }
 
-            addEffectsCacheVersion = overlayStateVersion;
+            addEffectsCacheVersion = snapshot->effects.availableVersion;
             addEffectsCacheSearch = addEffectsSearch;
             addEffectsCacheFilter = addEffectsFilterPackage;
         }
@@ -473,45 +472,18 @@ namespace VkHook
         ImGui::BeginDisabled(pendingAddEffects.empty() && addEffectsRemoved.empty());
         if (ImGui::Button(applyLabel.c_str()))
         {
-            // removals first, so an insert position lines up with what is left
-            bool removedAny = false;
-            if (hasRemovals)
+            EditChain edit;
+            for (const auto& removed : addEffectsRemoved)
             {
-                for (const auto& removed : addEffectsRemoved)
-                {
-                    auto it = std::find(selectedEffects.begin(), selectedEffects.end(), removed);
-                    if (it == selectedEffects.end())
-                        continue;
-                    effectRegistry->removeEffect(*it);
-                    selectedEffects.erase(it);
-                    removedAny = true;
-                }
-                if (removedAny)
-                    effectRegistry->setSelectedEffects(selectedEffects);
+                if (std::find(selectedEffects.begin(), selectedEffects.end(), removed) != selectedEffects.end())
+                    edit.remove.push_back(removed);
             }
-
-            int pos = (insertPosition >= 0 && insertPosition <= static_cast<int>(selectedEffects.size()))
-                      ? insertPosition : static_cast<int>(selectedEffects.size());
-            for (const auto& [instanceName, effectType] : pendingAddEffects)
+            edit.add = pendingAddEffects;
+            edit.position = insertPosition;
+            if (!edit.remove.empty() || !edit.add.empty())
             {
-                selectedEffects.insert(selectedEffects.begin() + pos, instanceName);
-                pos++;
-                effectRegistry->ensureEffect(instanceName, effectType);
-                effectRegistry->setEffectEnabled(instanceName, true);
-            }
-            const bool addedAny = !pendingAddEffects.empty();
-            if (addedAny)
-                effectRegistry->setSelectedEffects(selectedEffects);
-
-            if (removedAny || addedAny)
-            {
-                if (removedAny)
-                {
-                    paramsDirty = true;
-                    lastChangeTime = std::chrono::steady_clock::now();
-                }
-                applyRequested = true;
-                profileDirty = true;
+                emit(std::move(edit));
+                chainEdited();
             }
             pendingAddEffects.clear();
             addEffectsDuplicateCount.clear();

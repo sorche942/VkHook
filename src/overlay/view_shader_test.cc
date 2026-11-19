@@ -1,4 +1,4 @@
-#include "imgui_overlay.hh"
+#include "overlay_ui.hh"
 #include "reshade_parser.hh"
 #include "config_serializer.hh"
 #include "logger.hh"
@@ -16,7 +16,7 @@
 
 namespace VkHook
 {
-    void ImGuiOverlay::startShaderTest()
+    void OverlayUi::startShaderTest()
     {
         // Only an in-flight run blocks a new one: pressing the button again is an
         // explicit "refresh the paths and compile them all over".
@@ -39,8 +39,8 @@ namespace VkHook
         shaderTestCurrentIndex = 0;
         shaderTestComplete = false;
         shaderTestDuplicateCount = 0;
-        // the set this run covers; a later overlayStateVersion bump means new shaders
-        shaderTestStateVersion = overlayStateVersion;
+        // the set this run covers; a later availableVersion bump means new shaders
+        shaderTestStateVersion = snapshot->effects.availableVersion;
 
         // Cache include paths once — avoids re-reading shader_manager.conf per shader
         ShaderManagerConfig smConfig = ConfigSerializer::loadShaderManagerConfig();
@@ -91,7 +91,7 @@ namespace VkHook
         }
     }
 
-    void ImGuiOverlay::processShaderTest()
+    void OverlayUi::processShaderTest()
     {
         if (!shaderTestRunning)
             return;
@@ -125,7 +125,7 @@ namespace VkHook
         }
     }
 
-    void ImGuiOverlay::renderShaderTestSection()
+    void OverlayUi::renderShaderTestSection()
     {
         // The action never greys out on its own: a finished run just changes what
         // it offers, from the first compile-test to a re-run over refreshed paths.
@@ -140,7 +140,7 @@ namespace VkHook
         }
         else
         {
-            const bool alreadyTested = shaderTestComplete && overlayStateVersion == shaderTestStateVersion;
+            const bool alreadyTested = shaderTestComplete && snapshot->effects.availableVersion == shaderTestStateVersion;
             const char* label = alreadyTested
                 ? "Refresh paths and compile-test again"
                 : "Compile-test shaders";

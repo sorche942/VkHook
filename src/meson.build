@@ -70,6 +70,9 @@ imgui_src = [
 
 overlay_src = [
     'overlay/imgui_overlay.cc',
+    'overlay/overlay_ui.cc',
+    'overlay/overlay_renderer.cc',
+    'overlay/commands.cc',
     'overlay/view_add_effects.cc',
     'overlay/view_advanced.cc',
     'overlay/view_configs.cc',
@@ -94,6 +97,7 @@ VkHook_src = [
     'depth/tracker.cc',
     'control/frontend.cc',
     'control/preset_import.cc',
+    'control/preset_model.cc',
     'diag/gpu_crash.cc',
     'core/config/persist.cc',
     'core/config/ini.cc',
@@ -103,7 +107,9 @@ VkHook_src = [
     'core/config/config.cc',
     'core/config/config_serializer.cc',
     'core/config/config_serializer_profile.cc',
-    'core/config/settings_manager.cc',
+    'core/config/store.cc',
+    'core/config/settings_schema.cc',
+    'core/config/migrate.cc',
     'render/descriptor_set.cc',
     'effects/effect_registry.cc',
     'effects/effect_reshade.cc',
@@ -185,10 +191,10 @@ keyboard_input_x11_lib = static_library('keyboard_input_x11', 'input/keyboard_in
 mouse_input_lib = static_library('mouse_input', 'input/mouse_input.cc', include_directories: [include_directories('core', 'core/config')])
 input_blocker_lib = static_library('input_blocker', 'input/input_blocker.cc', include_directories: [include_directories('core', 'core/config')])
 
-# X11 input backends. The shared connection (x11_display) owns the single event
-# queue; keyboard and mouse register callbacks into it and the blocker grabs on
-# the same connection. Kept out of the unity-compiled core because X11/X.h
-# defines symbols (None, ...) that collide with the codebase.
+# X11 input backend (X11Input). The class is implemented across three
+# translation units so that its connection, keyboard and mouse halves stay
+# separate; each session owns one connection. Kept out of the unity-compiled
+# core because X11/X.h defines symbols (None, ...) that collide with the codebase.
 x11_display_lib = static_library('x11_display',
     'input/x11_display.cc',
     include_directories: [include_directories('core', 'core/config')])
@@ -196,10 +202,10 @@ mouse_input_x11_lib = static_library('mouse_input_x11',
     'input/mouse_input_x11.cc',
     include_directories: [include_directories('core', 'core/config')])
 
-# Wayland input backends — built as static libs to isolate wayland-client headers.
-# wayland_input_common provides a shared seat/queue used by both keyboard and mouse.
+# Wayland input backend (WaylandInput) — built as static libs to isolate wayland-client
+# headers. wayland_input_common holds the seat/queue/capture surface shared by keyboard and mouse.
 wayland_input_common_lib = static_library('wayland_input_common',
-    'input/wayland_input_common.cc', 'input/wayland_display.cc',
+    'input/wayland_input_common.cc',
     viewporter_code, viewporter_client_h,
     dependencies: [wayland_client_dep],
     include_directories: [include_directories('core', 'core/config')])
@@ -229,6 +235,13 @@ wayland_interpose_lib = static_library('wayland_interpose',
     cpp_args: ['-fvisibility=default'],
     include_directories: [include_directories('core', 'core/config')])
 
+# InputSession and the free-function facade over the current session. Includes no
+# X11 or wayland-client header; it reaches the backends through x11_input.hh and
+# wayland_input.hh, whose libraries the final link supplies.
+input_session_lib = static_library('input_session',
+    'input/input_session.cc', 'input/wayland_display.cc',
+    include_directories: [include_directories('core', 'core/config')])
+
 imgui_inc = include_directories('vendor/imgui')
 overlay_inc = include_directories('overlay')
 effects_inc = include_directories('effects')
@@ -255,7 +268,7 @@ endif
 vkhook_lib = shared_library('vkhook',
     VkHook_src, overlay_src, imgui_src, shader_include, dlss5_sources,
     link_depends : dlss5_assets,
-    link_with: [keyboard_input_x11_lib, mouse_input_lib, input_blocker_lib,
+    link_with: [keyboard_input_x11_lib, mouse_input_lib, input_blocker_lib, input_session_lib,
                 x11_display_lib, mouse_input_x11_lib,
                 wayland_input_common_lib, keyboard_input_wayland_lib, mouse_input_wayland_lib,
                 wayland_interpose_lib],
@@ -299,6 +312,7 @@ endif
 
 config_serializer_tests = executable('vkhook-config-serializer-tests',
     'tests/config_serializer_test.cc',
+    'control/preset_model.cc',
     'core/config/config_serializer.cc',
     'core/config/config_serializer_profile.cc',
     'core/config/config.cc',
@@ -307,6 +321,15 @@ config_serializer_tests = executable('vkhook-config-serializer-tests',
     'core/util.cc',
     include_directories : [core_inc, render_inc, effects_inc, effects_params_inc, vendor_inc, source_inc, imgui_inc])
 test('config serializer', config_serializer_tests)
+
+# The preset model (parse/serialize of ReShade presets plus the VkHook sidecar) is
+# pure: golden files in tests/fixtures/presets pin the on-disk format.
+preset_model_tests = executable('vkhook-preset-model-tests',
+    'tests/preset_model_test.cc',
+    'control/preset_model.cc',
+    include_directories : [source_inc])
+test('preset model', preset_model_tests,
+    args : [meson.current_source_dir() / 'tests/fixtures'])
 
 # The variable-font extension to stb_truetype is pure but invisible to CI: a bad
 # download or a gvar/HVAR regression would only show as wrong-looking text. This
@@ -379,6 +402,8 @@ depth_snapshot_scope_tests = executable('vkhook-depth-snapshot-scope-tests',
     'render/format.cc',
     'render/image_view.cc',
     'core/logger.cc',
+    'core/config/settings_schema.cc',
+    'core/config/ini.cc',
     cpp_args : ['-ffunction-sections', '-fdata-sections'],
     link_args : ['-Wl,--gc-sections'],
     dependencies : [threads_dep],
@@ -409,6 +434,42 @@ wayland_interpose_patch_tests = executable('vkhook-wayland-interpose-patch-tests
     dependencies : [threads_dep, wayland_client_dep],
     include_directories : [core_inc, input_inc, source_inc])
 test('wayland interpose patch', wayland_interpose_patch_tests)
+
+# The capture subsurface must follow the game's surface when the game recreates
+# it, and Wayland objects must be destroyed children-first with the event queue
+# last. Both are pure state machines (capture_attachment.hh, release_stack.hh),
+# driven here without a compositor.
+wayland_capture_tests = executable('vkhook-wayland-capture-tests',
+    'tests/wayland_capture_test.cc',
+    include_directories : [input_inc])
+test('wayland capture attachment and teardown order', wayland_capture_tests)
+
+# InputSession: the registry's "current session" policy, per-session blocking
+# state, surface re-targeting and destruction. The interposer's two entry points
+# are faked so the test records the key-withhold requests instead of linking the
+# process-wide dlsym override.
+input_session_tests = executable('vkhook-input-session-tests',
+    'tests/input_session_test.cc',
+    'core/logger.cc',
+    link_with : [input_session_lib, input_blocker_lib, x11_display_lib, keyboard_input_x11_lib, mouse_input_x11_lib,
+                 wayland_input_common_lib, keyboard_input_wayland_lib, mouse_input_wayland_lib],
+    dependencies : [threads_dep, x11_dep, xi_dep, xtst_dep, wayland_client_dep, xkbcommon_dep],
+    include_directories : [core_inc, input_inc, source_inc])
+test('input session', input_session_tests)
+
+# WaylandInput against a real libwayland client and an in-process fake server:
+# teardown order (no proxy left on the destroyed event queue), re-attaching the
+# capture subsurface when the game recreates its surface, and re-initialisation.
+wayland_server_dep = dependency('wayland-server', required: false)
+if wayland_server_dep.found()
+    wayland_input_teardown_tests = executable('vkhook-wayland-input-teardown-tests',
+        'tests/wayland_input_teardown_test.cc',
+        'core/logger.cc',
+        link_with : [wayland_input_common_lib, keyboard_input_wayland_lib, mouse_input_wayland_lib],
+        dependencies : [threads_dep, wayland_client_dep, wayland_server_dep, xkbcommon_dep],
+        include_directories : [core_inc, input_inc, source_inc])
+    test('wayland input teardown', wayland_input_teardown_tests)
+endif
 
 # The parameter parse and the runtime compile share one preprocess setup. This
 # drives the parse with extents, user macros and a failing shader to check that
@@ -475,8 +536,11 @@ test('reshade uniform sources', reshade_uniform_tests)
 # rules (coalescing, delete-vs-autosave, shutdown) are pure and headless.
 persist_tests = executable('vkhook-persist-tests',
     'tests/persist_test.cc',
+    'control/preset_model.cc',
     'core/config/persist.cc',
-    'core/config/settings_manager.cc',
+    'core/config/store.cc',
+    'core/config/settings_schema.cc',
+    'core/config/migrate.cc',
     'core/config/ini.cc',
     'core/config/config_serializer.cc',
     'core/config/config_serializer_profile.cc',
@@ -486,6 +550,32 @@ persist_tests = executable('vkhook-persist-tests',
     dependencies : [threads_dep],
     include_directories : [core_inc, render_inc, effects_inc, effects_params_inc, vendor_inc, source_inc, imgui_inc])
 test('persistence queue', persist_tests)
+
+# The settings schema (defaults, clamping, file round trip), the published
+# snapshots and the config-directory migrations.
+config_store_tests = executable('vkhook-config-store-tests',
+    'tests/config_store_test.cc',
+    'core/config/store.cc',
+    'core/config/settings_schema.cc',
+    'core/config/migrate.cc',
+    'core/config/persist.cc',
+    'core/config/config.cc',
+    'core/config/config_serializer.cc',
+    'core/config/config_serializer_profile.cc',
+    'core/config/ini.cc',
+    'core/logger.cc',
+    'core/util.cc',
+    dependencies : [threads_dep],
+    include_directories : [core_inc, render_inc, effects_inc, effects_params_inc, vendor_inc, source_inc, imgui_inc])
+test('config store', config_store_tests)
+
+# the overlay's command queue and the SetParam value copy
+overlay_commands_tests = executable('vkhook-overlay-commands-tests',
+    'tests/overlay_commands_test.cc',
+    'overlay/commands.cc',
+    dependencies : [threads_dep],
+    include_directories : [core_inc, render_inc, effects_inc, effects_params_inc, vendor_inc, source_inc, imgui_inc])
+test('overlay commands', overlay_commands_tests)
 
 # the numeric field editors parse with std::from_chars; the grammar is pinned here
 field_parse_tests = executable('vkhook-field-parse-tests',

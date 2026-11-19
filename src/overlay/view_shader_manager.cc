@@ -1,5 +1,4 @@
-#include "imgui_overlay.hh"
-#include "persist.hh"
+#include "overlay_ui.hh"
 #include "config_serializer.hh"
 #include "logger.hh"
 #include "overlay/ui_theme.hh"
@@ -57,7 +56,7 @@ namespace VkHook
         }
     }
 
-    void ImGuiOverlay::renderShaderManagerView()
+    void OverlayUi::renderShaderManagerView()
     {
         if (!dirBrowser)
             dirBrowser = std::make_shared<ImGui::FileBrowser>(
@@ -75,17 +74,13 @@ namespace VkHook
             shaderMgrInitialized = true;
         }
 
-        // Helper to save config (auto-save on any change)
+        // Any change is saved at once; core persists it and rescans the available effects.
         auto saveConfig = [&]() {
             ShaderManagerConfig config;
             config.parentDirectories = shaderMgrParentDirs;
             config.discoveredShaderPaths = shaderMgrShaderPaths;
             config.discoveredTexturePaths = shaderMgrTexturePaths;
-            PersistenceQueue::instance().write(ConfigSerializer::getBaseConfigDir() + "/shader_manager.conf",
-                                               [config = std::move(config)] {
-                                                   return ConfigSerializer::saveShaderManagerConfig(config);
-                                               });
-            shaderPathsChanged = true;
+            emit(ShaderPathsChanged{std::move(config)});
         };
 
         ImGui::BeginChild("ShaderMgrContent", ImVec2(0, 0), false);
@@ -129,7 +124,7 @@ namespace VkHook
         {
             // If the portal cannot even be started (no GIO, no session bus),
             // open the in-overlay browser right away.
-            if (!settingsManager.getUsePortalIntegration()
+            if (!settings().usePortalIntegration
                 || !startOpenDirectoryDialog("Select Parent Directory"))
             {
                 browser.SetTitle("Select Parent Directory");

@@ -1,33 +1,35 @@
-#include "imgui_overlay.hh"
-#include "settings_manager.hh"
+#include "overlay_ui.hh"
 #include "logger.hh"
 #include "overlay/ui_theme.hh"
 
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
-#include <functional>
 
 #include "vendor/imgui/imgui.h"
 
 namespace VkHook
 {
-    void ImGuiOverlay::renderSettingsView(const KeyboardState& keyboard)
+    void OverlayUi::renderSettingsView(const KeyboardState& keyboard)
     {
-        // Helper to save settings to file
-        auto saveSettings = [&]() {
-            settingsManager.save();
-            settingsSaved = true;
+        const AppSettings& cfg = settings();
+
+        // Every control reads its value from the snapshot and answers with a
+        // SetSetting; the range of a numeric control is the schema's. Settings
+        // that are final (a toggle, a finished slider drag) also send
+        // SettingsChanged, which persists them.
+        const auto rangeOf = [](const char* key) { return Schema::find(key); };
+        const auto commit = [&](const char* key, SettingValue value) {
+            emitSetting(key, std::move(value));
+            emit(SettingsChanged{});
         };
 
         ImGui::BeginChild("SettingsContent", ImVec2(0, 0), false);
         const float d = ImGui::GetFontSize() / 16.0f;
 
-        // Helper lambda to render a keybind button.
-        auto renderKeyBind = [&](const char* label, const char* tooltip,
-                                 const std::string& currentKey,
-                                 std::function<void(const std::string&)> setter,
-                                 int bindingId) {
+        // Renders a keybind button.
+        auto renderKeyBind = [&](const char* label, const char* tooltip, const char* key,
+                                 const std::string& currentKey, int bindingId) {
             ImGui::AlignTextToFramePadding();
             ImGui::TextUnformatted(label);
             if (ImGui::IsItemHovered())
@@ -53,32 +55,26 @@ namespace VkHook
 
             if (isListening && !keyboard.lastKeyName.empty())
             {
-                setter(keyboard.lastKeyName);
+                commit(key, keyboard.lastKeyName);
                 listeningForKey = 0;
-                saveSettings();
             }
         };
 
         // --- Controls ---
         ImGui::SeparatorText("Controls");
         ImGui::Spacing();
-        renderKeyBind("Toggle Effects", "Key to enable/disable all effects",
-                      settingsManager.getToggleKey(),
-                      [](const std::string& key) { settingsManager.setToggleKey(key); }, 1);
-        renderKeyBind("Reload Config", "Key to reload the configuration file",
-                      settingsManager.getReloadKey(),
-                      [](const std::string& key) { settingsManager.setReloadKey(key); }, 2);
-        renderKeyBind("Toggle Overlay", "Key to show/hide this overlay",
-                      settingsManager.getOverlayKey(),
-                      [](const std::string& key) { settingsManager.setOverlayKey(key); }, 3);
+        renderKeyBind("Toggle Effects", "Key to enable/disable all effects", "toggleKey", cfg.toggleKey, 1);
+        renderKeyBind("Reload Config", "Key to reload the configuration file", "reloadKey", cfg.reloadKey, 2);
+        renderKeyBind("Toggle Overlay", "Key to show/hide this overlay", "overlayKey", cfg.overlayKey, 3);
+        if (ImGui::Button("Reload config from disk"))
+            emit(ReloadConfig{});
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Re-read the configuration files and rebuild the effect chain.");
 
         ImGui::Spacing();
-        bool blockInput = settingsManager.getOverlayBlockInput();
+        bool blockInput = cfg.overlayBlockInput;
         if (ImGui::Checkbox("Block input while the overlay is open", &blockInput))
-        {
-            settingsManager.setOverlayBlockInput(blockInput);
-            saveSettings();
-        }
+            commit("overlayBlockInput", blockInput);
         if (ImGui::IsItemHovered())
         {
             ImGui::BeginTooltip();
@@ -90,45 +86,38 @@ namespace VkHook
         ImGui::Spacing();
         ImGui::SeparatorText("Behaviour");
 
-        bool enableOnLaunch = settingsManager.getEnableOnLaunch();
+        bool enableOnLaunch = cfg.enableOnLaunch;
         if (ImGui::Checkbox("Enable effects on launch", &enableOnLaunch))
-        {
-            settingsManager.setEnableOnLaunch(enableOnLaunch);
-            saveSettings();
-        }
+            commit("enableOnLaunch", enableOnLaunch);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("If enabled, effects are active when the game starts.");
 
-        bool autoApply = settingsManager.getAutoApply();
+        bool autoApply = cfg.autoApply;
         if (ImGui::Checkbox("Auto-apply changes", &autoApply))
-        {
-            settingsManager.setAutoApply(autoApply);
-            saveSettings();
-        }
+            commit("autoApply", autoApply);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Automatically apply parameter changes after a short delay.");
 
-        if (autoApply)
+        if (cfg.autoApply)
         {
+            const SettingDesc* delayRow = rangeOf("autoApplyDelay");
             ImGui::Indent();
             ImGui::AlignTextToFramePadding();
             ImGui::Text("Delay");
             ImGui::SameLine(160.0f * d);
             ImGui::SetNextItemWidth(160.0f * d);
-            int delayVal = settingsManager.getAutoApplyDelay();
-            if (ImGui::SliderInt("##autoApplyDelay", &delayVal, 20, 1000, "%d ms"))
-                settingsManager.setAutoApplyDelay(delayVal);
+            int delayVal = cfg.autoApplyDelay;
+            if (ImGui::SliderInt("##autoApplyDelay", &delayVal, static_cast<int>(delayRow->min),
+                                 static_cast<int>(delayRow->max), "%d ms"))
+                emitSetting("autoApplyDelay", delayVal);
             if (ImGui::IsItemDeactivatedAfterEdit())
-                saveSettings();
+                emit(SettingsChanged{});
             ImGui::Unindent();
         }
 
-        bool usePortal = settingsManager.getUsePortalIntegration();
+        bool usePortal = cfg.usePortalIntegration;
         if (ImGui::Checkbox("Use XDG Desktop Portal integrations when available", &usePortal))
-        {
-            settingsManager.setUsePortalIntegration(usePortal);
-            saveSettings();
-        }
+            commit("usePortalIntegration", usePortal);
         ImGui::Spacing();
         ImGui::AlignTextToFramePadding();
         ImGui::TextUnformatted("Max effects");
@@ -141,18 +130,15 @@ namespace VkHook
         }
         ImGui::SameLine(160.0f * d);
         ImGui::SetNextItemWidth(120.0f * d);
-        int maxEffectsVal = settingsManager.getMaxEffects();
+        int maxEffectsVal = cfg.maxEffects;
         if (ImGui::InputInt("##maxEffects", &maxEffectsVal, 0, 0))
-        {
-            maxEffectsVal = std::clamp(maxEffectsVal, 1, 200);
-            settingsManager.setMaxEffects(maxEffectsVal);
-        }
+            emitSetting("maxEffects", maxEffectsVal);
         if (ImGui::IsItemDeactivatedAfterEdit())
-            saveSettings();
+            emit(SettingsChanged{});
         float bytesPerSlot = 2.0f * currentWidth * currentHeight * 4.0f;
-        int estimatedVramMB = static_cast<int>((maxEffectsVal * bytesPerSlot) / (1024.0f * 1024.0f));
+        int estimatedVramMB = static_cast<int>((cfg.maxEffects * bytesPerSlot) / (1024.0f * 1024.0f));
         ImGui::SameLine();
-        if (maxEffectsVal > 20)
+        if (cfg.maxEffects > 20)
             ImGui::TextColored(UI::Attention(), "~%d MB @ %ux%u", estimatedVramMB, currentWidth, currentHeight);
         else
             ImGui::TextDisabled("~%d MB @ %ux%u", estimatedVramMB, currentWidth, currentHeight);
@@ -160,31 +146,25 @@ namespace VkHook
 
         ImGui::Spacing();
         ImGui::SeparatorText("Appearance");
-        float uiScale = settingsManager.getUiScale();
-        bool automaticScale = uiScale == 0.0f;
+        bool automaticScale = cfg.uiScale == 0.0f;
         if (ImGui::Checkbox("Automatic UI scale", &automaticScale))
-        {
-            settingsManager.setUiScale(automaticScale ? 0.0f : ImGui::GetFontSize() / 18.0f);
-            saveSettings();
-        }
+            commit("uiScale", automaticScale ? 0.0f : ImGui::GetFontSize() / 18.0f);
         if (!automaticScale)
         {
-            uiScale = settingsManager.getUiScale();
+            const SettingDesc* scaleRow = rangeOf("uiScale");
+            float uiScale = cfg.uiScale;
             ImGui::SetNextItemWidth(240.0f * d);
-            if (ImGui::SliderFloat("UI scale", &uiScale, 0.75f, 3.0f, "%.2fx"))
-                settingsManager.setUiScale(uiScale);
+            if (ImGui::SliderFloat("UI scale", &uiScale, static_cast<float>(scaleRow->min),
+                                   static_cast<float>(scaleRow->max), "%.2fx"))
+                emitSetting("uiScale", uiScale);
             if (ImGui::IsItemDeactivatedAfterEdit())
-                saveSettings();
+                emit(SettingsChanged{});
         }
 
         ImGui::Spacing();
-        bool separateParams = settingsManager.getSeparateEffectParams();
+        bool separateParams = cfg.separateEffectParams;
         if (ImGui::Checkbox("Separate effect parameters into their own section", &separateParams))
-        {
-            settingsManager.setSeparateEffectParams(separateParams);
-            saveSettings();
-        }
-
+            commit("separateEffectParams", separateParams);
 
         // --- Depth buffer: capture, decoding and selection all live here ---
         ImGui::Spacing();
@@ -198,6 +178,5 @@ namespace VkHook
 
         ImGui::EndChild();
     }
-
 
 } // namespace VkHook

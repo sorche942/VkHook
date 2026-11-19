@@ -1,7 +1,4 @@
-#include "imgui_overlay.hh"
-#include "settings_manager.hh"
-#include "layer/state.hh"
-#include "depth/tracker.hh"
+#include "overlay_ui.hh"
 #include "logger.hh"
 #include "overlay/ui_theme.hh"
 
@@ -84,161 +81,6 @@ namespace VkHook
         }
     }
 
-    void ImGuiOverlay::gatherDepthInfo()
-    {
-        if (!logicalDevice)
-            return;
-
-        std::lock_guard<std::mutex> l(globalLock);
-
-        depthInfo.supportedResolveModes = logicalDevice->supportedDepthResolveModes;
-        depthInfo.depthCaptureEnabled   = settingsManager.getDepthCapture();
-        depthInfo.swapchainExtent       = currentSwapchainExtentLocked(logicalDevice);
-
-        deviceInfo.gpuName      = logicalDevice->gpuName;
-        deviceInfo.gpuDriverInfo = logicalDevice->gpuDriverInfo;
-        deviceInfo.gpuPciSlot   = logicalDevice->gpuPciSlot;
-        deviceInfo.gpuApiVersion = logicalDevice->gpuApiVersion;
-        deviceInfo.gpuVendorId  = logicalDevice->gpuVendorId;
-
-        const int modePref = settingsManager.getDepthResolveMode();
-        const bool avgSupported = (logicalDevice->supportedDepthResolveModes & VK_RESOLVE_MODE_AVERAGE_BIT) != 0;
-        if (modePref == 2 && avgSupported)
-            depthInfo.depthResolveMode = VK_RESOLVE_MODE_AVERAGE_BIT;
-        else
-            depthInfo.depthResolveMode = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
-
-        // Snapshot pin state from the device.  If the pinned view was destroyed
-        // by the render thread since last frame, clear the stale pin here so the
-        // UI immediately falls back to auto instead of showing a ghost pin.
-        depthInfo.pinnedView = logicalDevice->pinnedDepthImageView;
-        depthInfo.depthIsPinned = (depthInfo.pinnedView != VK_NULL_HANDLE);
-
-        if (depthInfo.depthIsPinned)
-        {
-            auto it = logicalDevice->depthViewStates.find(depthInfo.pinnedView);
-            if (it != logicalDevice->depthViewStates.end())
-            {
-                // Pinned view is still valid — show it as the active buffer.
-                const DepthState& pinned = it->second;
-                depthInfo.active.imageView       = pinned.imageView;
-                depthInfo.active.format          = pinned.format;
-                depthInfo.active.extent          = pinned.extent;
-                depthInfo.active.samples         = pinned.samples;
-                depthInfo.active.observedLayout  = pinned.observedLayout;
-                depthInfo.active.transient       = pinned.transient;
-                depthInfo.active.drawCount = logicalDevice->bestDepthCandidate.valid
-                                              && logicalDevice->bestDepthCandidate.depthState.imageView == pinned.imageView
-                                              ? logicalDevice->bestDepthCandidate.drawCount : 0;
-                depthInfo.active.hasPresentableSnapshotTarget =
-                    logicalDevice->bestDepthCandidate.valid
-                    && logicalDevice->bestDepthCandidate.depthState.imageView == pinned.imageView
-                    ? logicalDevice->bestDepthCandidate.hasPresentableSnapshotTarget : false;
-            }
-            else
-            {
-                // Pinned view was destroyed since last frame — clear the stale pin
-                // so we fall back to auto.  getDepthState() in vkhook.cpp does the
-                // same check, but we need it here too so the UI is consistent.
-                Logger::debug("gatherDepthInfo: pinned view no longer tracked, clearing stale pin");
-                logicalDevice->pinnedDepthImageView = VK_NULL_HANDLE;
-                depthInfo.depthIsPinned = false;
-                depthInfo.pinnedView    = VK_NULL_HANDLE;
-                // Don't set active here — fall through to the auto path below.
-            }
-        }
-
-        // Auto path (also handles the case where the pin was just cleared above).
-        if (!depthInfo.depthIsPinned)
-        {
-            const DepthState& active = logicalDevice->activeDepthState;
-            depthInfo.active.imageView       = active.imageView;
-            depthInfo.active.format          = active.format;
-            depthInfo.active.extent          = active.extent;
-            depthInfo.active.samples         = active.samples;
-            depthInfo.active.observedLayout  = active.observedLayout;
-            depthInfo.active.transient       = active.transient;
-            depthInfo.active.drawCount       = logicalDevice->bestDepthCandidate.valid
-                                                 ? logicalDevice->bestDepthCandidate.drawCount : 0;
-            depthInfo.active.hasPresentableSnapshotTarget =
-                logicalDevice->bestDepthCandidate.hasPresentableSnapshotTarget;
-        }
-        depthInfo.depthResolveIsMsaa = depthInfo.active.samples != VK_SAMPLE_COUNT_1_BIT;
-
-        // Populate candidate list from all tracked depth views.
-        depthInfo.candidates.clear();
-        for (const auto& [view, ds] : logicalDevice->depthViewStates)
-        {
-            DepthCandidateInfo c;
-            c.imageView      = view;
-            c.format         = ds.format;
-            c.extent         = ds.extent;
-            c.samples        = ds.samples;
-            c.observedLayout = ds.observedLayout;
-            c.transient      = ds.transient;
-            if (logicalDevice->bestDepthCandidate.valid &&
-                logicalDevice->bestDepthCandidate.depthState.imageView == view)
-            {
-                c.drawCount = logicalDevice->bestDepthCandidate.drawCount;
-                c.hasPresentableSnapshotTarget =
-                    logicalDevice->bestDepthCandidate.hasPresentableSnapshotTarget;
-            }
-            depthInfo.candidates.push_back(c);
-        }
-        // Sort by drawCount descending so the best candidate appears first.
-        std::sort(depthInfo.candidates.begin(), depthInfo.candidates.end(),
-                  [](const DepthCandidateInfo& a, const DepthCandidateInfo& b){
-                      return a.drawCount > b.drawCount;
-                  });
-    }
-
-    void ImGuiOverlay::applyDepthPinRequests()
-    {
-        if (!logicalDevice)
-            return;
-
-        if (depthPinPendingView != VK_NULL_HANDLE)
-        {
-            std::lock_guard<std::mutex> l(globalLock);
-            auto it = logicalDevice->depthViewStates.find(depthPinPendingView);
-            if (it != logicalDevice->depthViewStates.end())
-            {
-                logicalDevice->pinnedDepthImageView = depthPinPendingView;
-                Logger::info("depth manual pin set to view 0x" +
-                    std::to_string((uint64_t)depthPinPendingView));
-                depthPinChanged = true;
-                // Force deferred realloc so descriptor sets + MSAA framebuffers
-                // get rebuilt for the new depth source view.
-                logicalDevice->depthReallocPending = true;
-            }
-            else
-            {
-                Logger::warn("depth pin requested but view not found (may have been destroyed)");
-            }
-            depthPinPendingView = VK_NULL_HANDLE;
-        }
-
-        if (depthPinPendingClear)
-        {
-            std::lock_guard<std::mutex> l(globalLock);
-            logicalDevice->pinnedDepthImageView = VK_NULL_HANDLE;
-            depthPinPendingClear = false;
-            depthPinChanged = true;
-            // Same: force realloc so we stop using the just-unpinned view.
-            logicalDevice->depthReallocPending = true;
-            Logger::info("depth manual pin cleared (back to auto-promotion)");
-        }
-
-        if (depthTransformPending)
-        {
-            std::lock_guard<std::mutex> l(globalLock);
-            // the resolve owns transforms now (macros no longer carry them),
-            // so re-recording it is all a toggle needs
-            logicalDevice->depthReallocPending = true;
-            depthTransformPending = false;
-        }
-    }
-
     // The one-line describer under the card's hero header. Reads as a sentence
     // instead of the old column dump: 1920x1080 (D16_UNORM, MSAA 1x, ...).
     static std::string describeActiveDepth(const DepthInfo& info)
@@ -298,16 +140,18 @@ namespace VkHook
         }
     } // namespace
 
-    void ImGuiOverlay::renderAdvancedView()
+    void OverlayUi::renderAdvancedView()
     {
+        const AppSettings& cfg = settings();
+        const DepthInfo& depthInfo = snapshot->depth;
         const float d = ImGui::GetFontSize() / 16.0f;
         ImGui::SeparatorText("Depth buffer");
         // Capture hooks are armed at startup, so this setting requires a restart.
-                bool depthCapture = settingsManager.getDepthCapture();
+        bool depthCapture = cfg.depthCapture;
         if (ImGui::Checkbox("Capture depth buffer (requires restart)", &depthCapture))
         {
-            settingsManager.setDepthCapture(depthCapture);
-            settingsDirty = true;
+            emitSetting("depthCapture", depthCapture);
+            emit(SettingsChanged{});
             Logger::info(std::string("depth capture ") + (depthCapture ? "enabled" : "disabled") +
                          " (saved; takes effect on restart)");
             pushToast(LogLevel::Info, depthCapture
@@ -315,7 +159,7 @@ namespace VkHook
                 : "Depth buffer capture off. Restart to apply.");
         }
         ImGui::TextDisabled("%s", describeActiveDepth(depthInfo).c_str());
-        if (depthCapture != depthCaptureAtStartup)
+        if (cfg.depthCapture != depthCaptureAtStartup)
         {
             ImGui::TextDisabled("Requires restart");
         }
@@ -334,13 +178,13 @@ namespace VkHook
                 if (mode == 0)
                 {
                     if (depthInfo.depthIsPinned)
-                        depthPinPendingClear = true;
+                        emit(ClearDepthPin{});
                 }
                 else if (!depthInfo.candidates.empty())
                 {
                     // unbiassed: the first reported buffer, so the switch is
                     // immediate even before anything has been drawn this frame.
-                    depthPinPendingView = defaultPinCandidateForSwapchain(depthInfo);
+                    emit(PinDepth{defaultPinCandidateForSwapchain(depthInfo)});
                 }
                 else
                 {
@@ -375,13 +219,12 @@ namespace VkHook
             ImGui::SameLine();
             ImGui::SetNextItemWidth(240.0f * d);
             ImGui::PushID("##depth_encoding");
-            int current = settingsManager.getDepthSourceChannel();
-            int index = (current == kChannels[1]) ? 1 : 0;
+            int index = (cfg.depthSourceChannel == kChannels[1]) ? 1 : 0;
             if (ImGui::Combo("##depth_channel", &index, labels, 2))
             {
-                settingsManager.setDepthSourceChannel(kChannels[index]);
-                depthTransformPending = true;
-                settingsDirty = true;
+                emitSetting("depthSourceChannel", kChannels[index]);
+                emit(DepthTransformChanged{});
+                emit(SettingsChanged{});
             }
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("%s", hints[index]);
@@ -391,14 +234,14 @@ namespace VkHook
         // --- Transforms: one compact row ---
         ImGui::Spacing();
         {
-            bool depthInvert = settingsManager.getDepthInvert();
-            bool depthFlip   = settingsManager.getDepthFlip();
-            bool depthFlop   = settingsManager.getDepthFlop();
+            bool depthInvert = cfg.depthInvert;
+            bool depthFlip = cfg.depthFlip;
+            bool depthFlop = cfg.depthFlop;
             bool changed = false;
 
             if (ImGui::Checkbox("Invert", &depthInvert))
             {
-                settingsManager.setDepthInvert(depthInvert);
+                emitSetting("depthInvert", depthInvert);
                 changed = true;
             }
             if (ImGui::IsItemHovered())
@@ -407,7 +250,7 @@ namespace VkHook
             ImGui::SameLine(0.0f, 18.0f * d);
             if (ImGui::Checkbox("Flip", &depthFlip))
             {
-                settingsManager.setDepthFlip(depthFlip);
+                emitSetting("depthFlip", depthFlip);
                 changed = true;
             }
             if (ImGui::IsItemHovered())
@@ -416,7 +259,7 @@ namespace VkHook
             ImGui::SameLine(0.0f, 18.0f * d);
             if (ImGui::Checkbox("Mirror", &depthFlop))
             {
-                settingsManager.setDepthFlop(depthFlop);
+                emitSetting("depthFlop", depthFlop);
                 changed = true;
             }
             if (ImGui::IsItemHovered())
@@ -424,8 +267,8 @@ namespace VkHook
 
             if (changed)
             {
-                depthTransformPending = true;
-                settingsDirty = true;
+                emit(DepthTransformChanged{});
+                emit(SettingsChanged{});
             }
         }
 
@@ -442,11 +285,11 @@ namespace VkHook
             ImGui::SameLine();
             ImGui::SetNextItemWidth(240.0f * d);
             ImGui::PushID("##depth_rebuild");
-            int index = (settingsManager.getDepthRebuildMode() == 0) ? 0 : 1;
+            int index = (cfg.depthRebuildMode == 0) ? 0 : 1;
             if (ImGui::Combo("##depth_rebuild_mode", &index, labels, 2))
             {
-                settingsManager.setDepthRebuildMode(index);
-                settingsDirty = true;
+                emitSetting("depthRebuildMode", index);
+                emit(SettingsChanged{});
             }
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("%s", hints[index]);
@@ -457,23 +300,17 @@ namespace VkHook
         ImGui::Spacing();
         if (ImGui::Button("Refresh depth buffers"))
         {
-            std::lock_guard<std::mutex> l(globalLock);
-            logicalDevice->activeDepthState    = DepthState{};
-            logicalDevice->bestDepthCandidate  = LogicalDevice::DepthCandidateTrackingState{};
-            logicalDevice->pinnedDepthImageView = VK_NULL_HANDLE;
-            depthPinChanged = true;
+            emit(RefreshDepth{});
             Logger::info("depth re-detect requested from Advanced UI");
         }
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Clear the active buffer, the best candidate and any pin.\nThe layer re-evaluates every render pass next frame.");
-
-        // --- Deferred save ---
-        flushSettingsSave();
     }
 
     // --- Pushed page: every tracked depth buffer -------------------------------
-    void ImGuiOverlay::renderDepthBuffersView()
+    void OverlayUi::renderDepthBuffersView()
     {
+        const DepthInfo& depthInfo = snapshot->depth;
         if (ImGui::Button("Back to settings"))
         {
             openSubView = SubView_None;
@@ -498,11 +335,11 @@ namespace VkHook
                 if (mode == 0)
                 {
                     if (depthInfo.depthIsPinned)
-                        depthPinPendingClear = true;
+                        emit(ClearDepthPin{});
                 }
                 else if (!depthInfo.candidates.empty())
                 {
-                    depthPinPendingView = defaultPinCandidateForSwapchain(depthInfo);
+                    emit(PinDepth{defaultPinCandidateForSwapchain(depthInfo)});
                 }
             }
             if (ImGui::IsItemHovered())
@@ -513,7 +350,6 @@ namespace VkHook
         if (depthInfo.candidates.empty())
         {
             UI::TextSupport("No depth views tracked yet. Render a frame with depth.");
-            flushSettingsSave();
             return;
         }
 
@@ -525,13 +361,11 @@ namespace VkHook
             const bool isPinned = depthInfo.depthIsPinned && (c.imageView == depthInfo.pinnedView);
             const DepthRowAction action = drawDepthBufferRow(static_cast<int>(i), c, isActive, isPinned);
             if (action.pin != VK_NULL_HANDLE)
-                depthPinPendingView = action.pin;
+                emit(PinDepth{action.pin});
             else if (action.unpin)
-                depthPinPendingClear = true;
+                emit(ClearDepthPin{});
         }
         ImGui::EndChild();
-
-        flushSettingsSave();
     }
 
 } // namespace VkHook
