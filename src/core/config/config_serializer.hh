@@ -17,96 +17,6 @@ namespace VkHook
         std::string value;
     };
 
-    struct ShaderProfileInstance
-    {
-        std::string name;
-        std::string type;  // ReShade filename or built-in id
-        bool enabled = true;
-    };
-
-    struct ShaderProfileData
-    {
-        std::vector<ConfigParam> params;
-        bool hasTechniques = false;
-        std::vector<std::string> techniques;
-        std::vector<std::string> techniqueSorting;
-        bool hasEffectList = false;
-        std::vector<std::string> effects;
-        std::vector<std::string> disabledEffects;
-        // [VKHOOK] section seen: VkHook wrote this profile, so the
-        // instance list is the exact stack and merges nothing
-        bool owned = false;
-        std::vector<ShaderProfileInstance> instances;
-    };
-
-    // global VkHook settings (from VkHook.conf); construct through
-    // DefaultConfig::appSettings so these members are never left uninitialised.
-    struct VkBasaltSettings
-    {
-        int maxEffects;
-        bool overlayBlockInput;
-        // Route file pickers and other integrations through the XDG desktop
-        // portals when the session provides them, instead of the in-overlay
-        // fallbacks. Off is for sessions with no portal service.
-        bool usePortalIntegration;
-        // Zero selects automatic framebuffer-based scaling; otherwise 0.75–3.
-        float uiScale;
-        std::string toggleKey;
-        std::string reloadKey;
-        std::string overlayKey;
-        bool enableOnLaunch;
-        bool depthCapture;
-        bool autoApply;  // Auto-apply changes without clicking Apply
-        int autoApplyDelay;  // ms delay before auto-applying changes
-        bool showDebugWindow;  // Show debug window with raw effect registry data
-        // Split effect parameters into their own tabbed card at the bottom
-        // (default) or keep them inline in the effect list (all-in-one card).
-        bool separateEffectParams;
-        // Depth buffer resolve mode for MSAA sources (Advanced tab).
-        // 0 = auto (prefer average, fall back to sample-zero),
-        // 1 = sample-zero, 2 = average. Only applied when supported by the device.
-        int depthResolveMode;
-        // How a depth change rebuilds the resolve path and command buffers
-        // (Advanced tab). 0 = safe: idle the queue first, so nothing in flight
-        // references the targets being freed. 1 = fast: rebuild behind the
-        // layer's own submit fences without idling; quicker to react, but a
-        // driver can fault if the app still references an old resolve target.
-        int depthRebuildMode;
-        // Optional manual depth buffer pin (Advanced tab). When non-empty, the
-        // layer pins depth capture to this tracked image view key instead of
-        // using the best-candidate heuristic. "" = auto-promotion.
-        std::string depthManualPin;
-        // Workaround for transient multisampled depth attachments (Advanced tab).
-        // When true, VkHook injects its own depth resolve attachment so the
-        // resolved depth survives past the render pass for effects to sample.
-        bool depthTransientWorkaround;
-        // Depth capture method for persistent storage path (Advanced tab).
-        // 0 = off (use legacy per-swapchain resolve only),
-        // 1 = Option A: RenderPassEnd hook (recommended, blit inline at CmdEndRenderPass),
-        // 2 = Option B: QueueSubmit interception (robust fallback, inject blit at submit).
-        int depthCaptureMethod;
-
-        // --- Alternative depth buffer handling ---
-        // Depth source channel/mode selection (Advanced tab).
-        // Comprehensive support for deferred rendering depth encodings:
-        //   0 = Luminance/Red (standard Vulkan depth from R channel)
-        //   1 = Alpha (alpha-encoded depth)
-        //   2 = Packed RGB (depth distributed across RGB channels)
-        //   3 = Logarithmic (log-encoded depth, needs linearization)
-        //   4 = View-space Z (raw view-space Z value)
-        //   5 = Normalized Device Coordinates / NDC
-        //   6 = Reversed-Z (inverted depth range for precision)
-        int depthSourceChannel;
-        // Invert depth values after reading from source.
-        // When enabled, depth = 1.0 - depth (flips near/far planes).
-        bool depthInvert;
-        // Mirror the depth image vertically (uv.y -> 1 - uv.y) for upside-down
-        // renderers such as macOS builds running under Darling.
-        bool depthFlip;
-        // Mirror the depth image horizontally (uv.x -> 1 - uv.x).
-        bool depthFlop;
-    };
-
     // Shader Manager configuration (from shader_manager.conf)
     struct ShaderManagerConfig
     {
@@ -149,14 +59,6 @@ namespace VkHook
         static std::string getDefaultConfig();
         static std::string getDefaultConfigPath();
 
-        // Global settings management (VkHook.conf). saveSettings is a
-        // read-modify-write: it rewrites the keys VkHook owns, appends the ones
-        // the file lacks and leaves everything else (unknown keys, comments,
-        // ordering) as the user wrote it. Callers off the main thread go through
-        // SettingsManager::save, which queues it on the PersistenceQueue.
-        static VkBasaltSettings loadSettings();
-        static bool saveSettings(const VkBasaltSettings& settings);
-
         // Shader Manager config (shader_manager.conf). Loading never writes.
         static ShaderManagerConfig loadShaderManagerConfig();
         static bool saveShaderManagerConfig(const ShaderManagerConfig& config);
@@ -166,8 +68,10 @@ namespace VkHook
         // a stale file after an upgrade.
         static bool ensureVersionFile();
 
-        // Merge a legacy reshade/packages/ tree into reshade/ once, keeping any
-        // file already present. Call early at startup, before shader discovery.
+        // Startup entry point: runs every pending config migration (migrate.hh)
+        // once, in order, before shader discovery. ConfigStore::initialize()
+        // runs the same chain, so control/frontend.cc's call is redundant and
+        // goes with its next edit.
         static void migrateLegacyReshadePackages();
 
         // Expand shader root directories to include their subdirectories, so a
@@ -213,8 +117,12 @@ namespace VkHook
                                         const std::string& copyFromProfile = "");
         static bool deleteShaderProfile(const std::string& gameName, const std::string& profileName);
 
-        // A usable preset name: non-empty, no path separators, no '@' (the
-        // game/profile separator) and no control bytes.
+        // One path component: non-empty, not "." or "..", no '/' or '\\' and no
+        // control bytes. The single check every game/profile name goes through.
+        static bool isSafePathComponent(const std::string& name);
+
+        // A usable preset name: a safe path component without '@' (the
+        // game/profile separator).
         static bool isValidShaderProfileName(const std::string& name);
 
         // Rename a preset in place, keeping its game-specific or imported-global
@@ -230,15 +138,14 @@ namespace VkHook
         static std::string importShaderProfile(const std::string& sourcePath);
         // Path importShaderProfile writes for an imported preset called `name`
         static std::string getImportedShaderProfilePath(const std::string& name);
-        static bool saveShaderProfile(const std::string& path, const std::vector<ConfigParam>& params,
-                                      const std::vector<std::string>& effects = {},
-                                      const std::vector<std::string>& disabledEffects = {},
-                                      const std::map<std::string, std::string>& effectPaths = {},
-                                      const std::vector<std::string>& enabledTechniques = {},
-                                      const std::vector<std::string>& techniqueSorting = {},
-                                      const std::vector<ConfigParam>& disabledEffectParams = {});
-        static std::vector<ConfigParam> loadShaderProfile(const std::string& path);
-        static ShaderProfileData loadShaderProfileData(const std::string& path);
+
+        // The two files of a preset (.ini plus hidden sidecar), as written by
+        // preset_model.hh's serialize(). Creates the directory; both files are
+        // written atomically. The caller routes the call through the PersistenceQueue.
+        static bool writeShaderProfile(const std::string& path, const std::string& ini,
+                                       const std::string& sidecar);
+        // Raw text of both files; a missing file reads as empty.
+        static void readShaderProfile(const std::string& path, std::string& ini, std::string& sidecar);
 
         // Save directly to a profile path (bypasses config name lookup)
         static bool saveToPath(

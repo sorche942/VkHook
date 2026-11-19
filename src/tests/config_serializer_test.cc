@@ -1,6 +1,6 @@
 #include "config.hh"
 #include "config_serializer.hh"
-#include "default_config.hh"
+#include "control/preset_model.hh"
 #include "ini.hh"
 #include "util.hh"
 
@@ -49,67 +49,6 @@ int main()
     setenv("XDG_CONFIG_HOME", root.c_str(), 1);
     setenv("HOME", root.c_str(), 1);
 
-    // A missing global config inherits launch effects enabled, and saving writes that default.
-    expect(VkHook::ConfigSerializer::loadSettings().enableOnLaunch,
-           "missing global config defaults enableOnLaunch to true");
-    expect(VkHook::ConfigSerializer::saveSettings(VkHook::ConfigSerializer::loadSettings()),
-           "save defaults into a missing config");
-    expect(readFile(VkHook::ConfigSerializer::getBaseConfigDir() + "/VkHook.conf")
-                   .find("enableOnLaunch = true") != std::string::npos,
-           "generated global config writes enableOnLaunch as true");
-
-    // Accept the capitalized boolean spelling used by older bundled configs.
-    {
-        std::ofstream legacy(VkHook::ConfigSerializer::getBaseConfigDir() + "/VkHook.conf");
-        legacy << "enableOnLaunch = True\n";
-    }
-    expect(VkHook::ConfigSerializer::loadSettings().enableOnLaunch,
-           "settings load capitalized True for enableOnLaunch");
-    std::filesystem::remove(VkHook::ConfigSerializer::getBaseConfigDir() + "/VkHook.conf");
-
-    // Settings are read back from an isolated XDG config directory.
-    VkHook::VkBasaltSettings settings = VkHook::DefaultConfig::appSettings();
-    settings.maxEffects = 23;
-    settings.overlayBlockInput = false;
-    settings.usePortalIntegration = false;
-    settings.toggleKey = "F8";
-    settings.reloadKey = "F9";
-    settings.overlayKey = "F11";
-    settings.enableOnLaunch = true;
-    settings.depthCapture = true;
-    settings.autoApply = false;
-    settings.autoApplyDelay = 375;
-    settings.showDebugWindow = true;
-    settings.separateEffectParams = false;
-    settings.depthResolveMode = 1;
-    settings.depthManualPin = "image-view-42";
-    settings.depthTransientWorkaround = false;
-    settings.depthCaptureMethod = 1;
-    settings.depthSourceChannel = 4;
-    settings.depthInvert = false;
-    settings.depthFlip = true;
-    settings.depthFlop = true;
-
-    expect(VkHook::ConfigSerializer::saveSettings(settings), "save global settings");
-    const auto loaded = VkHook::ConfigSerializer::loadSettings();
-    expect(loaded.maxEffects == settings.maxEffects, "settings preserve maxEffects");
-    expect(loaded.overlayBlockInput == settings.overlayBlockInput, "settings preserve overlayBlockInput");
-    expect(loaded.usePortalIntegration == settings.usePortalIntegration, "settings preserve usePortalIntegration");
-    expect(loaded.toggleKey == settings.toggleKey && loaded.reloadKey == settings.reloadKey &&
-               loaded.overlayKey == settings.overlayKey,
-           "settings preserve key bindings");
-    expect(loaded.enableOnLaunch == settings.enableOnLaunch, "settings preserve enableOnLaunch");
-    expect(loaded.depthCapture == settings.depthCapture, "settings preserve depthCapture");
-    expect(loaded.autoApply == settings.autoApply && loaded.autoApplyDelay == settings.autoApplyDelay,
-           "settings preserve auto-apply options");
-    expect(loaded.showDebugWindow == settings.showDebugWindow, "settings preserve showDebugWindow");
-    expect(loaded.separateEffectParams == settings.separateEffectParams, "settings preserve separateEffectParams");
-    expect(loaded.depthResolveMode == settings.depthResolveMode && loaded.depthManualPin == settings.depthManualPin &&
-               loaded.depthTransientWorkaround == settings.depthTransientWorkaround &&
-               loaded.depthCaptureMethod == settings.depthCaptureMethod &&
-               loaded.depthSourceChannel == settings.depthSourceChannel && loaded.depthInvert == settings.depthInvert &&
-               loaded.depthFlip == settings.depthFlip && loaded.depthFlop == settings.depthFlop,
-           "settings preserve depth options");
 
     // Saving a per-game config and loading it through Config preserves options.
     std::filesystem::create_directories(VkHook::ConfigSerializer::getConfigsDir());
@@ -151,113 +90,120 @@ int main()
            "game config migration renames legacy path");
     expect(readFile(gamePath) == "effects = Legacy\n", "game config migration preserves contents");
 
-    // Shader-profile serialization covers lists, scalar/vector params, and macros.
+    // Shader-profile files: serialize() (covered in preset_model_test) writes
+    // both files; the serializer places, reads, copies and deletes them.
+    const auto resolveAny = [](std::string_view key) {
+        return key == "cas" ? std::string("cas") : "/shaders/" + std::string(key);
+    };
+    const auto hasInstance = [](const VkHook::EffectStack& stack, const std::string& name) {
+        return std::any_of(stack.instances.begin(), stack.instances.end(),
+                           [&](const VkHook::EffectInstance& instance) { return instance.name == name; });
+    };
+    VkHook::EffectInstance simple;
+    simple.name = "Simple";
+    simple.type = "simple.fx";
+    simple.techniques = {{"SimplePass", true}};
+    simple.params = {{"Strength", {"0.75"}}, {"Tint", {"0.1", "0.2"}}};
+    simple.macros = {{"QUALITY", "high,fast"}};
+    VkHook::EffectInstance custom;
+    custom.name = "Custom";
+    custom.type = "custom.fx";
+    custom.enabled = false;
+    custom.techniques = {{"CustomPass", true}};
+    custom.params = {{"Strength", {"0.25"}}};
+    custom.macros = {{"QUALITY", "low"}};
+    VkHook::EffectInstance builtin;
+    builtin.name = "cas";
+    builtin.type = "cas";
+
     const std::string shaderPath = VkHook::ConfigSerializer::getShaderProfilePath("roundtrip-game", "source");
-    const std::vector<VkHook::ConfigParam> shaderParams = {
-        {"Simple", "Strength", "0.75"},
-        {"Simple", "Tint[0]", "0.1"},
-        {"Simple", "Tint[1]", "0.2"},
-        {"Simple", "@QUALITY", "high,fast"},
-    };
-    const std::vector<std::string> shaderEffects = {"Simple", "Custom"};
-    const std::vector<std::string> shaderDisabled = {"Custom"};
-    const std::vector<std::string> techniques = {"SimplePass@simple.fx"};
-    const std::vector<std::string> sorting = {"SimplePass@simple.fx", "CustomPass@custom.fx"};
-    const std::vector<VkHook::ConfigParam> disabledParams = {
-        {"Custom", "Strength", "0.25"},
-        {"Custom", "@QUALITY", "low"},
-    };
-    expect(VkHook::ConfigSerializer::saveShaderProfile(shaderPath, shaderParams, shaderEffects, shaderDisabled,
-                                                         effectPaths, techniques, sorting, disabledParams),
-           "save shader profile");
-    const auto shaderData = VkHook::ConfigSerializer::loadShaderProfileData(shaderPath);
-    expect(shaderData.hasTechniques && shaderData.techniques == techniques && shaderData.techniqueSorting == sorting,
-           "shader profile preserves ReShade techniques");
-    expect(!shaderData.hasEffectList, "shader profile does not require VkHook-only effect-list keys");
+    VkHook::EffectStack sourceStack;
+    sourceStack.instances = {simple, custom};
+    {
+        const auto preset = VkHook::serialize(sourceStack);
+        expect(VkHook::ConfigSerializer::writeShaderProfile(shaderPath, preset.ini, preset.sidecar),
+               "write shader profile");
+    }
+    std::string shaderIni, shaderSidecar;
+    VkHook::ConfigSerializer::readShaderProfile(shaderPath, shaderIni, shaderSidecar);
     const std::string shaderText = readFile(shaderPath);
-    expect(shaderText.find("[simple.fx]\n") != std::string::npos &&
-               shaderText.find("\n\n[simple.fx]\n") != std::string::npos,
-           "shader preset separates parameter sections with a blank line");
-    expect(shaderText.find("VkHookEffects=") == std::string::npos &&
-               shaderText.find("VkHookDisabledEffects=") == std::string::npos,
-           "shader profile only writes ReShade-compatible keys");
-    expect(shaderText.find("[simple.fx]\n") != std::string::npos,
-           "shader parameters use ReShade shader-filename section names");
-    expect(shaderData.params.size() == shaderParams.size(), "shader profile preserves parameter count");
+    expect(shaderIni == shaderText && !shaderIni.empty(), "readShaderProfile returns the .ini text");
     const auto presetPath = std::filesystem::path(shaderPath);
     const auto disabledProfilePath = (presetPath.parent_path() /
         ("." + presetPath.filename().string() + "_disabled-effectvalues")).string();
-    const auto savedDisabledParams = VkHook::ConfigSerializer::loadShaderProfile(disabledProfilePath);
-    expect(savedDisabledParams.size() == disabledParams.size(), "disabled effect values saved in sidecar");
-    expect(readFile(disabledProfilePath).find("PreprocessorDefinitions=QUALITY=low") != std::string::npos,
-           "disabled sidecar writes preprocessor definitions in normal INI syntax");
-    expect(readFile(shaderPath).find("PreprocessorDefinitions=QUALITY=high,,fast") != std::string::npos,
+    expect(VkHook::ConfigSerializer::getShaderProfileSidecarPath(shaderPath) == disabledProfilePath &&
+               shaderSidecar == readFile(disabledProfilePath) && !shaderSidecar.empty(),
+           "the sidecar is the hidden file beside the preset");
+    expect(shaderText.find("\n\n[simple.fx]\n") != std::string::npos,
+           "shader preset separates parameter sections with a blank line");
+    expect(shaderText.find("VkHookEffects=") == std::string::npos &&
+               shaderText.find("VkHookDisabledEffects=") == std::string::npos &&
+               shaderText.find("[VKHOOK]") == std::string::npos,
+           "shader profile only writes ReShade-compatible keys");
+    expect(shaderText.find("Tint=0.1,0.2") != std::string::npos, "vector values are written as one ReShade line");
+    expect(shaderText.find("PreprocessorDefinitions=QUALITY=high,,fast") != std::string::npos,
            "escaped commas in macro values retain ReShade syntax");
-    expect(readFile(shaderPath).find("Strength=0.25") == std::string::npos,
+    expect(shaderText.find("Strength=0.25") == std::string::npos && shaderText.find("custom.fx]") == std::string::npos &&
+               shaderText.find("QUALITY=low") == std::string::npos,
            "disabled effect values are omitted from main preset");
-    expect(std::find_if(savedDisabledParams.begin(), savedDisabledParams.end(), [](const auto& param) {
-               return param.effectName == "custom.fx" && param.paramName == "Strength" && param.value == "0.25";
-           }) != savedDisabledParams.end(),
-           "disabled effect value retains ReShade shader section in sidecar");
-    bool foundMacro = false, foundStrength = false, foundVector0 = false, foundVector1 = false;
-    for (const auto& param : shaderData.params)
-    {
-        foundMacro |= param.paramName == "@QUALITY" && param.value == "high,fast";
-        foundStrength |= param.paramName == "Strength" && param.value == "0.75";
-        foundVector0 |= param.paramName == "Tint[0]" && param.value == "0.1";
-        foundVector1 |= param.paramName == "Tint[1]" && param.value == "0.2";
-    }
-    expect(foundMacro, "shader profile preserves comma-containing preprocessor values");
-    expect(foundStrength && foundVector0 && foundVector1, "shader profile preserves scalar and vector values");
+    expect(shaderSidecar.find("[Custom]\nPreprocessorDefinitions=QUALITY=low\n") != std::string::npos &&
+               shaderSidecar.find("Strength=0.25") != std::string::npos,
+           "disabled effect values are saved in the sidecar in normal INI syntax");
+    expect(VkHook::parse(shaderIni, shaderSidecar, resolveAny) == sourceStack,
+           "the written preset reads back as the stack that was saved");
 
-    // Two instances of one shader file collapse into a single filename section,
-    // so their values are mirrored into the sidecar by instance name.
+    // Two instances of one shader file share a filename section, so their
+    // values live in the sidecar by instance name.
     const std::string dupPath = VkHook::ConfigSerializer::getShaderProfilePath("roundtrip-game", "dups");
-    const std::map<std::string, std::string> dupPaths = {
-        {"Bloom", "/shaders/bloom.fx"},
-        {"Bloom.2", "/shaders/bloom.fx"},
-    };
-    const std::vector<VkHook::ConfigParam> dupParams = {
-        {"Bloom", "Strength", "0.5"},
-        {"Bloom", "@QUALITY", "high"},
-        {"Bloom.2", "Strength", "0.9"},
-        {"Bloom.2", "@QUALITY", "low"},
-    };
-    expect(VkHook::ConfigSerializer::saveShaderProfile(dupPath, dupParams, {"Bloom", "Bloom.2"}, {},
-                                                        dupPaths, {}, {}, {}),
-           "save duplicate-instance shader profile");
-    const auto dupSidecar = VkHook::ConfigSerializer::loadShaderProfileData(
-        VkHook::ConfigSerializer::getShaderProfileSidecarPath(dupPath));
-    const auto hasParam = [](const std::vector<VkHook::ConfigParam>& params, const std::string& instance,
-                             const std::string& name, const std::string& value) {
-        return std::find_if(params.begin(), params.end(), [&](const auto& p) {
-                   return p.effectName == instance && p.paramName == name && p.value == value;
-               }) != params.end();
-    };
-    expect(hasParam(dupSidecar.params, "Bloom", "Strength", "0.5") &&
-               hasParam(dupSidecar.params, "Bloom.2", "Strength", "0.9"),
-           "duplicate instances keep per-instance values in the sidecar");
-    expect(hasParam(dupSidecar.params, "Bloom", "@QUALITY", "high") &&
-               hasParam(dupSidecar.params, "Bloom.2", "@QUALITY", "low"),
-           "duplicate instances keep per-instance preprocessor definitions");
-    expect(dupSidecar.instances.size() == 2, "duplicate instance list round-trips");
+    VkHook::EffectInstance bloom;
+    bloom.name = "Bloom";
+    bloom.type = "bloom.fx";
+    bloom.techniques = {{"Bloom", true}};
+    bloom.params = {{"Strength", {"0.5"}}};
+    bloom.macros = {{"QUALITY", "high"}};
+    VkHook::EffectInstance bloom2 = bloom;
+    bloom2.name = "Bloom.2";
+    bloom2.params = {{"Strength", {"0.9"}}};
+    bloom2.macros = {{"QUALITY", "low"}};
+    VkHook::EffectStack dupStack;
+    dupStack.instances = {bloom, bloom2};
+    {
+        const auto preset = VkHook::serialize(dupStack);
+        expect(VkHook::ConfigSerializer::writeShaderProfile(dupPath, preset.ini, preset.sidecar),
+               "write duplicate-instance shader profile");
+    }
+    std::string dupIni, dupSidecar;
+    VkHook::ConfigSerializer::readShaderProfile(dupPath, dupIni, dupSidecar);
+    const auto dupRead = VkHook::parse(dupIni, dupSidecar, resolveAny);
+    expect(dupRead == dupStack && dupRead.instances.size() == 2 &&
+               dupRead.instances[0].params[0].values[0] == "0.5" && dupRead.instances[1].params[0].values[0] == "0.9",
+           "duplicate instances keep per-instance values and preprocessor definitions");
 
     // The sidecar carries VkHook's authoritative instance list: order,
     // kinds, and per-instance enable state, including built-ins.
     const std::string ownedPath = VkHook::ConfigSerializer::getShaderProfilePath("roundtrip-game", "owned");
-    expect(VkHook::ConfigSerializer::saveShaderProfile(ownedPath, {}, {"Simple", "cas", "Custom"}, {"Custom"},
-                                                        effectPaths, {}, {}, {}),
-           "save vkhook-owned profile");
-    const auto ownedData = VkHook::ConfigSerializer::loadShaderProfileData(
-        VkHook::ConfigSerializer::getShaderProfileSidecarPath(ownedPath));
-    expect(ownedData.owned && ownedData.instances.size() == 3,
+    VkHook::EffectStack ownedStack;
+    ownedStack.instances = {simple, builtin, custom};
+    ownedStack.instances[0].params.clear();
+    ownedStack.instances[0].macros.clear();
+    ownedStack.instances[2].params.clear();
+    ownedStack.instances[2].macros.clear();
+    {
+        const auto preset = VkHook::serialize(ownedStack);
+        expect(VkHook::ConfigSerializer::writeShaderProfile(ownedPath, preset.ini, preset.sidecar),
+               "write vkhook-owned profile");
+    }
+    std::string ownedIni, ownedSidecar;
+    VkHook::ConfigSerializer::readShaderProfile(ownedPath, ownedIni, ownedSidecar);
+    const auto ownedRead = VkHook::parse(ownedIni, ownedSidecar, resolveAny);
+    expect(ownedRead.authoritative && ownedRead.instances.size() == 3,
            "sidecar marks the profile owned and lists every instance");
-    expect(ownedData.instances[0].name == "Simple" && ownedData.instances[0].type == "simple.fx" &&
-               ownedData.instances[0].enabled,
+    expect(ownedRead.instances[0].name == "Simple" && ownedRead.instances[0].type == "simple.fx" &&
+               ownedRead.instances[0].enabled,
            "reshade instance round-trips with its filename");
-    expect(ownedData.instances[1].name == "cas" && ownedData.instances[1].type == "cas",
+    expect(ownedRead.instances[1].name == "cas" && ownedRead.instances[1].type == "cas",
            "built-in instance round-trips as its bare type");
-    expect(ownedData.instances[2].name == "Custom" && !ownedData.instances[2].enabled,
+    expect(ownedRead.instances[2].name == "Custom" && !ownedRead.instances[2].enabled,
            "disabled flag survives the sidecar round-trip");
     expect(readFile(ownedPath).find("[VKHOOK]") == std::string::npos,
            "the main ini stays vkhook-free for ReShade");
@@ -273,8 +219,8 @@ int main()
                !std::filesystem::exists(copyPath) &&
                !std::filesystem::exists(VkHook::ConfigSerializer::getShaderProfileSidecarPath(copyPath)),
            "deleting a profile also deletes its sidecar");
-    expect(!VkHook::ConfigSerializer::loadShaderProfileData(shaderPath).owned &&
-               !VkHook::ConfigSerializer::loadShaderProfileData(ownedPath).owned,
+    expect(!hasInstance(VkHook::parse(ownedIni, "", resolveAny), "cas") &&
+               !hasInstance(VkHook::parse(shaderIni, "", resolveAny), "Custom"),
            "a preset's main ini is never mistaken for the vkhook instance list");
 
     // Imported, unprefixed ReShade presets should be discoverable and readable.
@@ -297,18 +243,20 @@ int main()
            "last shader profile persists by game name");
     expect(VkHook::ConfigSerializer::getShaderProfilePath("roundtrip-game", "reshade-import") == importedPath,
            "unprefixed ReShade preset resolves to its imported path");
-    const auto importedData = VkHook::ConfigSerializer::loadShaderProfileData(importedPath);
-    expect(!importedData.owned, "imported preset without a sidecar stays foreign");
-    expect(importedData.hasTechniques && importedData.techniques.size() == 2 &&
-               importedData.techniqueSorting.size() == 2,
+    std::string importedIni, importedSidecar;
+    VkHook::ConfigSerializer::readShaderProfile(importedPath, importedIni, importedSidecar);
+    expect(importedSidecar.empty(), "imported preset without a sidecar stays foreign");
+    const auto importedStack = VkHook::parse(importedIni, importedSidecar, resolveAny);
+    expect(importedStack.instances.size() == 1 && importedStack.instances[0].name == "Example" &&
+               importedStack.instances[0].techniques.size() == 2,
            "ReShade preset lists parse with standard comma-separated spacing");
-    expect(std::find_if(importedData.params.begin(), importedData.params.end(), [](const auto& param) {
-               return param.effectName == "Example.fx" && param.paramName == "Strength" && param.value == "0.5";
-           }) != importedData.params.end(),
+    expect(importedStack.instances.size() == 1 && importedStack.instances[0].params.size() == 1 &&
+               importedStack.instances[0].params[0].name == "Strength" &&
+               importedStack.instances[0].params[0].values == std::vector<std::string>{"0.5"},
            "ReShade shader-filename sections parse");
-    expect(std::find_if(importedData.params.begin(), importedData.params.end(), [](const auto& param) {
-               return param.effectName == "Example.fx" && param.paramName == "@QUALITY" && param.value == "2,4";
-           }) != importedData.params.end(),
+    expect(importedStack.instances.size() == 1 && importedStack.instances[0].macros.size() == 1 &&
+               importedStack.instances[0].macros[0].name == "QUALITY" &&
+               importedStack.instances[0].macros[0].value == "2,4",
            "ReShade preprocessor definitions preserve escaped commas");
 
     // Creating a game profile with an imported preset's name must not overwrite
@@ -331,10 +279,12 @@ int main()
         preset << "Techniques=EnabledPass@Example.fx\n"
                   "TechniqueSorting=EnabledPass@Example.fx,DisabledPass@Other.fx\n";
     }
-    const auto disabledTechniqueData = VkHook::ConfigSerializer::loadShaderProfileData(disabledTechniquePath);
-    expect(disabledTechniqueData.hasTechniques && disabledTechniqueData.techniques.size() == 1 &&
-               disabledTechniqueData.techniqueSorting.size() == 2,
-           "disabled techniques remain represented in sorting while absent from enabled list");
+    std::string disabledTechniqueIni, disabledTechniqueSidecar;
+    VkHook::ConfigSerializer::readShaderProfile(disabledTechniquePath, disabledTechniqueIni, disabledTechniqueSidecar);
+    const auto disabledTechniqueStack = VkHook::parse(disabledTechniqueIni, disabledTechniqueSidecar, resolveAny);
+    expect(disabledTechniqueStack.instances.size() == 1 && disabledTechniqueStack.instances[0].name == "Example" &&
+               disabledTechniqueStack.instances[0].techniques.size() == 1,
+           "a technique listed only in the sorting is not imported");
 
     // New shader profiles inherit the exact active profile contents.
     const std::string inheritedPath = VkHook::ConfigSerializer::getShaderProfilePath("roundtrip-game", "inherited");
@@ -403,40 +353,6 @@ int main()
            "global rename keeps the file global (no game prefix)");
 
 
-    // Saving settings is read-modify-write: keys VkHook does not own and the
-    // user's comments survive, in their original order.
-    {
-        const std::string confPath = VkHook::ConfigSerializer::getBaseConfigDir() + "/VkHook.conf";
-        {
-            std::ofstream user(confPath);
-            user << "# my notes about this setup\n"
-                    "reshadeIncludePath = /opt/my shaders/include\n"
-                    "maxEffects = 5\n"
-                    "# keep this too\n"
-                    "someFutureKey = \"a # b\"\n";
-        }
-        VkHook::VkBasaltSettings s = VkHook::ConfigSerializer::loadSettings();
-        s.maxEffects = 31;
-        expect(VkHook::ConfigSerializer::saveSettings(s), "save over a hand-edited VkHook.conf");
-        const std::string text = readFile(confPath);
-        const auto at = [&](const char* needle) { return text.find(needle); };
-        expect(at("# my notes about this setup") == 0, "leading comment preserved in place");
-        expect(at("reshadeIncludePath = /opt/my shaders/include") != std::string::npos,
-               "unknown key preserved verbatim");
-        expect(at("# keep this too") != std::string::npos && at("someFutureKey = \"a # b\"") != std::string::npos,
-               "later comment and unknown key preserved");
-        expect(at("maxEffects = 31") != std::string::npos && at("maxEffects = 5") == std::string::npos,
-               "owned key updated in place");
-        expect(at("reshadeIncludePath") < at("maxEffects = 31") && at("maxEffects = 31") < at("someFutureKey"),
-               "key order preserved");
-        expect(VkHook::ConfigSerializer::loadSettings().maxEffects == 31, "updated value reads back");
-        const std::string before = text;
-        expect(VkHook::ConfigSerializer::saveSettings(VkHook::ConfigSerializer::loadSettings()),
-               "re-save unchanged settings");
-        expect(readFile(confPath) == before, "saving unchanged settings is idempotent");
-        std::filesystem::remove(confPath);
-    }
-
     // One tokenizer: values with blanks, '#', quotes, '=' and backslashes survive write->read.
     {
         const std::vector<std::string> values = {
@@ -457,7 +373,7 @@ int main()
                    !VkHook::Ini::parseBool("maybe").has_value(),
                "bool parser");
 
-        // the same file means the same thing to Config and to loadSettings
+        // Config reads the same quoting rules the settings store does (config_store_test)
         const std::string confPath = VkHook::ConfigSerializer::getBaseConfigDir() + "/VkHook.conf";
         {
             std::ofstream f(confPath);
@@ -467,17 +383,11 @@ int main()
                  "depthManualPin = \"pin # one\"\n";
         }
         VkHook::Config config(confPath);
-        const auto settingsFromFile = VkHook::ConfigSerializer::loadSettings();
-        expect(config.getOption<int>("maxEffects") == 17 && settingsFromFile.maxEffects == 17,
-               "Config and loadSettings agree on a quoted number with a comment");
-        expect(config.getOption<std::string>("toggleKey") == settingsFromFile.toggleKey &&
-                   settingsFromFile.toggleKey == "Home",
-               "Config and loadSettings agree on a quoted string");
-        expect(config.getOption<bool>("enableOnLaunch") == false && !settingsFromFile.enableOnLaunch,
-               "Config and loadSettings agree on a bool");
-        expect(config.getOption<std::string>("depthManualPin") == "pin # one" &&
-                   settingsFromFile.depthManualPin == "pin # one",
-               "a '#' inside quotes is not a comment in either reader");
+        expect(config.getOption<int>("maxEffects") == 17, "Config reads a quoted number with a comment");
+        expect(config.getOption<std::string>("toggleKey") == "Home", "Config reads a quoted string");
+        expect(config.getOption<bool>("enableOnLaunch") == false, "Config reads a bool");
+        expect(config.getOption<std::string>("depthManualPin") == "pin # one",
+               "a '#' inside quotes is not a comment");
 
         // The hot-reload watcher ignores VkHook's own writes but sees external edits.
         VkHook::Config watched(confPath);
@@ -498,18 +408,23 @@ int main()
     {
         const std::string path = VkHook::ConfigSerializer::getShaderProfilePath("macro-game", "commas");
         std::filesystem::create_directories(std::filesystem::path(path).parent_path());
-        const std::map<std::string, std::string> paths = {{"Tint", "tint.fx"}};
-        const std::vector<VkHook::ConfigParam> disabledMacros = {
-            {"Tint", "@COLOR", "float3(1,0,0)"},
-            {"Tint", "Strength", "0.5"},
-        };
-        expect(VkHook::ConfigSerializer::saveShaderProfile(path, {}, {"Tint"}, {"Tint"}, paths, {}, {}, disabledMacros),
+        VkHook::EffectInstance tint;
+        tint.name = "Tint";
+        tint.type = "tint.fx";
+        tint.enabled = false;
+        tint.techniques = {{"Tint", true}};
+        tint.params = {{"Strength", {"0.5"}}};
+        tint.macros = {{"COLOR", "float3(1,0,0)"}};
+        VkHook::EffectStack stack;
+        stack.instances = {tint};
+        const auto preset = VkHook::serialize(stack);
+        expect(VkHook::ConfigSerializer::writeShaderProfile(path, preset.ini, preset.sidecar),
                "save profile with a disabled comma macro");
-        const auto data = VkHook::ConfigSerializer::loadShaderProfileData(
-            VkHook::ConfigSerializer::getShaderProfileSidecarPath(path));
-        const bool ok = std::any_of(data.params.begin(), data.params.end(), [](const auto& p) {
-            return p.paramName == "@COLOR" && p.value == "float3(1,0,0)";
-        });
+        std::string ini, sidecar;
+        VkHook::ConfigSerializer::readShaderProfile(path, ini, sidecar);
+        const auto data = VkHook::parse(ini, sidecar, resolveAny);
+        const bool ok = data.instances.size() == 1 && data.instances[0].macros.size() == 1 &&
+                        data.instances[0].macros[0].value == "float3(1,0,0)";
         expect(ok, "disabled macro value float3(1,0,0) round-trips through the sidecar");
     }
 
