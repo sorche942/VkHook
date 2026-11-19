@@ -1,6 +1,6 @@
 #include "imgui_overlay.hh"
 #include "settings_manager.hh"
-#include "layer/state.hh"
+#include "layer/registry.hh"
 #include "depth/tracker.hh"
 #include "logger.hh"
 #include "overlay/ui_theme.hh"
@@ -89,7 +89,7 @@ namespace VkHook
         if (!logicalDevice)
             return;
 
-        std::lock_guard<std::mutex> l(globalLock);
+        std::lock_guard<std::mutex> l(logicalDevice->stateLock);
 
         depthInfo.supportedResolveModes = logicalDevice->supportedDepthResolveModes;
         depthInfo.depthCaptureEnabled   = settingsManager.getDepthCapture();
@@ -199,7 +199,7 @@ namespace VkHook
 
         if (depthPinPendingView != VK_NULL_HANDLE)
         {
-            std::lock_guard<std::mutex> l(globalLock);
+            std::lock_guard<std::mutex> l(logicalDevice->stateLock);
             auto it = logicalDevice->depthViewStates.find(depthPinPendingView);
             if (it != logicalDevice->depthViewStates.end())
             {
@@ -220,7 +220,7 @@ namespace VkHook
 
         if (depthPinPendingClear)
         {
-            std::lock_guard<std::mutex> l(globalLock);
+            std::lock_guard<std::mutex> l(logicalDevice->stateLock);
             logicalDevice->pinnedDepthImageView = VK_NULL_HANDLE;
             depthPinPendingClear = false;
             depthPinChanged = true;
@@ -231,7 +231,7 @@ namespace VkHook
 
         if (depthTransformPending)
         {
-            std::lock_guard<std::mutex> l(globalLock);
+            std::lock_guard<std::mutex> l(logicalDevice->stateLock);
             // the resolve owns transforms now (macros no longer carry them),
             // so re-recording it is all a toggle needs
             logicalDevice->depthReallocPending = true;
@@ -457,7 +457,7 @@ namespace VkHook
         ImGui::Spacing();
         if (ImGui::Button("Refresh depth buffers"))
         {
-            std::lock_guard<std::mutex> l(globalLock);
+            std::lock_guard<std::mutex> l(logicalDevice->stateLock);
             logicalDevice->activeDepthState    = DepthState{};
             logicalDevice->bestDepthCandidate  = LogicalDevice::DepthCandidateTrackingState{};
             logicalDevice->pinnedDepthImageView = VK_NULL_HANDLE;

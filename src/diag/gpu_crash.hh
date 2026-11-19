@@ -27,16 +27,22 @@ namespace VkHook
     // and the device has crash diagnostics enabled.
     void reportDeviceLostDiagnostics(LogicalDevice* logicalDevice, VkQueue queue, const char* context, VkResult result);
 
-    // Push a fatal-error toast onto the device's overlay and switch the layer
-    // into pass-through mode until the device is destroyed.
+    // Soft-disable the device: toast on its overlay, no more effect work. Presents
+    // of faked swapchains keep going through the layer's copy-only path. Nothing
+    // is flushed or destroyed here.
     void panicLayer(LogicalDevice* logicalDevice, const std::string& reason);
 
     // True once panicLayer() recorded a device loss for this device.
     bool isDeviceLost(LogicalDevice* logicalDevice);
-    // DestroyDevice: forget the device.
-    void forgetDeviceLoss(LogicalDevice* logicalDevice);
 
-    // Smoke-test hook (VKHOOK_SMOKE_DEPTH_REFRESH=<ms>). Takes globalLock.
+    // Records one submitted batch in the device's small submit journal; the
+    // image index is a label for the dump, not a real image when unknown.
+    void recordSubmittedBatch(LogicalDevice* logicalDevice, const char* kind, uint32_t imageIndex,
+                              VkSemaphore waitSemaphore, VkSemaphore signalSemaphore, VkFence fence);
+    // Logs the journal, oldest first, with each batch's fence state.
+    void logSubmitJournal(LogicalDevice* logicalDevice, const char* reason);
+
+    // Smoke-test hook (VKHOOK_SMOKE_DEPTH_REFRESH=<ms>). Takes the device's stateLock.
     void maybeForceSmokeDepthRefresh(LogicalDevice* logicalDevice, DiagState& state);
 
     // Developer-only depth-resolve dump (VKHOOK_DEBUG builds); no-op otherwise.

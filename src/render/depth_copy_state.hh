@@ -13,13 +13,12 @@ namespace VkHook
     // v3 deferred depth copy: depth that needs blitting at QueueSubmit time.
     //
     // Two threads reach this state: a recording thread publishes a copy from
-    // CmdEndRenderPass*, and the submitting thread consumes it. QueueSubmit
-    // cannot use globalLock for it, because panicLayer() flushes the deferred
-    // destroy queue underneath that path, so the state carries its own mutex.
+    // CmdEndRenderPass*, and the submitting thread consumes it. The state carries
+    // its own mutex so the submit path does not need the device's stateLock for it.
     //
-    // Lock order: globalLock is always acquired *before* this mutex, never the
-    // other way round. QueueSubmit therefore never calls into globalLock-backed
-    // code (storage ensure, active-depth update) from inside withRing().
+    // Lock order: the device's stateLock is always acquired *before* this mutex,
+    // never the other way round. QueueSubmit therefore never calls into
+    // stateLock-backed code (storage ensure, active-depth update) from inside withRing().
     class DepthCopyState
     {
     public:
@@ -111,7 +110,7 @@ namespace VkHook
         };
 
         // fn runs with the mutex held and receives the locked ring view. It must
-        // not take globalLock, and must not call back into publish/consume.
+        // not take stateLock, and must not call back into publish/consume.
         template <typename F>
         auto withRing(F&& fn) -> decltype(fn(std::declval<RingAccess&>()))
         {

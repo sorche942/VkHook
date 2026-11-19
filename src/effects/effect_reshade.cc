@@ -12,7 +12,6 @@
 
 #include "image_view.hh"
 #include "c_resource.hh"
-#include "vk_handle.hh"
 #include "descriptor_set.hh"
 #include "buffer.hh"
 #include "renderpass.hh"
@@ -95,23 +94,36 @@ namespace VkHook
 
     // One cache per device, shared by every effect so a chain reload reuses the
     // pipelines the previous chain already made the driver compile. Created on
-    // first use; effect construction always runs under globalLock, so no extra
-    // locking is needed here.
+    // first use; effect construction runs with NO layer lock held, so two builds
+    // on one device can race here: the cache is published under stateLock and a
+    // loser destroys its (never used) cache.
     static VkPipelineCache devicePipelineCache(LogicalDevice* logicalDevice)
     {
         if (!logicalDevice)
             return VK_NULL_HANDLE;
-        if (logicalDevice->pipelineCache == VK_NULL_HANDLE)
         {
-            VkPipelineCacheCreateInfo createInfo = {};
-            createInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
-            if (logicalDevice->vkd.CreatePipelineCache(logicalDevice->device, &createInfo, nullptr,
-                                                       &logicalDevice->pipelineCache) != VK_SUCCESS)
-            {
-                logicalDevice->pipelineCache = VK_NULL_HANDLE;
-            }
+            std::lock_guard<std::mutex> l(logicalDevice->stateLock);
+            if (logicalDevice->pipelineCache != VK_NULL_HANDLE)
+                return logicalDevice->pipelineCache;
         }
-        return logicalDevice->pipelineCache;
+
+        VkPipelineCacheCreateInfo createInfo = {};
+        createInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+        VkPipelineCache created = VK_NULL_HANDLE;
+        if (logicalDevice->vkd.CreatePipelineCache(logicalDevice->device, &createInfo, nullptr, &created) != VK_SUCCESS)
+            return VK_NULL_HANDLE;
+
+        VkPipelineCache winner = created;
+        {
+            std::lock_guard<std::mutex> l(logicalDevice->stateLock);
+            if (logicalDevice->pipelineCache == VK_NULL_HANDLE)
+                logicalDevice->pipelineCache = created;
+            else
+                winner = logicalDevice->pipelineCache;
+        }
+        if (winner != created)
+            logicalDevice->vkd.DestroyPipelineCache(logicalDevice->device, created, nullptr);
+        return winner;
     }
 
     void ReshadeEffect::requireDescriptorSets(const std::vector<VkDescriptorSet>& sets, const char* what) const
@@ -1352,11 +1364,10 @@ namespace VkHook
         logicalDevice->vkd.CmdPipelineBarrier(commandBuffer, shaderStages, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &secondBarrier);
     }
 
-    // Registration order within a phase is the reverse of release order, because
-    // the queue releases equal phases newest-first. So a dependent object has to be
-    // registered AFTER the thing it depends on: images before their views, memory
-    // before both. Getting this backwards is silent until a driver dereferences
-    // freed memory, which is why it is stated here rather than left to the reader.
+    // Everything below may still be read by an in-flight submission, so it is
+    // retired (tagged with the submitted serial), never destroyed inline. The
+    // retire queue destroys dependents first (framebuffers before render passes,
+    // views before images, memory last) once the GPU serial passes.
     void ReshadeEffect::releaseResources()
     {
         if (!logicalDevice || logicalDevice->device == VK_NULL_HANDLE)
@@ -1364,89 +1375,76 @@ namespace VkHook
 
         Logger::info("[DESTROY-TRACE] ~ReshadeEffect start: " + effectName + " passRuntimes=" + std::to_string(passRuntimes.size()));
 
-        auto& queue = DeferredDestroyQueue::instance();
         auto  device = logicalDevice->device;
         auto& vkd    = logicalDevice->vkd;
+        size_t retired = 0;
+        const auto retire = [&](VkObjectType type, auto handle) {
+            logicalDevice->retire(type, handleToU64(handle));
+            ++retired;
+        };
 
-        // ---- Resource phase, registered bottom-up so views precede images ----
-
-        // memory first: it backs everything below it, so it must be released last.
-        // Lambdas capture by value from locals only, so every handle is copied out
-        // of the member first -- capturing the member itself would be a dangling
-        // read of a half-destroyed object, and capturing `this` would defeat the
-        // point of deferring.
         for (auto memory : textureMemory)
         {
             if (memory != VK_NULL_HANDLE)
-                queue.push(DestroyPhase::Memory, [vkd, device, memory] { vkd.FreeMemory(device, memory, nullptr); });
+                retire(VK_OBJECT_TYPE_DEVICE_MEMORY, memory);
         }
         const VkDeviceMemory stagingMemory = stagingBufferMemory;
-        if (stagingMemory != VK_NULL_HANDLE)
-            queue.push(DestroyPhase::Memory, [vkd, device, stagingMemory] { vkd.FreeMemory(device, stagingMemory, nullptr); });
 
         // the unmap has to happen before the memory goes, and it is a live call on
-        // the device, so it stays inline rather than being deferred
+        // the device, so it stays inline rather than being retired
         if (stagingBufferMapped)
             vkd.UnmapMemory(device, stagingBufferMemory);
+        if (stagingMemory != VK_NULL_HANDLE)
+            retire(VK_OBJECT_TYPE_DEVICE_MEMORY, stagingMemory);
 
         for (auto image : collectOwnedImages())
-            queue.push(DestroyPhase::Resource, [vkd, device, image] { vkd.DestroyImage(device, image, nullptr); });
+            retire(VK_OBJECT_TYPE_IMAGE, image);
 
-        // views after the images, so the reverse-order release destroys them first
         for (auto view : collectOwnedImageViews())
-            queue.push(DestroyPhase::Resource, [vkd, device, view] { vkd.DestroyImageView(device, view, nullptr); });
+            retire(VK_OBJECT_TYPE_IMAGE_VIEW, view);
 
         for (auto sampler : samplers)
         {
             if (sampler != VK_NULL_HANDLE)
-                queue.push(DestroyPhase::Resource, [vkd, device, sampler] { vkd.DestroySampler(device, sampler, nullptr); });
+                retire(VK_OBJECT_TYPE_SAMPLER, sampler);
         }
 
         const VkBuffer     buffer     = stagingBuffer;
         const VkShaderModule module     = shaderModule;
         if (buffer != VK_NULL_HANDLE)
-            queue.push(DestroyPhase::Resource, [vkd, device, buffer] { vkd.DestroyBuffer(device, buffer, nullptr); });
+            retire(VK_OBJECT_TYPE_BUFFER, buffer);
         if (module != VK_NULL_HANDLE)
-            queue.push(DestroyPhase::Resource, [vkd, device, module] { vkd.DestroyShaderModule(device, module, nullptr); });
+            retire(VK_OBJECT_TYPE_SHADER_MODULE, module);
 
-        // ---- Layout phase: pipeline layout and descriptor set layouts ----
-        // The pipeline layout names the descriptor set layouts, so it is registered
-        // last of the three and therefore released first.
         const VkDescriptorSetLayout uniformLayout  = uniformDescriptorSetLayout;
         const VkDescriptorSetLayout samplerLayout  = imageSamplerDescriptorSetLayout;
         const VkPipelineLayout      pipelineLay    = pipelineLayout;
         if (uniformLayout != VK_NULL_HANDLE)
-            queue.push(DestroyPhase::Layout, [vkd, device, uniformLayout] { vkd.DestroyDescriptorSetLayout(device, uniformLayout, nullptr); });
+            retire(VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT, uniformLayout);
         if (samplerLayout != VK_NULL_HANDLE)
-            queue.push(DestroyPhase::Layout, [vkd, device, samplerLayout] { vkd.DestroyDescriptorSetLayout(device, samplerLayout, nullptr); });
+            retire(VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT, samplerLayout);
         if (pipelineLay != VK_NULL_HANDLE)
-            queue.push(DestroyPhase::Layout, [vkd, device, pipelineLay] { vkd.DestroyPipelineLayout(device, pipelineLay, nullptr); });
+            retire(VK_OBJECT_TYPE_PIPELINE_LAYOUT, pipelineLay);
 
-        // ---- Descriptor phase: the pool implicitly frees its sets ----
+        // the pool implicitly frees its sets
         const VkDescriptorPool pool = descriptorPool;
         if (pool != VK_NULL_HANDLE)
-            queue.push(DestroyPhase::Descriptor, [vkd, device, pool] { vkd.DestroyDescriptorPool(device, pool, nullptr); });
+            retire(VK_OBJECT_TYPE_DESCRIPTOR_POOL, pool);
 
-        // ---- RenderPass phase: framebuffers before the passes they were built from ----
         for (auto& passRuntime : passRuntimes)
         {
             for (auto framebuffer : passRuntime.framebuffers)
             {
                 if (framebuffer != VK_NULL_HANDLE)
-                    queue.push(DestroyPhase::RenderPass, [vkd, device, framebuffer] { vkd.DestroyFramebuffer(device, framebuffer, nullptr); });
+                    retire(VK_OBJECT_TYPE_FRAMEBUFFER, framebuffer);
             }
             if (passRuntime.renderPass != VK_NULL_HANDLE)
-                queue.push(DestroyPhase::RenderPass, [vkd, device, renderPass = passRuntime.renderPass] { vkd.DestroyRenderPass(device, renderPass, nullptr); });
-        }
-
-        // ---- Pipeline phase: the pipeline references its layout and its stages ----
-        for (auto& passRuntime : passRuntimes)
-        {
+                retire(VK_OBJECT_TYPE_RENDER_PASS, passRuntime.renderPass);
             if (passRuntime.pipeline != VK_NULL_HANDLE)
-                queue.push(DestroyPhase::Pipeline, [vkd, device, pipeline = passRuntime.pipeline] { vkd.DestroyPipeline(device, pipeline, nullptr); });
+                retire(VK_OBJECT_TYPE_PIPELINE, passRuntime.pipeline);
         }
 
-        Logger::info("[DESTROY-TRACE] ~ReshadeEffect complete: handed " + std::to_string(queue.pending()) + " releases to the queue");
+        Logger::info("[DESTROY-TRACE] ~ReshadeEffect complete: retired " + std::to_string(retired) + " objects");
     }
 
     // The same handle is stored in several members -- a COLOR and a DEPTH texture

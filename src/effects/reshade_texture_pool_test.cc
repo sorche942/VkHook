@@ -2,7 +2,8 @@
 
 #include "image.hh"
 #include "logical_device.hh"
-#include "vk_handle.hh"
+#include "gpu/retire.hh"
+#include "gpu/timeline.hh"
 
 #include <algorithm>
 #include <cstdio>
@@ -38,6 +39,9 @@ namespace
     VkExtent3D lastExtent = {};
     VkFormat lastFormat = VK_FORMAT_UNDEFINED;
     uint32_t lastMips = 0;
+    Timeline timeline;
+    RetireQueue retireQueue{timeline};
+    TimelineLane lane = 0;
 
     struct View
     {
@@ -123,9 +127,36 @@ namespace
         releases.push_back('m');
     }
 
+    // Stands in for the device's destroy function: only the types a texture owns.
+    void destroyRetired(void*, const RetiredObject& object)
+    {
+        switch (object.type)
+        {
+        case VK_OBJECT_TYPE_IMAGE_VIEW:
+            destroyImageView(expectedDevice, u64ToHandle<VkImageView>(object.handle), nullptr);
+            break;
+        case VK_OBJECT_TYPE_IMAGE:
+            destroyImage(expectedDevice, u64ToHandle<VkImage>(object.handle), nullptr);
+            break;
+        case VK_OBJECT_TYPE_DEVICE_MEMORY:
+            freeMemory(expectedDevice, u64ToHandle<VkDeviceMemory>(object.handle), nullptr);
+            break;
+        default:
+            expect(false, "texture retires only views, images and memory");
+        }
+    }
+
+    void retireToQueue(void*, VkObjectType type, uint64_t handle, uint64_t extra)
+    {
+        retireQueue.retire(type, handle, extra);
+    }
+
+    ReshadeRetireHook testHook() { return {retireToQueue, nullptr}; }
+
     void reset()
     {
-        DeferredDestroyQueue::instance().flush();
+        retireQueue.drainAll();
+        timeline.nextSerial(lane); // submitted serial > 0 so collect(submitted - 1) is "GPU not done"
         expect(images.empty() && memories.empty() && views.empty(), "previous case leaves no live GPU handles");
         imageCalls = viewCalls = initCalls = failView = 0;
         failImage = failInit = false;
@@ -135,17 +166,19 @@ namespace
 
     void finish(unsigned expectedViews, unsigned expectedImages = 1)
     {
-        expect(releases.empty(), "destruction is deferred until flush");
-        expect(DeferredDestroyQueue::instance().pending() == expectedViews + 2 * expectedImages,
+        expect(releases.empty(), "destruction is deferred until the GPU serial passes");
+        expect(retireQueue.pending() == expectedViews + 2 * expectedImages,
                "one queued release per distinct owned handle");
-        DeferredDestroyQueue::instance().flush();
+        expect(retireQueue.collect(timeline.submittedSerial() - 1) == 0 && releases.empty(),
+               "nothing is destroyed before the serial it was retired under completes");
+        retireQueue.collect(timeline.submittedSerial());
         expect(images.empty() && memories.empty() && views.empty(), "flush releases every owned handle");
         expect(std::count(releases.begin(), releases.end(), 'v') == expectedViews, "exact view release count");
         expect(std::count(releases.begin(), releases.end(), 'i') == expectedImages, "exact image release count");
         expect(std::count(releases.begin(), releases.end(), 'm') == expectedImages, "exact memory release count");
         const auto count = releases.size();
-        DeferredDestroyQueue::instance().flush();
-        expect(releases.size() == count && DeferredDestroyQueue::instance().pending() == 0,
+        retireQueue.collect(timeline.submittedSerial());
+        expect(releases.size() == count && retireQueue.pending() == 0,
                "second flush never repeats destruction");
     }
 
@@ -157,7 +190,7 @@ namespace
         std::shared_ptr<ReshadeTexture> consumer;
         VkImage producerImage = VK_NULL_HANDLE;
         {
-            ReshadeTexturePool pool(&device);
+            ReshadeTexturePool pool(&device, testHook());
             auto producer = pool.acquire("DH_MotionVectors", standard);
             producerImage = producer->image;
             consumer = pool.acquire("DH_MotionVectors", standard);
@@ -177,16 +210,16 @@ namespace
             expect(views.at(consumer->unormRenderView).levels == 1 && views.at(consumer->srgbRenderView).levels == 1,
                    "attachment views expose only base level");
             producer.reset();
-            DeferredDestroyQueue::instance().flush();
+            retireQueue.collect(timeline.submittedSerial());
             expect(images.count(producerImage) == 1 && releases.empty(), "dropping producer cannot release consumer's image");
             consumer.reset();
-            DeferredDestroyQueue::instance().flush();
+            retireQueue.collect(timeline.submittedSerial());
             expect(images.count(producerImage) == 1 && releases.empty(), "pool retains texture with no external consumers");
             consumer = pool.acquire("DH_MotionVectors", standard);
             expect(consumer->image == producerImage && imageCalls == 1 && initCalls == 1,
                    "later consumer receives retained producer image without reinitializing");
         }
-        DeferredDestroyQueue::instance().flush();
+        retireQueue.collect(timeline.submittedSerial());
         expect(images.count(producerImage) == 1 && releases.empty(), "dropping pool cannot release consumer's image");
         consumer.reset();
         finish(4);
@@ -197,7 +230,7 @@ namespace
     {
         reset();
         {
-            ReshadeTexturePool pool(&device);
+            ReshadeTexturePool pool(&device, testHook());
             auto first = pool.acquire("shared", standard);
             ReshadeTextureDesc variants[] = {standard, standard, standard, standard, standard, standard};
             ++variants[0].extent.width;
@@ -216,7 +249,7 @@ namespace
                 expect(pool.acquire("shared", standard) == first, "mismatch preserves existing texture");
             }
             auto otherName = pool.acquire("other", standard);
-            ReshadeTexturePool otherPool(&device);
+            ReshadeTexturePool otherPool(&device, testHook());
             auto otherScope = otherPool.acquire("shared", standard);
             expect(first->image != otherName->image && first->image != otherScope->image
                        && otherName->image != otherScope->image, "different names and chain scopes never alias");
@@ -231,7 +264,7 @@ namespace
     {
         reset();
         {
-            ReshadeTexturePool pool(&device);
+            ReshadeTexturePool pool(&device, testHook());
             const uint32_t first = pool.beginEffect("Temporal.fx");
             const uint32_t second = pool.beginEffect("Temporal.fx");
             const uint32_t otherFile = pool.beginEffect("Other.fx");
@@ -262,7 +295,7 @@ namespace
                 const bool sameFormat = format == VK_FORMAT_R16G16_SFLOAT;
                 const unsigned expected = (sameFormat ? 1u : 2u) * (mips == 1 ? 1u : 2u);
                 {
-                    ReshadeTexturePool pool(&device);
+                    ReshadeTexturePool pool(&device, testHook());
                     auto texture = pool.acquire("dedup", {{32, 16, 1}, format, mips, VK_IMAGE_VIEW_TYPE_2D});
                     expect(viewCalls == expected, "only distinct format/mip combinations create views");
                     expect((texture->unormView == texture->srgbView) == sameFormat, "identical sampled formats share view");
@@ -273,7 +306,7 @@ namespace
             }
         reset();
         {
-            ReshadeTexturePool pool(&device);
+            ReshadeTexturePool pool(&device, testHook());
             auto texture = pool.acquire("volume", {{16, 16, 8}, VK_FORMAT_R16G16_SFLOAT, 1, VK_IMAGE_VIEW_TYPE_3D});
             expect(!(lastUsage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT), "3D texture excludes unsupported attachment usage");
             expect(lastExtent.depth == 8 && views.at(texture->unormView).type == VK_IMAGE_VIEW_TYPE_3D,
@@ -291,7 +324,7 @@ namespace
             failImage = stage == 0;
             failView = stage >= 1 && stage <= 4 ? stage : 0;
             failInit = stage == 5;
-            ReshadeTexturePool pool(&device);
+            ReshadeTexturePool pool(&device, testHook());
             bool threw = false;
             try { pool.acquire("partial", standard); }
             catch (const std::runtime_error&) { threw = true; }
@@ -349,6 +382,8 @@ int main()
     LogicalDevice device = {};
     device.device = handle<VkDevice>();
     expectedDevice = device.device;
+    lane = timeline.addLane();
+    retireQueue.bind(destroyRetired, nullptr);
     device.vkd.CreateImageView = createImageView;
     device.vkd.DestroyImageView = destroyImageView;
     device.vkd.DestroyImage = destroyImage;

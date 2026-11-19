@@ -22,11 +22,18 @@ namespace VkHook
         Downstream,
     };
 
+    // `extension` / `coreVersion` say what makes the command exist: the device
+    // extension that provides it and/or the core Vulkan version that promoted it
+    // (VK_API_VERSION_*). vkGetDeviceProcAddr returns null for the command
+    // unless the device enabled that extension or its API version is at least
+    // `coreVersion`. Entries with neither are always available.
     struct InterceptEntry
     {
-        const char*       name;
+        const char*        name;
         PFN_vkVoidFunction fn;
-        InterceptGate     gate;
+        InterceptGate      gate;
+        const char*        extension   = nullptr;
+        uint32_t           coreVersion = 0;
     };
 
     struct InterceptTable
@@ -43,6 +50,11 @@ namespace VkHook
 
 #define VKHOOK_INTERCEPT(gate, Name) \
     ::VkHook::InterceptEntry{"vk" #Name, reinterpret_cast<PFN_vkVoidFunction>(&VkHook_##Name), ::VkHook::InterceptGate::gate}
+
+    // `ext` is a device extension name string (e.g. VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME) or nullptr,
+    // `core` a VK_API_VERSION_* constant or 0.
+#define VKHOOK_INTERCEPT_EXT(gate, Name, ext, core) \
+    ::VkHook::InterceptEntry{"vk" #Name, reinterpret_cast<PFN_vkVoidFunction>(&VkHook_##Name), ::VkHook::InterceptGate::gate, ext, core}
 
     // one per module that owns hooks
     InterceptTable instanceInterceptTable();   // layer/instance.cc

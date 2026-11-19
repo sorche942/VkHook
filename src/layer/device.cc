@@ -1,5 +1,6 @@
 #include "layer/entry.hh"
-#include "layer/state.hh"
+#include "layer/registry.hh"
+#include "layer/guard.hh"
 #include "layer/env.hh"
 
 #include "control/frontend.hh"
@@ -8,301 +9,91 @@
 
 #include "keyboard_input_wayland.hh"
 #include "mouse_input_wayland.hh"
-#include "vk_handle.hh"
 #include "util.hh"
 #include "logger.hh"
 #include "effects/dlss5_config.hh"
 #ifdef VKHOOK_DLSS5
 #include "effects/effect_dlss5.hh"
-#include "render/dlss5_device.hh"
 #endif
+#include "layer/device_plan.hh"
+#include "layer/pipeline_cache.hh"
 #include "imgui_overlay.hh"
+#include "gpu/retire_device.hh"
 
+#include <algorithm>
 #include <cstring>
+#include <unordered_map>
 #include <string>
 #include <vector>
+#include <memory>
 
 namespace VkHook
 {
 namespace
 {
-    VkResult VKAPI_CALL VkHook_CreateDevice(VkPhysicalDevice             physicalDevice,
-                                              const VkDeviceCreateInfo*    pCreateInfo,
-                                              const VkAllocationCallbacks* pAllocator,
-                                              VkDevice*                    pDevice)
+    // Everything the post-create setup needs, gathered by vkCreateDevice.
+    struct DeviceBuild
     {
-        Logger::trace("vkCreateDevice");
-        VkLayerDeviceCreateInfo* layerCreateInfo = (VkLayerDeviceCreateInfo*) pCreateInfo->pNext;
+        VkPhysicalDevice           physicalDevice;
+        VkDevice                   device;
+        const InstanceSnapshot&    instance;
+        const DevicePlan&          plan;
+        const DeviceCaps&          caps;
+        const VkDeviceCreateInfo*  appCreateInfo;
+        PFN_vkGetInstanceProcAddr  gipa;
+        PFN_vkGetDeviceProcAddr    gdpa;
+        bool                       gpuCrashDiagnosticsRequested;
+    };
 
-        // step through the chain of pNext until we get to the link info
-        while (layerCreateInfo
-               && (layerCreateInfo->sType != VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO || layerCreateInfo->function != VK_LAYER_LINK_INFO))
-        {
-            layerCreateInfo = (VkLayerDeviceCreateInfo*) layerCreateInfo->pNext;
-        }
-
-        if (layerCreateInfo == nullptr)
-        {
-            // No loader instance create info
-            return VK_ERROR_INITIALIZATION_FAILED;
-        }
-
-        // everything below uses a copy of the instance state: no lock is held
-        // while the next layer creates the device
-        const InstanceSnapshot instSnap = snapshotInstance(GetKey(physicalDevice));
-        if (!instSnap.found)
-            return failUnknownObject("vkCreateDevice", VK_ERROR_INITIALIZATION_FAILED);
-
-        PFN_vkGetInstanceProcAddr gipa = layerCreateInfo->u.pLayerInfo->pfnNextGetInstanceProcAddr;
-        PFN_vkGetDeviceProcAddr   gdpa = layerCreateInfo->u.pLayerInfo->pfnNextGetDeviceProcAddr;
-        // move chain on for next layer
-        layerCreateInfo->u.pLayerInfo = layerCreateInfo->u.pLayerInfo->pNext;
-
-        PFN_vkCreateDevice createFunc = (PFN_vkCreateDevice) gipa(VK_NULL_HANDLE, "vkCreateDevice");
-
-        // check and activate extentions
-        uint32_t extensionCount = 0;
-
-        std::vector<VkExtensionProperties> extensionProperties;
-
-        {
-            {
-                VkResult res = instSnap.dispatch.EnumerateDeviceExtensionProperties(physicalDevice, nullptr, &extensionCount, nullptr);
-                if (res != VK_SUCCESS || extensionCount == 0)
-                {
-                    Logger::warn("EnumerateDeviceExtensionProperties failed or no extensions");
-                }
-                else
-                {
-                    extensionProperties.resize(extensionCount);
-                    res = instSnap.dispatch.EnumerateDeviceExtensionProperties(
-                        physicalDevice, nullptr, &extensionCount, extensionProperties.data());
-                    if (res != VK_SUCCESS)
-                        Logger::warn("EnumerateDeviceExtensionProperties second call failed");
-                }
-            }
-        }
-
-        auto hasDeviceExtension = [&](const char* extensionName) {
-            for (const VkExtensionProperties& properties : extensionProperties)
-            {
-                if (std::strcmp(properties.extensionName, extensionName) == 0)
-                    return true;
-            }
-            return false;
-        };
-
-        const bool supportsMutableFormat = hasDeviceExtension("VK_KHR_swapchain_mutable_format");
-        const bool supportsNvCheckpointExt = hasDeviceExtension(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
-        const bool supportsNvDiagnosticsConfigExt = hasDeviceExtension(VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME);
-        const bool supportsDeviceFaultExt = hasDeviceExtension(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
-        const bool gpuCrashDiagnosticsRequested = isGpuCrashDiagEnabled();
-        if (supportsMutableFormat)
-            Logger::debug("device supports VK_KHR_swapchain_mutable_format");
-
-        bool hasMutableEnvOverride = false;
-        bool mutableRequested = getMutableSwapchainEnvOverride(hasMutableEnvOverride, true);
-
-        VkPhysicalDeviceProperties deviceProps;
-        instSnap.dispatch.GetPhysicalDeviceProperties(physicalDevice, &deviceProps);
-
-        VkDeviceCreateInfo       modifiedCreateInfo = *pCreateInfo;
-        uint32_t queueFamilyCount = 0;
-        instSnap.dispatch.GetPhysicalDeviceQueueFamilyProperties(physicalDevice, &queueFamilyCount, nullptr);
-        std::vector<VkQueueFamilyProperties> queueProperties(queueFamilyCount);
-        instSnap.dispatch.GetPhysicalDeviceQueueFamilyProperties(physicalDevice, &queueFamilyCount, queueProperties.data());
-        std::vector<const char*> enabledExtensionNames;
-        if (modifiedCreateInfo.enabledExtensionCount)
-        {
-            enabledExtensionNames = std::vector<const char*>(modifiedCreateInfo.ppEnabledExtensionNames,
-                                                             modifiedCreateInfo.ppEnabledExtensionNames + modifiedCreateInfo.enabledExtensionCount);
-        }
-
-        if (supportsMutableFormat && mutableRequested)
-        {
-            Logger::debug("activating mutable_format");
-            addUniqueCString(enabledExtensionNames, "VK_KHR_swapchain_mutable_format");
-        }
-        else if (hasMutableEnvOverride)
-        {
-            Logger::info(std::string("Mutable swapchain device extension set via VKHOOK_ENABLE_MUTABLE_SWAPCHAIN=") + (mutableRequested ? "1" : "0"));
-        }
-        if (deviceProps.apiVersion < VK_API_VERSION_1_2 || instSnap.apiVersion < VK_API_VERSION_1_2)
-        {
-            addUniqueCString(enabledExtensionNames, "VK_KHR_image_format_list");
-        }
-
-        bool enableNvCheckpoints = false;
-        bool enableNvDiagnosticsConfig = false;
-        bool enableDeviceFault = false;
-        bool enableDeviceFaultFeature = false;
-        VkPhysicalDeviceFaultFeaturesEXT faultFeatureEnable = {};
-        VkDeviceDiagnosticsConfigCreateInfoNV diagnosticsConfigInfo = {};
-        if (gpuCrashDiagnosticsRequested)
-        {
-            if (supportsNvCheckpointExt)
-            {
-                addUniqueCString(enabledExtensionNames, VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
-                enableNvCheckpoints = true;
-            }
-            else
-            {
-                Logger::warn("VKHOOK_GPU_CRASH_DIAGNOSTICS=1 but VK_NV_device_diagnostic_checkpoints is not supported by this device");
-            }
-
-            if (supportsNvDiagnosticsConfigExt)
-            {
-                addUniqueCString(enabledExtensionNames, VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME);
-                enableNvDiagnosticsConfig = true;
-            }
-            else
-            {
-                Logger::warn("VKHOOK_GPU_CRASH_DIAGNOSTICS=1 but VK_NV_device_diagnostics_config is not supported by this device");
-            }
-
-            if (supportsDeviceFaultExt)
-            {
-                addUniqueCString(enabledExtensionNames, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
-                enableDeviceFault = true;
-            }
-            else
-            {
-                Logger::warn("VKHOOK_GPU_CRASH_DIAGNOSTICS=1 but VK_EXT_device_fault is not supported by this device");
-            }
-        }
-        modifiedCreateInfo.ppEnabledExtensionNames = enabledExtensionNames.data();
-        modifiedCreateInfo.enabledExtensionCount   = enabledExtensionNames.size();
-
-        // Active needed Features
-        VkPhysicalDeviceFeatures deviceFeatures = {};
-        if (modifiedCreateInfo.pEnabledFeatures)
-        {
-            deviceFeatures = *(modifiedCreateInfo.pEnabledFeatures);
-        }
-        deviceFeatures.shaderImageGatherExtended = VK_TRUE;
-        deviceFeatures.shaderStorageImageReadWithoutFormat = VK_TRUE;
-        deviceFeatures.shaderStorageImageWriteWithoutFormat = VK_TRUE;
-        modifiedCreateInfo.pEnabledFeatures      = &deviceFeatures;
-
-        void* extendedDevicePNext = const_cast<void*>(modifiedCreateInfo.pNext);
-
-        if (enableDeviceFault && !pNextChainContainsSType(modifiedCreateInfo.pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT))
-        {
-            VkPhysicalDeviceFaultFeaturesEXT faultFeatureQuery = {};
-            faultFeatureQuery.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT;
-            VkPhysicalDeviceFeatures2 featureQuery = {};
-            featureQuery.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-            featureQuery.pNext = &faultFeatureQuery;
-            if (instSnap.dispatch.GetPhysicalDeviceFeatures2)
-            {
-                instSnap.dispatch.GetPhysicalDeviceFeatures2(physicalDevice, &featureQuery);
-                if (faultFeatureQuery.deviceFault == VK_TRUE)
-                {
-                    faultFeatureEnable = {};
-                    faultFeatureEnable.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT;
-                    faultFeatureEnable.deviceFault = VK_TRUE;
-                    faultFeatureEnable.pNext = extendedDevicePNext;
-                    extendedDevicePNext = &faultFeatureEnable;
-                    enableDeviceFaultFeature = true;
-                }
-                else
-                {
-                    Logger::warn("VK_EXT_device_fault is present but deviceFault feature is not supported");
-                }
-            }
-            else
-            {
-                Logger::warn("Cannot query VkPhysicalDeviceFaultFeaturesEXT (vkGetPhysicalDeviceFeatures2 unavailable)");
-            }
-        }
-        else if (enableDeviceFault)
-        {
-            enableDeviceFaultFeature = true;
-        }
-
-        if (enableNvDiagnosticsConfig && !pNextChainContainsSType(modifiedCreateInfo.pNext, VK_STRUCTURE_TYPE_DEVICE_DIAGNOSTICS_CONFIG_CREATE_INFO_NV))
-        {
-            diagnosticsConfigInfo = {};
-            diagnosticsConfigInfo.sType = VK_STRUCTURE_TYPE_DEVICE_DIAGNOSTICS_CONFIG_CREATE_INFO_NV;
-            diagnosticsConfigInfo.flags =
-                VK_DEVICE_DIAGNOSTICS_CONFIG_ENABLE_AUTOMATIC_CHECKPOINTS_BIT_NV
-                | VK_DEVICE_DIAGNOSTICS_CONFIG_ENABLE_SHADER_ERROR_REPORTING_BIT_NV;
-            diagnosticsConfigInfo.pNext = extendedDevicePNext;
-            extendedDevicePNext = &diagnosticsConfigInfo;
-        }
-
-        modifiedCreateInfo.pNext = extendedDevicePNext;
-
-        bool dlss5Supported = false;
-        std::string dlss5UnavailableReason = "DLSS5 backend not built";
-        uint32_t opticalFlowFamily = VK_QUEUE_FAMILY_IGNORED;
-#ifdef VKHOOK_DLSS5
-        Dlss5DeviceFeatures dlss5Features;
-        const auto opticalQueue = selectDlss5OpticalQueue(queueProperties, *pCreateInfo);
-        opticalFlowFamily = opticalQueue.family;
-        dlss5Supported = dlss5Features.prepare(physicalDevice, instSnap.apiVersion,
-            instSnap.dispatch.GetPhysicalDeviceFeatures2, deviceProps,
-            extensionProperties, modifiedCreateInfo, enabledExtensionNames,
-            opticalFlowFamily != VK_QUEUE_FAMILY_IGNORED);
-        dlss5UnavailableReason = dlss5Features.error();
-        std::vector<VkDeviceQueueCreateInfo> queueInfos;
-        const float opticalFlowPriority = 1.0f;
-        if (dlss5Supported && dlss5Features.opticalFlowEnabled())
-        {
-            if (!opticalQueue.shared)
-            {
-                queueInfos.assign(pCreateInfo->pQueueCreateInfos, pCreateInfo->pQueueCreateInfos + pCreateInfo->queueCreateInfoCount);
-                VkDeviceQueueCreateInfo flowQueue{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
-                flowQueue.queueFamilyIndex = opticalFlowFamily;
-                flowQueue.queueCount = 1;
-                flowQueue.pQueuePriorities = &opticalFlowPriority;
-                queueInfos.push_back(flowQueue);
-                modifiedCreateInfo.queueCreateInfoCount = static_cast<uint32_t>(queueInfos.size());
-                modifiedCreateInfo.pQueueCreateInfos = queueInfos.data();
-            }
-            Logger::info("DLSS5 optical flow: " + std::string(opticalQueue.shared ? "sharing application" : "reserving private")
-                + " queue family " + std::to_string(opticalFlowFamily) + ", queue 0");
-        }
-        else
-        {
-            opticalFlowFamily = VK_QUEUE_FAMILY_IGNORED;
-            if (dlss5Supported)
-                Logger::warn(opticalQueue.family == VK_QUEUE_FAMILY_IGNORED
-                    ? "DLSS5 temporal unavailable: no usable separate optical-flow queue (protected/mixed queues cannot be shared)"
-                    : "DLSS5 temporal unavailable: VK_NV_optical_flow extension or opticalFlow feature not supported");
-        }
-#endif
-
-        VkResult ret = createFunc(physicalDevice, &modifiedCreateInfo, pAllocator, pDevice);
-
-        if (ret != VK_SUCCESS)
-            return ret;
+    // The layer's per-device state, built after the real device exists. May throw;
+    // vkCreateDevice then tears the device down again.
+    std::shared_ptr<LogicalDevice> buildLogicalDevice(const DeviceBuild& build)
+    {
+        const VkPhysicalDeviceProperties& deviceProps = build.caps.properties;
+        const InstanceSnapshot&           instSnap    = build.instance;
+        const DevicePlan&                 plan        = build.plan;
+        const VkDevice                    device      = build.device;
 
         auto logicalDevice = std::make_shared<LogicalDevice>();
         logicalDevice->vki                   = instSnap.dispatch;
-        logicalDevice->device                = *pDevice;
-        logicalDevice->physicalDevice        = physicalDevice;
+        logicalDevice->device                = device;
+        logicalDevice->physicalDevice        = build.physicalDevice;
         logicalDevice->instance              = instSnap.instance;
         logicalDevice->queue                 = VK_NULL_HANDLE;
         logicalDevice->queueFamilyIndex      = 0;
-        logicalDevice->commandPool           = VK_NULL_HANDLE;
-        logicalDevice->supportsMutableFormat = supportsMutableFormat && mutableRequested;
+        logicalDevice->supportsMutableFormat = plan.supportsMutableFormat;
         logicalDevice->isNvidiaGpu           = (deviceProps.vendorID == 0x10DE);
-        logicalDevice->gpuCrashDiagnosticsEnabled = gpuCrashDiagnosticsRequested;
-        logicalDevice->supportsNvDiagnosticCheckpoints = enableNvCheckpoints;
-        logicalDevice->supportsNvDiagnosticsConfig = enableNvDiagnosticsConfig;
-        logicalDevice->supportsDeviceFaultExt = enableDeviceFault && enableDeviceFaultFeature;
-        logicalDevice->downstreamGIPA = gipa;
-        logicalDevice->downstreamGDPA = gdpa;
-        logicalDevice->dlss5Supported = dlss5Supported;
-        logicalDevice->dlss5UnavailableReason = dlss5UnavailableReason;
+        logicalDevice->gpuProperties         = deviceProps;
+        logicalDevice->gpuCrashDiagnosticsEnabled = build.gpuCrashDiagnosticsRequested;
+        logicalDevice->supportsNvDiagnosticCheckpoints = plan.enableNvCheckpoints;
+        logicalDevice->supportsNvDiagnosticsConfig = plan.enableNvDiagnosticsConfig;
+        logicalDevice->supportsDeviceFaultExt = plan.enableDeviceFault && plan.enableDeviceFaultFeature;
+        logicalDevice->downstreamGIPA = build.gipa;
+        logicalDevice->downstreamGDPA = build.gdpa;
+        logicalDevice->dlss5Supported = plan.dlss5Supported;
+        logicalDevice->dlss5UnavailableReason = plan.dlss5UnavailableReason;
 
-        fillDispatchTableDevice(*pDevice, gdpa, &logicalDevice->vkd);
-        if (opticalFlowFamily != VK_QUEUE_FAMILY_IGNORED)
+        // what vkGetDeviceProcAddr may hand out (AGENTS.md: null for commands
+        // whose extension the device did not enable)
+        const VkDeviceCreateInfo& created = plan.createInfo();
+        for (uint32_t i = 0; i < created.enabledExtensionCount; ++i)
+            logicalDevice->enabledExtensions.insert(created.ppEnabledExtensionNames[i]);
+        logicalDevice->deviceApiVersion = std::min(instSnap.apiVersion, deviceProps.apiVersion);
+
+        fillDispatchTableDevice(device, build.gdpa, &logicalDevice->vkd);
         {
-            logicalDevice->dlss5OpticalFlowQueueFamily = opticalFlowFamily;
-            logicalDevice->vkd.GetDeviceQueue(*pDevice, opticalFlowFamily, 0, &logicalDevice->dlss5OpticalFlowQueue);
-            initializeDispatchTable(logicalDevice->dlss5OpticalFlowQueue, *pDevice);
+            QueueDispatch queueDispatch;
+            fillQueueDispatch(device, build.gdpa, &queueDispatch);
+            logicalDevice->queues.init(device, queueDispatch, logicalDevice->timeline);
+            bindRetireDestroyer(*logicalDevice);
+        }
+
+        if (plan.opticalFlowFamily != VK_QUEUE_FAMILY_IGNORED)
+        {
+            logicalDevice->dlss5OpticalFlowQueueFamily = plan.opticalFlowFamily;
+            logicalDevice->vkd.GetDeviceQueue(device, plan.opticalFlowFamily, 0, &logicalDevice->dlss5OpticalFlowQueue);
+            initializeDispatchTable(logicalDevice->dlss5OpticalFlowQueue, device);
+            logicalDevice->queues.add(logicalDevice->dlss5OpticalFlowQueue, plan.opticalFlowFamily, 0);
         }
 
         // Query supported depth resolve modes once (VK_KHR_depth_resolve_mode,
@@ -325,7 +116,7 @@ namespace
             pcieProps.pNext = &driverProps;
             if (instSnap.dispatch.GetPhysicalDeviceProperties2)
             {
-                instSnap.dispatch.GetPhysicalDeviceProperties2(physicalDevice, &props2);
+                instSnap.dispatch.GetPhysicalDeviceProperties2(build.physicalDevice, &props2);
                 logicalDevice->supportedDepthResolveModes = resolveProps.supportedDepthResolveModes;
                 if (logicalDevice->supportedDepthResolveModes == 0)
                     logicalDevice->supportedDepthResolveModes = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
@@ -382,9 +173,10 @@ namespace
                 + ", device fault=" + (logicalDevice->supportsDeviceFaultExt ? "on" : "off") + ")");
         }
 
-        for (uint32_t i = 0; i < pCreateInfo->queueCreateInfoCount; i++)
+        const auto& queueProperties = build.caps.queueFamilies;
+        for (uint32_t i = 0; i < build.appCreateInfo->queueCreateInfoCount; i++)
         {
-            auto& queueInfo = pCreateInfo->pQueueCreateInfos[i];
+            auto& queueInfo = build.appCreateInfo->pQueueCreateInfos[i];
             if (queueInfo.queueFamilyIndex < queueProperties.size()
                 && (queueProperties[queueInfo.queueFamilyIndex].queueFlags & VK_QUEUE_GRAPHICS_BIT))
             {
@@ -395,21 +187,11 @@ namespace
                 }
                 logicalDevice->vkd.GetDeviceQueue(logicalDevice->device, queueInfo.queueFamilyIndex, 0, &logicalDevice->queue);
 
-                VkCommandPoolCreateInfo commandPoolCreateInfo;
-                commandPoolCreateInfo.sType            = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-                commandPoolCreateInfo.pNext            = nullptr;
-                commandPoolCreateInfo.flags            = 0;
-                commandPoolCreateInfo.queueFamilyIndex = queueInfo.queueFamilyIndex;
-
                 Logger::debug("Found graphics capable queue");
-                VkResult poolRes = logicalDevice->vkd.CreateCommandPool(logicalDevice->device, &commandPoolCreateInfo, nullptr, &logicalDevice->commandPool);
-                if (poolRes != VK_SUCCESS)
-                {
-                    Logger::err("CreateCommandPool failed: " + std::to_string(poolRes));
-                }
                 logicalDevice->queueFamilyIndex = queueInfo.queueFamilyIndex;
 
                 initializeDispatchTable(logicalDevice->queue, logicalDevice->device);
+                logicalDevice->queues.add(logicalDevice->queue, queueInfo.queueFamilyIndex, 0);
 
                 break;
             }
@@ -421,12 +203,150 @@ namespace
             // Still register the device so destruction works, but effects won't function
         }
 
+        loadPipelineCache(*logicalDevice, deviceProps);
+
+        return logicalDevice;
+    }
+
+    VkResult VKAPI_CALL VkHook_CreateDevice(VkPhysicalDevice             physicalDevice,
+                                              const VkDeviceCreateInfo*    pCreateInfo,
+                                              const VkAllocationCallbacks* pAllocator,
+                                              VkDevice*                    pDevice)
+    {
+        Logger::trace("vkCreateDevice");
+        VkLayerDeviceCreateInfo* layerCreateInfo = (VkLayerDeviceCreateInfo*) pCreateInfo->pNext;
+
+        // step through the chain of pNext until we get to the link info
+        while (layerCreateInfo
+               && (layerCreateInfo->sType != VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO || layerCreateInfo->function != VK_LAYER_LINK_INFO))
         {
-            scoped_lock l(globalLock);
-            deviceMap[GetKey(*pDevice)] = logicalDevice;
+            layerCreateInfo = (VkLayerDeviceCreateInfo*) layerCreateInfo->pNext;
         }
 
-        return VK_SUCCESS;
+        if (layerCreateInfo == nullptr)
+        {
+            // No loader instance create info
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+
+        // everything below uses a copy of the instance state: no lock is held
+        // while the next layer creates the device
+        const InstanceSnapshot instSnap = snapshotInstance(GetKey(physicalDevice));
+        if (!instSnap.found)
+            return failUnknownObject("vkCreateDevice", VK_ERROR_INITIALIZATION_FAILED);
+
+        PFN_vkGetInstanceProcAddr gipa = layerCreateInfo->u.pLayerInfo->pfnNextGetInstanceProcAddr;
+        PFN_vkGetDeviceProcAddr   gdpa = layerCreateInfo->u.pLayerInfo->pfnNextGetDeviceProcAddr;
+        // move chain on for next layer
+        layerCreateInfo->u.pLayerInfo = layerCreateInfo->u.pLayerInfo->pNext;
+
+        PFN_vkCreateDevice createFunc = (PFN_vkCreateDevice) gipa(VK_NULL_HANDLE, "vkCreateDevice");
+
+        // Vulkan queries live here; planDeviceCreate is pure (AGENTS.md invariant 9)
+        DeviceCaps caps;
+        {
+            uint32_t extensionCount = 0;
+            VkResult res = instSnap.dispatch.EnumerateDeviceExtensionProperties(physicalDevice, nullptr, &extensionCount, nullptr);
+            if (res != VK_SUCCESS || extensionCount == 0)
+            {
+                Logger::warn("EnumerateDeviceExtensionProperties failed or no extensions");
+            }
+            else
+            {
+                caps.extensions.resize(extensionCount);
+                res = instSnap.dispatch.EnumerateDeviceExtensionProperties(
+                    physicalDevice, nullptr, &extensionCount, caps.extensions.data());
+                if (res != VK_SUCCESS)
+                {
+                    Logger::warn("EnumerateDeviceExtensionProperties second call failed");
+                    caps.extensions.clear();
+                }
+                else
+                {
+                    caps.extensions.resize(extensionCount);
+                }
+            }
+        }
+
+        instSnap.dispatch.GetPhysicalDeviceProperties(physicalDevice, &caps.properties);
+        {
+            uint32_t queueFamilyCount = 0;
+            instSnap.dispatch.GetPhysicalDeviceQueueFamilyProperties(physicalDevice, &queueFamilyCount, nullptr);
+            caps.queueFamilies.resize(queueFamilyCount);
+            instSnap.dispatch.GetPhysicalDeviceQueueFamilyProperties(physicalDevice, &queueFamilyCount, caps.queueFamilies.data());
+        }
+
+        if (instSnap.dispatch.GetPhysicalDeviceFeatures2)
+        {
+            VkPhysicalDeviceFaultFeaturesEXT faultQuery = {};
+            faultQuery.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT;
+            VkPhysicalDeviceFeatures2 featureQuery = {};
+            featureQuery.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+            // the fault struct may only be queried when the extension exists
+            if (caps.hasExtension(VK_EXT_DEVICE_FAULT_EXTENSION_NAME))
+                featureQuery.pNext = &faultQuery;
+            instSnap.dispatch.GetPhysicalDeviceFeatures2(physicalDevice, &featureQuery);
+            caps.shaderImageGatherExtended            = featureQuery.features.shaderImageGatherExtended == VK_TRUE;
+            caps.shaderStorageImageReadWithoutFormat  = featureQuery.features.shaderStorageImageReadWithoutFormat == VK_TRUE;
+            caps.shaderStorageImageWriteWithoutFormat = featureQuery.features.shaderStorageImageWriteWithoutFormat == VK_TRUE;
+            caps.deviceFault                          = faultQuery.deviceFault == VK_TRUE;
+        }
+        else
+        {
+            Logger::warn("vkGetPhysicalDeviceFeatures2 unavailable: VkHook device features and fault reporting stay off");
+        }
+
+        caps.instanceApiVersion = instSnap.apiVersion;
+        caps.mutableEnvValue = getMutableSwapchainEnvOverride(caps.mutableEnvOverridePresent, true);
+        const bool gpuCrashDiagnosticsRequested = isGpuCrashDiagEnabled();
+        caps.gpuCrashDiagnostics = gpuCrashDiagnosticsRequested;
+#ifdef VKHOOK_DLSS5
+        caps.dlss5          = true;
+        caps.physicalDevice = physicalDevice;
+        caps.queryFeatures  = instSnap.dispatch.GetPhysicalDeviceFeatures2;
+#endif
+
+        const std::unique_ptr<DevicePlan> plan = planDeviceCreate(caps, *pCreateInfo);
+        for (const std::string& message : plan->infos)
+            Logger::info(message);
+        for (const std::string& message : plan->warnings)
+            Logger::warn(message);
+
+        const VkPhysicalDeviceProperties& deviceProps = caps.properties;
+        const bool enableNvCheckpoints         = plan->enableNvCheckpoints;
+        const bool enableNvDiagnosticsConfig   = plan->enableNvDiagnosticsConfig;
+        const bool enableDeviceFault           = plan->enableDeviceFault;
+        const bool enableDeviceFaultFeature    = plan->enableDeviceFaultFeature;
+        const bool dlss5Supported              = plan->dlss5Supported;
+        const std::string& dlss5UnavailableReason = plan->dlss5UnavailableReason;
+        const uint32_t opticalFlowFamily       = plan->opticalFlowFamily;
+
+        VkResult ret = createFunc(physicalDevice, &plan->createInfo(), pAllocator, pDevice);
+
+        if (ret != VK_SUCCESS)
+            return ret;
+
+        try
+        {
+            DeviceBuild build{physicalDevice, *pDevice, instSnap, *plan, caps, pCreateInfo, gipa, gdpa, gpuCrashDiagnosticsRequested};
+            registerDevice(GetKey(*pDevice), buildLogicalDevice(build));
+            return VK_SUCCESS;
+        }
+        catch (const std::exception& e)
+        {
+            reportHookException(nullptr, "vkCreateDevice", e.what());
+        }
+        catch (...)
+        {
+            reportHookException(nullptr, "vkCreateDevice", nullptr);
+        }
+
+        // The layer could not set the device up. Fail the creation cleanly
+        // rather than hand the app a device the layer does not track.
+        if (auto destroyDevice = reinterpret_cast<PFN_vkDestroyDevice>(gdpa(*pDevice, "vkDestroyDevice")))
+            destroyDevice(*pDevice, pAllocator);
+        *pDevice = VK_NULL_HANDLE;
+        return VK_ERROR_INITIALIZATION_FAILED;
     }
 
     void VKAPI_CALL VkHook_DestroyDevice(VkDevice device, const VkAllocationCallbacks* pAllocator)
@@ -434,95 +354,74 @@ namespace
         if (!device)
             return;
 
-        // Teardown of the layer's own objects runs under the lock; the final
-        // forward to the next layer runs after it is released.
-        std::unique_lock<std::mutex> l(globalLock);
-
         Logger::trace("vkDestroyDevice");
 
-        // Last chance to release anything still queued: once the device below is
-        // destroyed, calling Vulkan against it is undefined behaviour, so the
-        // queue is drained while the handle is still valid. Swapchain destruction
-        // will normally have flushed already; this covers the paths that destroy
-        // the device without a swapchain teardown, such as a lost device.
-        DeferredDestroyQueue::instance().flush();
-
-        auto devIt = deviceMap.find(GetKey(device));
-        if (devIt == deviceMap.end() || !devIt->second)
+        auto keepAlive = findDevice(GetKey(device));
+        if (!keepAlive)
         {
             failUnknownObject("vkDestroyDevice", VK_ERROR_DEVICE_LOST);
             return;
         }
-        std::shared_ptr<LogicalDevice> keepAlive = devIt->second;
         LogicalDevice* logicalDevice = keepAlive.get();
 
-        // Destroy all swapchains belonging to this device first
-        for (auto swapIt = swapchainMap.begin(); swapIt != swapchainMap.end(); )
-        {
-            if (swapIt->second && swapIt->second->logicalDevice == logicalDevice)
+        guardLayerWork(logicalDevice, "vkDestroyDevice", [&] {
+            // The only real vkDeviceWaitIdle in the layer, and nothing is held: the
+            // app must have stopped using the device (AGENTS.md invariant 3). From
+            // here every retired object can go.
+            logicalDevice->vkd.DeviceWaitIdle(device);
+
+            // swapchains first: their generations and shared images retire into the queue
+            std::unordered_map<VkSwapchainKHR, std::shared_ptr<LogicalSwapchain>> swapchains;
             {
-                swapIt->second->destroy();
-                swapIt = swapchainMap.erase(swapIt);
+                std::lock_guard<std::mutex> l(logicalDevice->stateLock);
+                swapchains.swap(logicalDevice->swapchains);
             }
-            else
+            swapchains.clear();
+
+            // the overlay uses device resources
+            logicalDevice->imguiOverlay.reset();
+
+            destroyPersistentDepthStorage(logicalDevice);
+
+            // The ring's teardown takes its own lock so it cannot race a QueueSubmit
+            // mid-copy; the device is idle, so the objects go directly.
+            logicalDevice->depthCopy.withRing([&](DepthCopyState::RingAccess& ring) {
+                VkCommandPool pool = VK_NULL_HANDLE;
+                std::vector<VkFence> fences;
+                ring.detach(pool, fences);
+
+                if (pool == VK_NULL_HANDLE && fences.empty())
+                    return;
+
+                Logger::debug("DestroyCommandPool (depth copy ring buffer)");
+                for (VkFence f : fences)
+                {
+                    if (f != VK_NULL_HANDLE)
+                        logicalDevice->vkd.DestroyFence(device, f, nullptr);
+                }
+                if (pool != VK_NULL_HANDLE)
+                    logicalDevice->vkd.DestroyCommandPool(device, pool, pAllocator);
+            });
+
+            // Clean up Wayland input resources (no-op if not initialized)
+            cleanupWaylandKeyboard();
+            cleanupWaylandMouse();
+
+            // everything the layer retired, including the overlay's handles above
+            logicalDevice->retireQueue.drainAll();
+
+            savePipelineCache(*logicalDevice);
+            if (logicalDevice->pipelineCache != VK_NULL_HANDLE)
             {
-                ++swapIt;
+                logicalDevice->vkd.DestroyPipelineCache(device, logicalDevice->pipelineCache, pAllocator);
+                logicalDevice->pipelineCache = VK_NULL_HANDLE;
             }
-        }
 
-        // Destroy ImGui overlay before device (it uses device resources)
-        logicalDevice->imguiOverlay.reset();
-
-        // Destroy persistent depth storage
-        destroyPersistentDepthStorage(logicalDevice);
-
-        // Destroy depth copy ring buffer pool and its fences. The teardown takes
-        // the ring's own lock so it cannot race a QueueSubmit mid-copy; lock
-        // order here is globalLock -> depthCopy, as DepthCopyState documents.
-        logicalDevice->depthCopy.withRing([&](DepthCopyState::RingAccess& ring) {
-            VkCommandPool pool = VK_NULL_HANDLE;
-            std::vector<VkFence> fences;
-            ring.detach(pool, fences);
-
-            if (pool == VK_NULL_HANDLE && fences.empty())
-                return;
-
-            Logger::debug("DestroyCommandPool (depth copy ring buffer)");
-            // Destroy fences first (they're independent of the pool)
-            for (VkFence f : fences)
-            {
-                if (f != VK_NULL_HANDLE)
-                    logicalDevice->vkd.DestroyFence(device, f, nullptr);
-            }
-            if (pool != VK_NULL_HANDLE)
-                logicalDevice->vkd.DestroyCommandPool(device, pool, pAllocator);
+            logicalDevice->queues.destroy();
+            releaseDeviceControl(logicalDevice);
         });
 
-        // Clean up Wayland input resources (no-op if not initialized)
-        cleanupWaylandKeyboard();
-        cleanupWaylandMouse();
-
-        if (logicalDevice->commandPool != VK_NULL_HANDLE)
-        {
-            Logger::debug("DestroyCommandPool");
-            logicalDevice->vkd.DestroyCommandPool(device, logicalDevice->commandPool, pAllocator);
-        }
-
-        // second drain: imguiOverlay.reset() queues the overlay's handles just before
-        // the device dies, and there's no later flush to pick them up.
-        DeferredDestroyQueue::instance().flush();
-
-        if (logicalDevice->pipelineCache != VK_NULL_HANDLE)
-        {
-            logicalDevice->vkd.DestroyPipelineCache(device, logicalDevice->pipelineCache, pAllocator);
-            logicalDevice->pipelineCache = VK_NULL_HANDLE;
-        }
-
-        depthRetryStates.erase(logicalDevice);
-        forgetDeviceLoss(logicalDevice);
-        releaseDeviceControlLocked(logicalDevice);
-        deviceMap.erase(GetKey(device));
-        l.unlock();
+        unregisterDevice(GetKey(device));
 
         keepAlive->vkd.DestroyDevice(device, pAllocator);
     }

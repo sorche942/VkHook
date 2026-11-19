@@ -5,11 +5,15 @@
 #include <vector>
 #include <memory>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "vulkan_include.hh"
 #include "vkdispatch.hh"
 #include "depth_state.hh"
 #include "depth_copy_state.hh"
+#include "gpu/queue.hh"
+#include "gpu/retire.hh"
+#include "gpu/timeline.hh"
 #include <chrono>
 #include <mutex>
 
@@ -41,6 +45,14 @@ namespace VkHook
         VkImageUsageFlags     usage = 0;
         VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
         VkImageTiling         tiling = VK_IMAGE_TILING_OPTIMAL;
+    };
+
+    struct DepthRetryState
+    {
+        bool                                  disabled     = false;
+        bool                                  retryPending = false;
+        std::chrono::steady_clock::time_point retryAt{};
+        VkExtent2D                            blockedExtent{0, 0};
     };
 
     struct OverlayPersistentState;  // Forward declaration
@@ -77,7 +89,10 @@ namespace VkHook
         VkInstance               instance;
         VkQueue                  queue;
         uint32_t                 queueFamilyIndex;
-        VkCommandPool            commandPool;
+        // The layer's own graphics queue (family queueFamilyIndex). Submits go
+        // through `queues`, which holds the queue's mutex around every call.
+        // Effect command buffers are recorded for this family; a present on a
+        // queue of another family submits them here instead.
         // Shared driver pipeline cache. Rebuilt effects reuse compiled pipelines
         // instead of making the driver recompile them on every chain reload.
         VkPipelineCache          pipelineCache = VK_NULL_HANDLE;
@@ -87,11 +102,8 @@ namespace VkHook
         std::string dlss5UnavailableReason;
         VkQueue dlss5OpticalFlowQueue = VK_NULL_HANDLE;
         uint32_t dlss5OpticalFlowQueueFamily = VK_QUEUE_FAMILY_IGNORED;
-        // Lock before globalLock when both are needed. Application queue waits
-        // must never hold globalLock: their GPU waits can need another submitter.
-        std::mutex dlss5OpticalFlowQueueMutex;
         // Incremented even when effects/presents bypass; gaps invalidate history.
-        uint64_t presentSerial = 0;
+        std::atomic<uint64_t> presentSerial{0};
         bool                     supportsMutableFormat;
         bool                     isNvidiaGpu;
         // Real identity of the device the game is actually running on. The
@@ -102,6 +114,8 @@ namespace VkHook
         std::string              gpuPciSlot;  // "0000:01:00.0", empty if none
         uint32_t                 gpuApiVersion = 0;
         uint32_t                 gpuVendorId = 0;
+        // Physical device properties, filled at vkCreateDevice (pipeline cache key)
+        VkPhysicalDeviceProperties gpuProperties = {};
         bool                     gpuCrashDiagnosticsEnabled = false;
         bool                     supportsNvDiagnosticCheckpoints = false;
         bool                     supportsNvDiagnosticsConfig = false;
@@ -140,8 +154,9 @@ namespace VkHook
 
         // set on every swapchain create and on destroying the active depth
         // image/view; while set, getDepthState reports nothing and no copies
-        // are published until a scope from the new generation promotes
-        bool depthTransitionHold = false;
+        // are published until a scope from the new generation promotes.
+        // Atomic: the submit and present paths read it without stateLock.
+        std::atomic<bool> depthTransitionHold{false};
 
         // Persistent depth storage — layer-internal depth image that outlives
         // app depth image destruction. NOT stored in the parallel
@@ -186,6 +201,49 @@ namespace VkHook
         // Cleared only by DestroyDevice — the user must restart the game to
         // re-enable effects after a panic.
         std::atomic<bool> softDisabled{false};
+
+        // ---- layer runtime (gpu/*, layer/registry) ----
+
+        // Serials, queue mutexes and deferred destruction for this device.
+        Timeline    timeline;
+        QueueTable  queues;
+        RetireQueue retireQueue{timeline};
+
+        // Retire a layer-owned object the GPU may still read. Destroyed by
+        // RetireQueue::collect once its tagged serial completed.
+        template <typename Handle>
+        void retire(VkObjectType type, Handle handle, uint64_t extra = 0)
+        {
+            retireQueue.retire(type, handleToU64(handle), extra);
+        }
+
+        // The short per-device lock: guards `swapchains`, the depth tracking
+        // maps above, the retry state and the pending-reload flags. Held for a
+        // few map operations at a time. NEVER across a GPU wait, file I/O, a
+        // shader compile or a call into the next layer (AGENTS.md invariant 1).
+        std::mutex stateLock;
+        std::unordered_map<VkSwapchainKHR, std::shared_ptr<LogicalSwapchain>> swapchains;
+        // render pass -> depth attachment finalLayout, per device (handles are
+        // only unique within one)
+        std::unordered_map<VkRenderPass, VkImageLayout> renderPassDepthFinalLayouts;
+        DepthRetryState depthRetry;
+
+        // What the device was created with (after the device plan): vkGetDeviceProcAddr
+        // returns null for commands whose extension was not enabled. Set once at
+        // vkCreateDevice, read-only afterwards.
+        std::unordered_set<std::string> enabledExtensions;
+        uint32_t                        deviceApiVersion = 0;  // min(instance API the app asked for, physical device)
+
+        // command pool -> the buffers allocated from it, so a pool reset or
+        // destroy drops the per-command-buffer depth state (stateLock)
+        std::unordered_map<VkCommandPool, std::vector<VkCommandBuffer>> commandPoolBuffers;
+
+        // Present threads of one device run the control step one at a time:
+        // the loser skips it (it does file I/O, so it cannot wait on a mutex).
+        std::atomic<bool> frontendBusy{false};
+
+        // set by panicLayer() when the driver reported VK_ERROR_DEVICE_LOST
+        std::atomic<bool> deviceLost{false};
     };
 } // namespace VkHook
 

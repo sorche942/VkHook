@@ -4,7 +4,7 @@
 #include "image.hh"
 #include "logger.hh"
 #include "util.hh"
-#include "vk_handle.hh"
+#include "logical_device.hh"
 
 #include <stdexcept>
 
@@ -58,9 +58,17 @@ namespace VkHook
             && mipLevels == other.mipLevels && viewType == other.viewType;
     }
 
-    ReshadeTexture::ReshadeTexture(LogicalDevice* logicalDevice, const ReshadeTextureDesc& description)
-        : desc(description), device(logicalDevice->device), destroyImage(logicalDevice->vkd.DestroyImage),
-          destroyImageView(logicalDevice->vkd.DestroyImageView), freeMemory(logicalDevice->vkd.FreeMemory)
+    namespace
+    {
+        void retireOnDevice(void* ctx, VkObjectType type, uint64_t handle, uint64_t extra)
+        {
+            static_cast<LogicalDevice*>(ctx)->retire(type, handle, extra);
+        }
+    }
+
+    ReshadeTexture::ReshadeTexture(LogicalDevice* logicalDevice, const ReshadeTextureDesc& description,
+                                   ReshadeRetireHook hook)
+        : desc(description), retireHook(hook.fn ? hook : ReshadeRetireHook{retireOnDevice, logicalDevice})
     {
         try
         {
@@ -102,14 +110,11 @@ namespace VkHook
 
     void ReshadeTexture::deferRelease()
     {
-        auto& queue = DeferredDestroyQueue::instance();
+        // Types and the dependents-first order are the retire queue's concern:
+        // views are destroyed before their image, memory last.
         if (image != VK_NULL_HANDLE)
-            queue.push(DestroyPhase::Resource, [device = device, release = destroyImage, image = image] {
-                release(device, image, nullptr);
-            });
+            retireHook.fn(retireHook.ctx, VK_OBJECT_TYPE_IMAGE, handleToU64(image), 0);
 
-        // Reverse registration within Resource releases all distinct views
-        // before their image, without a heap-allocated deduplication container.
         const VkImageView views[] = {unormView, srgbView, unormRenderView, srgbRenderView};
         for (size_t i = 0; i < 4; ++i)
         {
@@ -119,14 +124,10 @@ namespace VkHook
             for (size_t j = 0; j < i; ++j)
                 duplicate |= views[j] == views[i];
             if (!duplicate)
-                queue.push(DestroyPhase::Resource, [device = device, release = destroyImageView, view = views[i]] {
-                    release(device, view, nullptr);
-                });
+                retireHook.fn(retireHook.ctx, VK_OBJECT_TYPE_IMAGE_VIEW, handleToU64(views[i]), 0);
         }
         if (memory != VK_NULL_HANDLE)
-            queue.push(DestroyPhase::Memory, [device = device, release = freeMemory, memory = memory] {
-                release(device, memory, nullptr);
-            });
+            retireHook.fn(retireHook.ctx, VK_OBJECT_TYPE_DEVICE_MEMORY, handleToU64(memory), 0);
     }
 
     uint32_t ReshadeTexturePool::beginEffect(const std::string& effectFile)
@@ -150,7 +151,7 @@ namespace VkHook
             return found->second;
         }
 
-        auto texture = std::make_shared<ReshadeTexture>(logicalDevice, desc);
+        auto texture = std::make_shared<ReshadeTexture>(logicalDevice, desc, retireHook);
         textures.emplace(key, texture);
         Logger::debug("[reshade-texture-pool] create name=" + key + " image=" + convertToString(texture->image));
         return texture;

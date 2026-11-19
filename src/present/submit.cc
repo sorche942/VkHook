@@ -1,16 +1,17 @@
 #include "layer/entry.hh"
-#include "layer/state.hh"
+#include "layer/registry.hh"
+#include "layer/guard.hh"
 
 #include "control/frontend.hh"
 #include "depth/tracker.hh"
 #include "diag/gpu_crash.hh"
 
 #include "command_buffer.hh"
-#include "vk_handle.hh"
 #include "format.hh"
 #include "settings_manager.hh"
 #include "logger.hh"
 
+#include <algorithm>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -19,34 +20,47 @@ namespace VkHook
 {
 namespace
 {
+    // What the application's own vkQueueSubmit already did, so an exception in
+    // the layer's bookkeeping after it never submits the batch twice.
+    struct AppSubmit
+    {
+        bool     forwarded = false;
+        VkResult result    = VK_SUCCESS;
+    };
+
+    VkResult forwardSubmit(LogicalDevice* logicalDevice, AppSubmit& app, VkQueue queue, uint32_t submitCount,
+                           const VkSubmitInfo* pSubmits, VkFence fence, const char* context)
+    {
+        app.result    = logicalDevice->queues.submit(queue, submitCount, pSubmits, fence);
+        app.forwarded = true;
+        reportDeviceLostDiagnostics(logicalDevice, queue, context, app.result);
+        if (app.result == VK_ERROR_DEVICE_LOST)
+            panicLayer(logicalDevice, "Vulkan device lost during QueueSubmit passthrough");
+        return app.result;
+    }
+
     // --- v3 Deferred Depth Copy: QueueSubmit interception ---
     // When depthCaptureMethod == 1 or 2, we intercept QueueSubmit to inject a
     // depth copy command buffer into the last submit. The copy is recorded
-    // into a ring-buffered CB from a dedicated transient pool, using the
-    // correct source layout obtained from the render pass's depth attachment
-    // finalLayout at CmdBeginRenderPass time.
+    // into a ring-buffered CB from a dedicated pool, using the correct source
+    // layout obtained from the render pass's depth attachment finalLayout at
+    // CmdBeginRenderPass time.
     //
     // The pending copy and the ring live in DepthCopyState and are guarded by
-    // its own mutex, not globalLock: panicLayer() below flushes the deferred
-    // destroy queue, which must never happen with globalLock held. The lock
-    // order is globalLock -> depthCopy, so nothing in withRing() touches
-    // globalLock-backed state; storage is prepared before and published after.
-    VKAPI_ATTR VkResult VKAPI_CALL VkHook_QueueSubmit(VkQueue queue,
-                                                       uint32_t submitCount,
-                                                       const VkSubmitInfo* pSubmits,
-                                                       VkFence fence)
+    // its own mutex. Lock order: stateLock -> depthCopy, so nothing in
+    // withRing() touches stateLock-backed state; storage is prepared before and
+    // published after. The queue mutex is only ever taken inside
+    // device->queues, around one driver call.
+    VkResult queueSubmitImpl(LogicalDevice* logicalDevice, AppSubmit& app, VkQueue queue, uint32_t submitCount,
+                             const VkSubmitInfo* pSubmits, VkFence fence)
     {
-        // the device stays alive for the whole call; the lock is not held
-        auto deviceRef = findDevice(GetKey(queue));
-        LogicalDevice* logicalDevice = deviceRef.get();
-        if (logicalDevice && queue == logicalDevice->dlss5OpticalFlowQueue)
+        if (queue == logicalDevice->dlss5OpticalFlowQueue)
         {
             // Optical submissions are not graphics/depth producers.
-            std::lock_guard queueLock(logicalDevice->dlss5OpticalFlowQueueMutex);
-            return logicalDevice->vkd.QueueSubmit(queue, submitCount, pSubmits, fence);
+            return forwardSubmit(logicalDevice, app, queue, submitCount, pSubmits, fence, "vkQueueSubmit(optical flow)");
         }
 
-        if (logicalDevice && submitCount > 0 && pSubmits)
+        if (submitCount > 0 && pSubmits)
         {
             // journal the app's batch so a stuck queue can be traced past it
             VkSemaphore appWait = VK_NULL_HANDLE;
@@ -59,25 +73,14 @@ namespace
             recordSubmittedBatch(logicalDevice, "app", UINT32_MAX, appWait, appSignal, fence);
         }
 
-        const int method = settingsManager.getDepthCaptureMethod();
-        if (!logicalDevice || method < 1 || method > 2
+        const auto settings = settingsManager.snapshot();
+        const int  method   = std::clamp(settings->depthCaptureMethod, 0, 2);
+        if (method < 1 || method > 2
             || !depthCaptureActive()
-            || logicalDevice->depthTransitionHold
+            || logicalDevice->depthTransitionHold.load(std::memory_order_acquire)
             || logicalDevice->softDisabled.load(std::memory_order_acquire)
             || submitCount == 0 || !pSubmits)
-        {
-            if (logicalDevice)
-            {
-                VkResult passthroughResult = logicalDevice->vkd.QueueSubmit(queue, submitCount, pSubmits, fence);
-                reportDeviceLostDiagnostics(logicalDevice, queue, "vkQueueSubmit(passthrough)", passthroughResult);
-                if (passthroughResult == VK_ERROR_DEVICE_LOST)
-                    panicLayer(logicalDevice, "Vulkan device lost during QueueSubmit passthrough");
-                return passthroughResult;
-            }
-            // The queue belongs to no device this layer created, so there is no
-            // dispatch table to forward through (see failUnknownObject).
-            return failUnknownObject("vkQueueSubmit", VK_ERROR_DEVICE_LOST);
-        }
+            return forwardSubmit(logicalDevice, app, queue, submitCount, pSubmits, fence, "vkQueueSubmit(passthrough)");
 
         // Claim the pending copy. Clearing the flag is unconditional and happens
         // under the depth-copy lock, so a copy can be published mid-read without
@@ -85,32 +88,20 @@ namespace
         DepthState captureDepth;
         VkImageLayout sourceLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         if (!logicalDevice->depthCopy.consume(captureDepth, sourceLayout))
-        {
-            VkResult passthroughResult = logicalDevice->vkd.QueueSubmit(queue, submitCount, pSubmits, fence);
-            reportDeviceLostDiagnostics(logicalDevice, queue, "vkQueueSubmit(passthrough)", passthroughResult);
-            if (passthroughResult == VK_ERROR_DEVICE_LOST)
-                panicLayer(logicalDevice, "Vulkan device lost during QueueSubmit passthrough");
-            return passthroughResult;
-        }
+            return forwardSubmit(logicalDevice, app, queue, submitCount, pSubmits, fence, "vkQueueSubmit(passthrough)");
 
-        // Validate the tracked maps under globalLock, but drop it before any
-        // panic: panicLayer() -> flush() is not allowed under globalLock.
         bool depthValid = false;
         {
-            scoped_lock l(globalLock);
+            std::lock_guard<std::mutex> l(logicalDevice->stateLock);
             depthValid = hasDepthState(captureDepth) && validateDepthStateForResolve(logicalDevice, captureDepth);
         }
         if (!depthValid)
         {
             Logger::debug("QueueSubmit v3: skipping invalid/stale depth state");
-            VkResult passthroughResult = logicalDevice->vkd.QueueSubmit(queue, submitCount, pSubmits, fence);
-            reportDeviceLostDiagnostics(logicalDevice, queue, "vkQueueSubmit(passthrough-invalid-depth)", passthroughResult);
-            if (passthroughResult == VK_ERROR_DEVICE_LOST)
-                panicLayer(logicalDevice, "Vulkan device lost during invalid-depth passthrough");
-            return passthroughResult;
+            return forwardSubmit(logicalDevice, app, queue, submitCount, pSubmits, fence, "vkQueueSubmit(passthrough-invalid-depth)");
         }
 
-        // Prepare the storage under globalLock and snapshot what the recording
+        // Prepare the storage under stateLock and snapshot what the recording
         // needs into locals, so the ring section below holds only depthCopy.
         const VkFormat storageFormat = (sourceLayout == VK_IMAGE_LAYOUT_GENERAL)
             ? VK_FORMAT_R32_SFLOAT
@@ -120,7 +111,7 @@ namespace
         VkImageView storageImageView = VK_NULL_HANDLE;
         bool storageWasValid = false;
         {
-            scoped_lock l(globalLock);
+            std::lock_guard<std::mutex> l(logicalDevice->stateLock);
             ensurePersistentDepthStorage(logicalDevice, storageFormat, captureDepth.extent);
             const auto& storage = logicalDevice->depthCaptureStorage;
             storageImage = storage.image;
@@ -129,18 +120,13 @@ namespace
         }
 
         if (storageImage == VK_NULL_HANDLE)
-        {
-            VkResult passthroughResult = logicalDevice->vkd.QueueSubmit(queue, submitCount, pSubmits, fence);
-            reportDeviceLostDiagnostics(logicalDevice, queue, "vkQueueSubmit(passthrough-no-depth-storage)", passthroughResult);
-            if (passthroughResult == VK_ERROR_DEVICE_LOST)
-                panicLayer(logicalDevice, "Vulkan device lost during no-depth-storage passthrough");
-            return passthroughResult;
-        }
+            return forwardSubmit(logicalDevice, app, queue, submitCount, pSubmits, fence, "vkQueueSubmit(passthrough-no-depth-storage)");
 
         // --- ring section: init, reserve, fence, record, submit ---
         bool ringBusy = false;            // slot in flight or ring unavailable: skip the copy
         VkResult slotFenceError = VK_SUCCESS;
         VkResult submitResult = VK_SUCCESS;
+        VkResult appSubmitResult = VK_SUCCESS;
 
         logicalDevice->depthCopy.withRing([&](DepthCopyState::RingAccess& ring) {
             if (!ring.ready())
@@ -345,25 +331,20 @@ namespace
             // app submits go through untouched, fence included. the copy rides
             // its own submit so an app-side fence wait can never be starved,
             // and its barriers still order it after the frame's depth writes.
-            submitResult = logicalDevice->vkd.QueueSubmit(queue, submitCount, pSubmits, fence);
+            submitResult = logicalDevice->queues.submit(queue, submitCount, pSubmits, fence);
+            appSubmitResult = submitResult;
             if (submitResult == VK_SUCCESS)
             {
                 VkSubmitInfo copySubmitInfo = {};
                 copySubmitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
                 copySubmitInfo.commandBufferCount = 1;
                 copySubmitInfo.pCommandBuffers = &copyCB;
-                submitResult = logicalDevice->vkd.QueueSubmit(queue, 1, &copySubmitInfo, slotFence);
+                submitResult = logicalDevice->queues.submitProbed(queue, 1, &copySubmitInfo, slotFence);
             }
         });
 
         if (ringBusy)
-        {
-            VkResult passthroughResult = logicalDevice->vkd.QueueSubmit(queue, submitCount, pSubmits, fence);
-            reportDeviceLostDiagnostics(logicalDevice, queue, "vkQueueSubmit(passthrough-ring-busy)", passthroughResult);
-            if (passthroughResult == VK_ERROR_DEVICE_LOST)
-                panicLayer(logicalDevice, "Vulkan device lost during QueueSubmit passthrough");
-            return passthroughResult;
-        }
+            return forwardSubmit(logicalDevice, app, queue, submitCount, pSubmits, fence, "vkQueueSubmit(passthrough-ring-busy)");
 
         if (slotFenceError != VK_SUCCESS)
         {
@@ -374,12 +355,12 @@ namespace
                 return slotFenceError;
             }
             Logger::warn("QueueSubmit v3: depth copy ring fence status failed (" + std::to_string(slotFenceError) + ")");
-            VkResult passthroughResult = logicalDevice->vkd.QueueSubmit(queue, submitCount, pSubmits, fence);
-            reportDeviceLostDiagnostics(logicalDevice, queue, "vkQueueSubmit(passthrough-ring-status)", passthroughResult);
-            if (passthroughResult == VK_ERROR_DEVICE_LOST)
-                panicLayer(logicalDevice, "Vulkan device lost during QueueSubmit passthrough");
-            return passthroughResult;
+            return forwardSubmit(logicalDevice, app, queue, submitCount, pSubmits, fence, "vkQueueSubmit(passthrough-ring-status)");
         }
+
+        // the app's batch went out inside the ring section
+        app.forwarded = true;
+        app.result    = appSubmitResult;
 
         // The copy went out; publish the storage as the deepest state and let the
         // barrier in the next copy treat its contents as valid. If the submit
@@ -387,7 +368,7 @@ namespace
         // UNDEFINED rather than assuming contents that never landed.
         if (submitResult == VK_SUCCESS)
         {
-            scoped_lock l(globalLock);
+            std::lock_guard<std::mutex> l(logicalDevice->stateLock);
             logicalDevice->depthCaptureStorage.valid = true;
             DepthState storageState = captureDepth;
             storageState.image = storageImage;
@@ -407,51 +388,140 @@ namespace
         return submitResult;
     }
 
-    // These calls also touch VkQueue host state. In particular, waiting while
-    // holding globalLock would block another thread from submitting its signals.
-#define OPTICAL_QUEUE_CALL(Result, Name, Parameters, Arguments, Failure) \
-    VKAPI_ATTR Result VKAPI_CALL VkHook_##Name Parameters { \
-        auto device = findDevice(GetKey(queue)); \
-        if (!device) { failUnknownObject(#Name, VK_ERROR_DEVICE_LOST); return Failure; } \
-        std::unique_lock lock(device->dlss5OpticalFlowQueueMutex, std::defer_lock); \
-        if (queue == device->dlss5OpticalFlowQueue) lock.lock(); \
-        return device->vkd.Name Arguments; \
+    // The ring section's results. When the app's own batch succeeded but the
+    // copy submit failed, the app still gets its batch's result.
+    VKAPI_ATTR VkResult VKAPI_CALL VkHook_QueueSubmit(VkQueue queue, uint32_t submitCount, const VkSubmitInfo* pSubmits,
+                                                       VkFence fence)
+    {
+        // the device stays alive for the whole call; no lock is held
+        auto deviceRef = findDevice(GetKey(queue));
+        if (!deviceRef)
+            return failUnknownObject("vkQueueSubmit", VK_ERROR_DEVICE_LOST);
+        LogicalDevice* logicalDevice = deviceRef.get();
+
+        AppSubmit app;
+        try
+        {
+            return queueSubmitImpl(logicalDevice, app, queue, submitCount, pSubmits, fence);
+        }
+        catch (const std::exception& e)
+        {
+            reportHookException(logicalDevice, "vkQueueSubmit", e.what());
+        }
+        catch (...)
+        {
+            reportHookException(logicalDevice, "vkQueueSubmit", nullptr);
+        }
+        // the layer failed; the application's batch still has to run, exactly once
+        if (app.forwarded)
+            return app.result;
+        return logicalDevice->queues.submit(queue, submitCount, pSubmits, fence);
     }
-    OPTICAL_QUEUE_CALL(VkResult, QueueSubmit2,
-        (VkQueue queue, uint32_t count, const VkSubmitInfo2* infos, VkFence fence),
-        (queue, count, infos, fence), VK_ERROR_DEVICE_LOST)
-    OPTICAL_QUEUE_CALL(VkResult, QueueSubmit2KHR,
-        (VkQueue queue, uint32_t count, const VkSubmitInfo2* infos, VkFence fence),
-        (queue, count, infos, fence), VK_ERROR_DEVICE_LOST)
-    OPTICAL_QUEUE_CALL(VkResult, QueueBindSparse,
-        (VkQueue queue, uint32_t count, const VkBindSparseInfo* infos, VkFence fence),
-        (queue, count, infos, fence), VK_ERROR_DEVICE_LOST)
-    OPTICAL_QUEUE_CALL(VkResult, QueueWaitIdle, (VkQueue queue), (queue), VK_ERROR_DEVICE_LOST)
-    OPTICAL_QUEUE_CALL(void, QueueBeginDebugUtilsLabelEXT,
-        (VkQueue queue, const VkDebugUtilsLabelEXT* label), (queue, label), )
-    OPTICAL_QUEUE_CALL(void, QueueInsertDebugUtilsLabelEXT,
-        (VkQueue queue, const VkDebugUtilsLabelEXT* label), (queue, label), )
-    OPTICAL_QUEUE_CALL(void, QueueEndDebugUtilsLabelEXT, (VkQueue queue), (queue), )
-#undef OPTICAL_QUEUE_CALL
+
+    ///////////////////////////////////////////////////////////////////////////////////////////
+    // The remaining queue entry points. Each holds the queue's mutex around the
+    // one driver call (QueueTable); none holds a layer lock.
+
+    template <typename Fn>
+    VkResult withQueueDevice(VkQueue queue, const char* name, Fn&& fn)
+    {
+        auto device = findDevice(GetKey(queue));
+        if (!device)
+            return failUnknownObject(name, VK_ERROR_DEVICE_LOST);
+        return fn(*device);
+    }
+
+    VKAPI_ATTR VkResult VKAPI_CALL VkHook_QueueSubmit2(VkQueue queue, uint32_t count, const VkSubmitInfo2* infos, VkFence fence)
+    {
+        return withQueueDevice(queue, "vkQueueSubmit2", [&](LogicalDevice& d) { return d.queues.submit2(queue, count, infos, fence, false); });
+    }
+
+    VKAPI_ATTR VkResult VKAPI_CALL VkHook_QueueSubmit2KHR(VkQueue queue, uint32_t count, const VkSubmitInfo2* infos, VkFence fence)
+    {
+        return withQueueDevice(queue, "vkQueueSubmit2KHR", [&](LogicalDevice& d) { return d.queues.submit2(queue, count, infos, fence, true); });
+    }
+
+    VKAPI_ATTR VkResult VKAPI_CALL VkHook_QueueBindSparse(VkQueue queue, uint32_t count, const VkBindSparseInfo* infos, VkFence fence)
+    {
+        return withQueueDevice(queue, "vkQueueBindSparse", [&](LogicalDevice& d) { return d.queues.bindSparse(queue, count, infos, fence); });
+    }
+
+    // vkQueueWaitIdle: an empty fenced submit under the queue mutex, then the
+    // wait with nothing held (the real call would wait under the mutex).
+    VKAPI_ATTR VkResult VKAPI_CALL VkHook_QueueWaitIdle(VkQueue queue)
+    {
+        return withQueueDevice(queue, "vkQueueWaitIdle", [&](LogicalDevice& d) { return d.queues.waitIdle(queue); });
+    }
 
     VKAPI_ATTR VkResult VKAPI_CALL VkHook_DeviceWaitIdle(VkDevice handle)
     {
         auto device = findDevice(GetKey(handle));
-        if (!device) return failUnknownObject("vkDeviceWaitIdle", VK_ERROR_DEVICE_LOST);
-        std::unique_lock lock(device->dlss5OpticalFlowQueueMutex, std::defer_lock);
-        if (device->dlss5OpticalFlowQueue) lock.lock();
-        return device->vkd.DeviceWaitIdle(handle);
+        if (!device)
+            return failUnknownObject("vkDeviceWaitIdle", VK_ERROR_DEVICE_LOST);
+        return device->queues.deviceWaitIdle();
+    }
+
+    VKAPI_ATTR void VKAPI_CALL VkHook_QueueBeginDebugUtilsLabelEXT(VkQueue queue, const VkDebugUtilsLabelEXT* label)
+    {
+        if (auto device = findDevice(GetKey(queue)))
+            device->queues.beginLabel(queue, label);
+        else
+            failUnknownObject("vkQueueBeginDebugUtilsLabelEXT", VK_ERROR_DEVICE_LOST);
+    }
+
+    VKAPI_ATTR void VKAPI_CALL VkHook_QueueEndDebugUtilsLabelEXT(VkQueue queue)
+    {
+        if (auto device = findDevice(GetKey(queue)))
+            device->queues.endLabel(queue);
+        else
+            failUnknownObject("vkQueueEndDebugUtilsLabelEXT", VK_ERROR_DEVICE_LOST);
+    }
+
+    VKAPI_ATTR void VKAPI_CALL VkHook_QueueInsertDebugUtilsLabelEXT(VkQueue queue, const VkDebugUtilsLabelEXT* label)
+    {
+        if (auto device = findDevice(GetKey(queue)))
+            device->queues.insertLabel(queue, label);
+        else
+            failUnknownObject("vkQueueInsertDebugUtilsLabelEXT", VK_ERROR_DEVICE_LOST);
+    }
+
+    // The layer learns a queue's family from the application's own lookups.
+    VKAPI_ATTR void VKAPI_CALL VkHook_GetDeviceQueue(VkDevice device, uint32_t queueFamilyIndex, uint32_t queueIndex, VkQueue* pQueue)
+    {
+        auto deviceRef = findDevice(GetKey(device));
+        if (!deviceRef)
+        {
+            failUnknownObject("vkGetDeviceQueue", VK_ERROR_DEVICE_LOST);
+            return;
+        }
+        deviceRef->vkd.GetDeviceQueue(device, queueFamilyIndex, queueIndex, pQueue);
+        if (pQueue && *pQueue)
+            deviceRef->queues.add(*pQueue, queueFamilyIndex, queueIndex);
+    }
+
+    VKAPI_ATTR void VKAPI_CALL VkHook_GetDeviceQueue2(VkDevice device, const VkDeviceQueueInfo2* pQueueInfo, VkQueue* pQueue)
+    {
+        auto deviceRef = findDevice(GetKey(device));
+        if (!deviceRef)
+        {
+            failUnknownObject("vkGetDeviceQueue2", VK_ERROR_DEVICE_LOST);
+            return;
+        }
+        deviceRef->vkd.GetDeviceQueue2(device, pQueueInfo, pQueue);
+        if (pQueueInfo && pQueue && *pQueue)
+            deviceRef->queues.add(*pQueue, pQueueInfo->queueFamilyIndex, pQueueInfo->queueIndex);
     }
 
     const InterceptEntry kSubmitIntercepts[] = {
         VKHOOK_INTERCEPT(Unconditional, QueueSubmit),
-        // queue-level calls that must hold the optical-flow queue lock when they
-        // address that queue; only exposed when the next layer implements them
-        VKHOOK_INTERCEPT(Downstream, QueueSubmit2),
-        VKHOOK_INTERCEPT(Downstream, QueueSubmit2KHR),
+        VKHOOK_INTERCEPT(Unconditional, GetDeviceQueue),
+        VKHOOK_INTERCEPT_EXT(Downstream, GetDeviceQueue2, nullptr, VK_API_VERSION_1_1),
+        VKHOOK_INTERCEPT_EXT(Downstream, QueueSubmit2, nullptr, VK_API_VERSION_1_3),
+        VKHOOK_INTERCEPT_EXT(Downstream, QueueSubmit2KHR, VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME, 0),
         VKHOOK_INTERCEPT(Downstream, QueueBindSparse),
         VKHOOK_INTERCEPT(Downstream, QueueWaitIdle),
         VKHOOK_INTERCEPT(Downstream, DeviceWaitIdle),
+        // instance-level extension, device-dispatched: the next layer decides
         VKHOOK_INTERCEPT(Downstream, QueueBeginDebugUtilsLabelEXT),
         VKHOOK_INTERCEPT(Downstream, QueueEndDebugUtilsLabelEXT),
         VKHOOK_INTERCEPT(Downstream, QueueInsertDebugUtilsLabelEXT),

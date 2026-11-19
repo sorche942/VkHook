@@ -1,5 +1,5 @@
 #include "layer/entry.hh"
-#include "layer/state.hh"
+#include "layer/registry.hh"
 
 #include "control/frontend.hh"
 #include "logger.hh"
@@ -108,11 +108,18 @@ namespace
         return reinterpret_cast<PFN_vkGetDeviceProcAddr>(dlsym(RTLD_NEXT, "vkGetDeviceProcAddr"));
     }
 
+    bool commandAvailable(const InterceptEntry& entry, const LogicalDevice& device)
+    {
+        if (entry.coreVersion && device.deviceApiVersion >= entry.coreVersion)
+            return true;
+        return entry.extension && device.enabledExtensions.count(entry.extension) != 0;
+    }
+
     // Looks `name` up in one module table. Returns true when the name is ours
     // (`fn` is null for a Downstream entry the next layer does not provide) and
     // false when the table has no such name or the entry is gated off.
     template <typename DownstreamResolvable>
-    bool lookup(const InterceptTable& table, const char* name, bool depthCapture,
+    bool lookup(const InterceptTable& table, const char* name, bool depthCapture, const LogicalDevice* device,
                 DownstreamResolvable&& downstreamHas, PFN_vkVoidFunction& fn)
     {
         for (size_t i = 0; i < table.count; ++i)
@@ -120,6 +127,13 @@ namespace
             const InterceptEntry& entry = table.entries[i];
             if (std::strcmp(name, entry.name) != 0)
                 continue;
+            // A device command exists only if the device enabled its extension or
+            // its API version promoted it; otherwise the answer is null.
+            if (device && (entry.extension || entry.coreVersion) && !commandAvailable(entry, *device))
+            {
+                fn = nullptr;
+                return true;
+            }
             switch (entry.gate)
             {
             case InterceptGate::Unconditional:
@@ -144,7 +158,8 @@ namespace
     // one table: some games resolve device entry points through the instance
     // loader and the other way round.
     template <typename DownstreamResolvable>
-    bool interceptLookup(const char* name, DownstreamResolvable&& downstreamHas, PFN_vkVoidFunction& fn)
+    bool interceptLookup(const char* name, const LogicalDevice* device, DownstreamResolvable&& downstreamHas,
+                         PFN_vkVoidFunction& fn)
     {
         const bool depthCapture = depthCaptureActive();
         const InterceptTable tables[] = {
@@ -157,7 +172,7 @@ namespace
             depthInterceptTable(),
         };
         for (const InterceptTable& table : tables)
-            if (lookup(table, name, depthCapture, downstreamHas, fn))
+            if (lookup(table, name, depthCapture, device, downstreamHas, fn))
                 return true;
         return false;
     }
@@ -180,13 +195,14 @@ extern "C"
         if (!std::strcmp(pName, "vkGetDeviceProcAddr"))
             return reinterpret_cast<PFN_vkVoidFunction>(&VkHook_GetDeviceProcAddr);
 
-        // The downstream resolver is copied out under the lock and called after
-        // it is released.
+        // The downstream resolver is copied out of the registry entry and called
+        // after; no lock is involved.
         PFN_vkGetDeviceProcAddr downstream = nullptr;
         bool                    known      = false;
+        std::shared_ptr<VkHook::LogicalDevice> dev;
         if (device != VK_NULL_HANDLE)
         {
-            auto dev = VkHook::findDevice(VkHook::GetKey(device));
+            dev = VkHook::findDevice(VkHook::GetKey(device));
             if (dev && dev->vkd.GetDeviceProcAddr)
             {
                 known      = true;
@@ -197,7 +213,7 @@ extern "C"
         PFN_vkVoidFunction fn = nullptr;
         // Preserve null for unsupported/disabled extension entry points.
         auto downstreamHas = [&] { return known && downstream(device, pName) != nullptr; };
-        if (VkHook::interceptLookup(pName, downstreamHas, fn))
+        if (VkHook::interceptLookup(pName, dev.get(), downstreamHas, fn))
             return fn;
 
         if (known)
@@ -226,7 +242,7 @@ extern "C"
 
         PFN_vkVoidFunction fn = nullptr;
         auto downstreamHas = [&] { return downstream != nullptr && downstream(instance, pName) != nullptr; };
-        if (VkHook::interceptLookup(pName, downstreamHas, fn))
+        if (VkHook::interceptLookup(pName, nullptr, downstreamHas, fn))
             return fn;
 
         if (downstream)

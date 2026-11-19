@@ -10,6 +10,19 @@
 
 namespace VkHook
 {
+    // `descriptorsMayBeInUse`: the descriptor sets of this generation may be
+    // referenced by a submission still in flight (recording into an
+    // application command buffer against a live generation), so the shader
+    // path polls the image's fence (never waits) before rewriting them. Layer
+    // buffers built into an unpublished generation pass false.
+    static void recordDepthResolveSnapshotImpl(LogicalDevice*    logicalDevice,
+                                               LogicalSwapchain* logicalSwapchain,
+                                               VkCommandBuffer   commandBuffer,
+                                               uint32_t          imageIndex,
+                                               const DepthState& depthState,
+                                               bool              descriptorsMayBeInUse,
+                                               bool              callerHoldsStateLock);
+
     static bool hasDepthResolveResources(const LogicalSwapchain* logicalSwapchain, size_t commandBufferCount)
     {
         return logicalSwapchain != nullptr
@@ -87,44 +100,86 @@ namespace VkHook
             : getInternalDepthReadOnlyLayout(logicalSwapchain->depthResolveFormat);
     }
 
-    static VkImageView getOrCreateTrackedDepthSampleView(LogicalDevice* logicalDevice, const DepthState& depthState)
+    // Looks the sample view up in the device's tracking maps (stateLock held).
+    // Never creates it: `needsCreate` is set when the tracked slot is empty and
+    // the caller must create the view with no lock held and publish it with
+    // createAndPublishTrackedDepthSampleView. `view` is the app view as the fallback.
+    struct SampleViewLookup
     {
-        if (!logicalDevice || !hasDepthState(depthState))
-            return VK_NULL_HANDLE;
+        VkImageView view        = VK_NULL_HANDLE;
+        bool        needsCreate = false;
+    };
+
+    static SampleViewLookup lookupTrackedDepthSampleViewLocked(LogicalDevice* logicalDevice, const DepthState& depthState)
+    {
+        SampleViewLookup out;
+        out.view = depthState.imageView;
 
         auto it = logicalDevice->depthViewStates.find(depthState.imageView);
         if (it != logicalDevice->depthViewStates.end() && it->second.imageView != VK_NULL_HANDLE)
-            return it->second.imageView;
+        {
+            out.view = it->second.imageView;
+            return out;
+        }
 
-        // Check if this is the persistent storage image — if so, we can't use
-        // the parallel-indexed depthImages/depthFormats/depthImageViews vectors
-        // (those are for app images only). Return the view directly.
+        // The persistent storage image is not in the parallel-indexed
+        // depthImages/depthFormats/depthImageViews vectors (app images only).
         if (depthState.image == logicalDevice->depthCaptureStorage.image
             && logicalDevice->persistentStorageTracked)
-        {
-            return depthState.imageView;
-        }
+            return out;
 
         auto imageIt = std::find(logicalDevice->depthImages.begin(), logicalDevice->depthImages.end(), depthState.image);
         if (imageIt == logicalDevice->depthImages.end())
-            return depthState.imageView;
+            return out;
 
         const size_t index = std::distance(logicalDevice->depthImages.begin(), imageIt);
-        // Bounds-check: the parallel vectors must have the same length.
         if (index >= logicalDevice->depthFormats.size() || index >= logicalDevice->depthImageViews.size())
         {
-            Logger::warn("getOrCreateTrackedDepthSampleView: index " + std::to_string(index)
+            Logger::warn("lookupTrackedDepthSampleView: index " + std::to_string(index)
                          + " out of range (depthFormats=" + std::to_string(logicalDevice->depthFormats.size())
                          + " depthImageViews=" + std::to_string(logicalDevice->depthImageViews.size())
                          + "); returning app view");
-            return depthState.imageView;
+            return out;
         }
 
-        VkImageView& trackedView = logicalDevice->depthImageViews[index];
-        if (trackedView == VK_NULL_HANDLE)
-            trackedView = createSingleImageView(logicalDevice, depthState.format, depthState.image, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_DEPTH_BIT);
+        const VkImageView tracked = logicalDevice->depthImageViews[index];
+        if (tracked != VK_NULL_HANDLE)
+            out.view = tracked;
+        else
+            out.needsCreate = true;
+        return out;
+    }
 
-        return trackedView != VK_NULL_HANDLE ? trackedView : depthState.imageView;
+    // Creates the missing tracked sample view with no lock held (a driver call)
+    // and publishes it under stateLock; a concurrent creator's view wins and
+    // ours, never used by the GPU, is destroyed.
+    static VkImageView createAndPublishTrackedDepthSampleView(LogicalDevice* logicalDevice,
+                                                              const DepthState& depthState,
+                                                              bool callerHoldsStateLock)
+    {
+        const VkImageView created = createSingleImageView(
+            logicalDevice, depthState.format, depthState.image, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_DEPTH_BIT);
+        if (created == VK_NULL_HANDLE)
+            return depthState.imageView;
+
+        std::unique_lock<std::mutex> lock(logicalDevice->stateLock, std::defer_lock);
+        if (!callerHoldsStateLock)
+            lock.lock();
+        auto imageIt = std::find(logicalDevice->depthImages.begin(), logicalDevice->depthImages.end(), depthState.image);
+        const size_t index = std::distance(logicalDevice->depthImages.begin(), imageIt);
+        if (imageIt == logicalDevice->depthImages.end() || index >= logicalDevice->depthImageViews.size())
+        {
+            logicalDevice->vkd.DestroyImageView(logicalDevice->device, created, nullptr);
+            return depthState.imageView;
+        }
+        VkImageView& slot = logicalDevice->depthImageViews[index];
+        if (slot == VK_NULL_HANDLE)
+        {
+            slot = created;
+            return created;
+        }
+        logicalDevice->vkd.DestroyImageView(logicalDevice->device, created, nullptr);
+        return slot;
     }
 
     // must match DepthParams in the resolve shader: five int32, glsl bool is
@@ -146,11 +201,12 @@ namespace VkHook
                       "DepthPushConstants size must be 20 bytes to match GLSL");
 
         DepthPushConstants pushData = {};
-        pushData.depthMode = static_cast<int32_t>(settingsManager.getDepthSourceChannel());
-        pushData.invertDepth = settingsManager.getDepthInvert() ? 1 : 0;
+        const auto settings = settingsManager.snapshot();
+        pushData.depthMode = static_cast<int32_t>(std::clamp(settings->depthSourceChannel, 0, 6));
+        pushData.invertDepth = settings->depthInvert ? 1 : 0;
         pushData.normalize = 1;
-        pushData.flipDepth = settingsManager.getDepthFlip() ? 1 : 0;
-        pushData.flopDepth = settingsManager.getDepthFlop() ? 1 : 0;
+        pushData.flipDepth = settings->depthFlip ? 1 : 0;
+        pushData.flopDepth = settings->depthFlop ? 1 : 0;
 
         logicalDevice->vkd.CmdPushConstants(commandBuffer,
                                             logicalSwapchain->depthResolvePipelineLayout,
@@ -164,39 +220,42 @@ namespace VkHook
                                                     LogicalSwapchain* logicalSwapchain,
                                                     VkCommandBuffer   commandBuffer,
                                                     uint32_t          imageIndex,
-                                                    const DepthState& depthState)
+                                                    const DepthState& depthState,
+                                                    bool              descriptorsMayBeInUse,
+                                                    bool              extentTracked,
+                                                    const VkExtent3D& tracked,
+                                                    VkImageView       sampleView)
     {
         if (!logicalDevice || !logicalSwapchain || imageIndex >= logicalSwapchain->depthResolveDescriptorSets.size()
             || imageIndex >= logicalSwapchain->depthResolveFramebuffers.size())
             return;
 
         // CRITICAL: Zero-trust resource management - verify depth state is still valid
-        // before attempting any descriptor updates or command recording.
-        auto extentIt = logicalDevice->depthImageExtents.find(depthState.image);
-        if (extentIt == logicalDevice->depthImageExtents.end())
+        // (the caller read the tracked extent under the lock) before any descriptor
+        // update or command recording.
+        if (!extentTracked)
         {
             Logger::debug("recordDepthResolveSnapshotViaShader: depth image no longer tracked, skipping");
             return;
         }
-        const VkExtent3D& tracked = extentIt->second;
         if (tracked.width != depthState.extent.width || tracked.height != depthState.extent.height || tracked.depth != depthState.extent.depth)
         {
             Logger::debug("recordDepthResolveSnapshotViaShader: depth handle recycled, skipping");
             return;
         }
 
-        // Non-blocking fence check - skip descriptor update if previous CB still running.
-        // The submit path owns the reset: a signaled fence means the submission
-        // that used this image finished, so leaving it signaled is what the
-        // rebuild gate reads. Resetting it here would let an in-flight
-        // submission look done.
-        if (imageIndex < logicalSwapchain->effectSubmitFences.size()
-            && imageIndex < logicalSwapchain->effectSubmitFenceUsed.size()
-            && logicalSwapchain->effectSubmitFenceUsed[imageIndex]
-            && logicalSwapchain->effectSubmitFences[imageIndex] != VK_NULL_HANDLE)
+        // Non-blocking fence poll (GetFenceStatus, never a wait): skip the
+        // descriptor update if the submission that last used this image may
+        // still be reading the set. The fences live in the swapchain's shared
+        // frame ring and are reset only by the submit path; a signalled fence
+        // means that submission finished.
+        if (descriptorsMayBeInUse && logicalSwapchain->shared
+            && logicalSwapchain->fenceUsed(imageIndex)
+            && imageIndex < logicalSwapchain->shared->effectFences.size()
+            && logicalSwapchain->shared->effectFences[imageIndex] != VK_NULL_HANDLE)
         {
             VkResult status = logicalDevice->vkd.GetFenceStatus(
-                logicalDevice->device, logicalSwapchain->effectSubmitFences[imageIndex]);
+                logicalDevice->device, logicalSwapchain->shared->effectFences[imageIndex]);
             if (status != VK_SUCCESS)
             {
                 Logger::debug("recordDepthResolveSnapshotViaShader: fence not ready, skipping snapshot");
@@ -206,7 +265,7 @@ namespace VkHook
 
         VkDescriptorImageInfo imageInfo = {};
         imageInfo.sampler = logicalSwapchain->depthResolveSampler;
-        imageInfo.imageView = getOrCreateTrackedDepthSampleView(logicalDevice, depthState);
+        imageInfo.imageView = sampleView;
         imageInfo.imageLayout = shouldKeepObservedDepthInGeneralLayout(depthState)
             ? VK_IMAGE_LAYOUT_GENERAL
             : getInternalDepthReadOnlyLayout(depthState.format);
@@ -329,15 +388,19 @@ namespace VkHook
 
     std::vector<VkCommandBuffer> allocateCommandBuffer(LogicalDevice* logicalDevice, uint32_t count, VkCommandPool pool)
     {
+        if (pool == VK_NULL_HANDLE)
+        {
+            Logger::err("allocateCommandBuffer: no command pool given");
+            return {};
+        }
+
         std::vector<VkCommandBuffer> commandBuffers(count);
 
         VkCommandBufferAllocateInfo allocInfo;
         allocInfo.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
         allocInfo.pNext              = nullptr;
         allocInfo.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        // Swapchain-scoped pools keep one swapchain's buffers alive while a
-        // replacement swapchain is being created and the old one is torn down.
-        allocInfo.commandPool        = pool != VK_NULL_HANDLE ? pool : logicalDevice->commandPool;
+        allocInfo.commandPool        = pool;
         allocInfo.commandBufferCount = count;
 
         VkResult result = logicalDevice->vkd.AllocateCommandBuffers(logicalDevice->device, &allocInfo, commandBuffers.data());
@@ -405,8 +468,8 @@ namespace VkHook
                 // This image's fence is complete and the snapshot is overwritten.
                 if (imageIndex != UINT32_MAX)
                     logicalSwapchain->depthResolvePerImage[i].initialized = false;
-                recordDepthResolveSnapshot(
-                    logicalDevice, logicalSwapchain, commandBuffers[i], i, depthState);
+                recordDepthResolveSnapshotImpl(
+                    logicalDevice, logicalSwapchain, commandBuffers[i], i, depthState, false, false);
             }
 
             for (uint32_t j = 0; j < effects.size(); j++)
@@ -734,23 +797,16 @@ namespace VkHook
         });
     }
 
-    void recordDepthResolveSnapshot(LogicalDevice*  logicalDevice,
-                                    LogicalSwapchain* logicalSwapchain,
-                                    VkCommandBuffer commandBuffer,
-                                    uint32_t imageIndex,
-                                    const DepthState& depthState)
+    static void recordDepthResolveSnapshotImpl(LogicalDevice*    logicalDevice,
+                                               LogicalSwapchain* logicalSwapchain,
+                                               VkCommandBuffer   commandBuffer,
+                                               uint32_t          imageIndex,
+                                               const DepthState& depthState,
+                                               bool              descriptorsMayBeInUse,
+                                               bool              callerHoldsStateLock)
     {
         if (!logicalDevice || !logicalSwapchain)
             return;
-        // All snapshot backends need to run outside application rendering:
-        // transfer commands cannot run in a render pass, and shader resolves
-        // must not nest a render pass or overwrite live graphics bindings.
-        const auto scope = logicalDevice->commandBufferDepthStates.find(commandBuffer);
-        if (scope != logicalDevice->commandBufferDepthStates.end() && scope->second.inRenderScope)
-        {
-            Logger::warn("Skipping depth snapshot inside an active render scope");
-            return;
-        }
         if (!hasDepthState(depthState))
             return;
         if (depthState.extent.width == 0 || depthState.extent.height == 0)
@@ -758,31 +814,80 @@ namespace VkHook
         if (imageIndex >= logicalSwapchain->depthResolvePerImage.size())
             return;
 
+        // Everything read from the device's depth maps is copied out under
+        // stateLock here; the lock is gone before any Vulkan call below.
+        bool                  inRenderScope = false;
+        bool                  imageTracked  = true;
+        bool                  metadataFound = false;
+        VkImageUsageFlags     metaUsage     = 0;
+        VkSampleCountFlagBits metaSamples   = VK_SAMPLE_COUNT_1_BIT;
+        VkImageTiling         metaTiling    = VK_IMAGE_TILING_OPTIMAL;
+        bool                  extentTracked = false;
+        VkExtent3D            trackedExtent = {0, 0, 1};
+        SampleViewLookup      sampleLookup;
+        {
+            std::unique_lock<std::mutex> lock(logicalDevice->stateLock, std::defer_lock);
+            if (!callerHoldsStateLock)
+                lock.lock();
+
+            // All snapshot backends need to run outside application rendering:
+            // transfer commands cannot run in a render pass, and shader resolves
+            // must not nest a render pass or overwrite live graphics bindings.
+            const auto scope = logicalDevice->commandBufferDepthStates.find(commandBuffer);
+            inRenderScope = scope != logicalDevice->commandBufferDepthStates.end() && scope->second.inRenderScope;
+
+            // Note: persistent storage is tracked separately, not in depthImages.
+            if (depthState.image != logicalDevice->depthCaptureStorage.image
+                || !logicalDevice->persistentStorageTracked)
+            {
+                imageTracked = std::find(logicalDevice->depthImages.begin(),
+                                         logicalDevice->depthImages.end(),
+                                         depthState.image) != logicalDevice->depthImages.end();
+            }
+
+            auto metadataIt = logicalDevice->depthImageMetadata.find(depthState.image);
+            if (metadataIt != logicalDevice->depthImageMetadata.end())
+            {
+                metadataFound = true;
+                metaUsage     = metadataIt->second.usage;
+                metaSamples   = metadataIt->second.samples;
+                metaTiling    = metadataIt->second.tiling;
+            }
+
+            if (logicalSwapchain->depthResolveUsesShader)
+            {
+                auto extentIt = logicalDevice->depthImageExtents.find(depthState.image);
+                if (extentIt != logicalDevice->depthImageExtents.end())
+                {
+                    extentTracked = true;
+                    trackedExtent = extentIt->second;
+                }
+                sampleLookup = lookupTrackedDepthSampleViewLocked(logicalDevice, depthState);
+            }
+        }
+
+        if (inRenderScope)
+        {
+            Logger::warn("Skipping depth snapshot inside an active render scope");
+            return;
+        }
+
         // Defensive: ensure the underlying depth image is still tracked and has
         // the usage flags we need. This catches the race where Roblox (or any
         // app) destroys a depth image between the time the resolve resources
         // were built and the time we record this command buffer. Without this
         // check, vkCmdCopyImage / vkCmdResolveImage would operate on a dangling
         // image handle, producing either a device-loss or silent garbage.
-        // Note: persistent storage is tracked separately, not in depthImages.
-        if (depthState.image != logicalDevice->depthCaptureStorage.image
-            || !logicalDevice->persistentStorageTracked)
+        if (!imageTracked)
         {
-            auto imageIt = std::find(logicalDevice->depthImages.begin(),
-                                     logicalDevice->depthImages.end(),
-                                     depthState.image);
-            if (imageIt == logicalDevice->depthImages.end())
-            {
-                Logger::warn("recordDepthResolveSnapshot: depth image no longer tracked; skipping (image="
-                             + convertToString(depthState.image) + ")");
-                return;
-            }
-        } // end persistent-storage bypass
-        auto metadataIt = logicalDevice->depthImageMetadata.find(depthState.image);
-        if (metadataIt != logicalDevice->depthImageMetadata.end())
+            Logger::warn("recordDepthResolveSnapshot: depth image no longer tracked; skipping (image="
+                         + convertToString(depthState.image) + ")");
+            return;
+        }
+        if (metadataFound)
         {
             const VkImageUsageFlags required = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-            if ((metadataIt->second.usage & required) != required)
+            if ((metaUsage & required) != required)
             {
                 Logger::warn("recordDepthResolveSnapshot: depth image missing required usage flags; skipping (image="
                              + convertToString(depthState.image) + ")");
@@ -806,17 +911,16 @@ namespace VkHook
             return;
         }
 
-        auto logMetadataIt = logicalDevice->depthImageMetadata.find(depthState.image);
-        if (logMetadataIt != logicalDevice->depthImageMetadata.end())
+        if (metadataFound)
         {
             VKHOOK_LOG_DEBUG([&](std::string& s) {
                 s = "depth snapshot source state: commandBuffer=" + convertToString(commandBuffer)
                     + " image=" + convertToString(depthState.image)
                     + " observedLayout=" + convertToString(depthState.observedLayout)
-                    + " usage=" + convertToString(logMetadataIt->second.usage)
-                    + " samples=" + convertToString(logMetadataIt->second.samples)
-                    + " tiling=" + convertToString(logMetadataIt->second.tiling)
-                    + " transient=" + std::string((logMetadataIt->second.usage & VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT) != 0 ? "true" : "false");
+                    + " usage=" + convertToString(metaUsage)
+                    + " samples=" + convertToString(metaSamples)
+                    + " tiling=" + convertToString(metaTiling)
+                    + " transient=" + std::string((metaUsage & VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT) != 0 ? "true" : "false");
             });
         }
         else
@@ -831,7 +935,11 @@ namespace VkHook
 
         if (logicalSwapchain->depthResolveUsesShader)
         {
-            recordDepthResolveSnapshotViaShader(logicalDevice, logicalSwapchain, commandBuffer, imageIndex, depthState);
+            VkImageView sampleView = sampleLookup.view;
+            if (sampleLookup.needsCreate)
+                sampleView = createAndPublishTrackedDepthSampleView(logicalDevice, depthState, callerHoldsStateLock);
+            recordDepthResolveSnapshotViaShader(logicalDevice, logicalSwapchain, commandBuffer, imageIndex, depthState,
+                                                descriptorsMayBeInUse, extentTracked, trackedExtent, sampleView);
             return;
         }
 
@@ -993,6 +1101,15 @@ namespace VkHook
                                                    1,
                                                    &memoryBarrier);
         }
+    }
+
+    void recordDepthResolveSnapshot(LogicalDevice*  logicalDevice,
+                                    LogicalSwapchain* logicalSwapchain,
+                                    VkCommandBuffer commandBuffer,
+                                    uint32_t imageIndex,
+                                    const DepthState& depthState)
+    {
+        recordDepthResolveSnapshotImpl(logicalDevice, logicalSwapchain, commandBuffer, imageIndex, depthState, true, true);
     }
 
     std::vector<VkSemaphore> createSemaphores(LogicalDevice* logicalDevice, uint32_t count)

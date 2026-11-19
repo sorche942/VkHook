@@ -61,7 +61,7 @@ namespace VkHook
     };
 
     // Snapshot of the depth-capture state, gathered each frame for the Advanced
-    // tab. The overlay reads these from LogicalDevice under globalLock.
+    // tab. The overlay reads these from LogicalDevice under its stateLock.
     struct DepthCandidateInfo
     {
         VkImageView         imageView = VK_NULL_HANDLE;
@@ -252,7 +252,7 @@ namespace VkHook
             SubView_Diagnostics,
         };
         int openSubView = SubView_None;
-        void gatherDepthInfo();     // Snapshot LogicalDevice depth state under globalLock
+        void gatherDepthInfo();     // Snapshot LogicalDevice depth state under its stateLock
         void applyDepthPinRequests();  // Flush UI depth-pin/clear requests to LogicalDevice
         void renderToasts();       // Persistent top-right notifications
 

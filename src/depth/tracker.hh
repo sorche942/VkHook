@@ -2,8 +2,11 @@
 
 // Depth tracker: follows the application's depth attachment as commands are
 // recorded, picks a presentable snapshot target for it, resolves it, and retries
-// when the attachment is not yet usable. Functions with a `Locked` suffix need
-// globalLock; the rest document their own locking.
+// when the attachment is not yet usable. Functions with a `Locked` suffix, and
+// every other function here that reads or writes the device's tracking maps or
+// `swapchains`, require the caller to hold LogicalDevice::stateLock; they never
+// take it themselves. Layer-owned GPU objects are released through
+// LogicalDevice::retire, never destroyed inline.
 
 #include "vulkan_include.hh"
 #include "logical_device.hh"
@@ -15,16 +18,6 @@
 
 namespace VkHook
 {
-    struct DepthRetryState
-    {
-        bool                                  disabled     = false;
-        bool                                  retryPending = false;
-        std::chrono::steady_clock::time_point retryAt{};
-        VkExtent2D                            blockedExtent{0, 0};
-    };
-    // keyed by device; guarded by globalLock
-    extern std::unordered_map<LogicalDevice*, DepthRetryState> depthRetryStates;
-
     inline constexpr auto DEPTH_RETRY_DELAY        = std::chrono::seconds(5);
     inline constexpr auto DEPTH_REBUILD_POLL_DELAY = std::chrono::milliseconds(100);
 
@@ -86,9 +79,10 @@ namespace VkHook
     void updateDeviceDepthStateLocked(LogicalDevice* logicalDevice, const DepthState& depth, const char* reason);
     DepthState getDepthState(LogicalDevice* logicalDevice);
     VkImageView getOrCreateTrackedDepthSampleViewLocked(LogicalDevice* logicalDevice, VkImage image, VkFormat format);
-    void reallocateCommandBuffers(LogicalDevice* logicalDevice, LogicalSwapchain* logicalSwapchain, const DepthState& depth);
 
-    void destroyDepthResolveResources(LogicalSwapchain* logicalSwapchain);
+    // Scratch builder: `logicalSwapchain` is an unpublished generation no other
+    // thread can see, so no lock and no fence check is needed. Stale depth-resolve
+    // state it holds is retired first. A rebuild constructs a whole new generation.
     void ensureDepthResolveResources(LogicalSwapchain* logicalSwapchain, const DepthState& depth);
     void destroyPersistentDepthStorage(LogicalDevice* logicalDevice);
     void ensurePersistentDepthStorage(LogicalDevice* logicalDevice, VkFormat format, const VkExtent3D& extent);
@@ -99,11 +93,10 @@ namespace VkHook
     void armDepthRetryLocked(LogicalDevice* logicalDevice, const LogicalSwapchain* sc, const char* reason);
     bool depthRetryDueLocked(LogicalDevice* logicalDevice);
     void scheduleDepthRetryLocked(LogicalDevice* logicalDevice, bool fastPoll = false);
-    bool depthRebuildFencesReady(LogicalDevice* logicalDevice, const LogicalSwapchain* sc);
 
     // Extent of a live, non-passthrough swapchain for this device (the window
     // size), for UI defaults such as the manual depth pin. Defined in
-    // present/swapchain.cc. Callers must hold globalLock.
+    // present/swapchain.cc. Caller holds the device stateLock.
     VkExtent2D currentSwapchainExtentLocked(LogicalDevice* logicalDevice);
 
     // Drops every tracked scope whose depth state matches `predicate`.

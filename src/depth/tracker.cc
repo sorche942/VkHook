@@ -1,12 +1,10 @@
 #include "depth/tracker.hh"
 
-#include "layer/state.hh"
 #include "diag/gpu_crash.hh"
 
 #include "image_view.hh"
 #include "image.hh"
 #include "command_buffer.hh"
-#include "vk_handle.hh"
 #include "util.hh"
 #include "format.hh"
 #include "renderpass.hh"
@@ -26,7 +24,9 @@
 
 namespace VkHook
 {
-    std::unordered_map<LogicalDevice*, DepthRetryState> depthRetryStates;
+    // Locking: functions with a `Locked` suffix, and the other functions that touch
+    // the device's tracking maps or `swapchains`, run with the device's stateLock
+    // held by the caller (the depth hooks take it). They never take it themselves.
 
     bool hasDepthState(const DepthState& state)
     {
@@ -132,7 +132,7 @@ namespace VkHook
         if (!logicalDevice || image == VK_NULL_HANDLE)
             return false;
 
-        for (auto& [_, logicalSwapchain] : swapchainMap)
+        for (auto& [_, logicalSwapchain] : logicalDevice->swapchains)
         {
             if (!logicalSwapchain || logicalSwapchain->logicalDevice != logicalDevice)
                 continue;
@@ -178,7 +178,7 @@ namespace VkHook
             return false;
 
         // exact matches win over chrome-sized ones
-        for (auto& [_, logicalSwapchain] : swapchainMap)
+        for (auto& [_, logicalSwapchain] : logicalDevice->swapchains)
         {
             if (!logicalSwapchain || logicalSwapchain->logicalDevice != logicalDevice)
                 continue;
@@ -188,7 +188,7 @@ namespace VkHook
                 return true;
         }
 
-        for (auto& [_, logicalSwapchain] : swapchainMap)
+        for (auto& [_, logicalSwapchain] : logicalDevice->swapchains)
         {
             if (!logicalSwapchain || logicalSwapchain->logicalDevice != logicalDevice)
                 continue;
@@ -395,7 +395,7 @@ namespace VkHook
             return target.swapchain != VK_NULL_HANDLE;
         }
 
-        for (auto& [swapchainHandle, logicalSwapchain] : swapchainMap)
+        for (auto& [swapchainHandle, logicalSwapchain] : logicalDevice->swapchains)
         {
             if (!logicalSwapchain || logicalSwapchain->logicalDevice != logicalDevice)
                 continue;
@@ -419,7 +419,7 @@ namespace VkHook
         if (image == VK_NULL_HANDLE)
             return target;
 
-        for (auto& [swapchainHandle, logicalSwapchain] : swapchainMap)
+        for (auto& [swapchainHandle, logicalSwapchain] : logicalDevice->swapchains)
         {
             if (!logicalSwapchain || logicalSwapchain->logicalDevice != logicalDevice)
                 continue;
@@ -771,8 +771,8 @@ namespace VkHook
         recordDepthResolveSnapshotForCommandBuffer(logicalDevice, commandBuffer, scopeState.depthState, &snapshotTarget);
     }
 
-    // Caller MUST hold globalLock while validating and recording against
-    // tracked device/swapchain resources.
+    // Caller MUST hold logicalDevice->stateLock while validating and recording
+    // against tracked device/swapchain resources.
     void recordDepthResolveSnapshotForCommandBuffer(LogicalDevice* logicalDevice,
                                                     VkCommandBuffer commandBuffer,
                                                     const DepthState& depthState,
@@ -807,8 +807,8 @@ namespace VkHook
         }
 
         DepthSnapshotTarget target = *snapshotTarget;
-        auto swapIt = swapchainMap.find(target.swapchain);
-        if (swapIt == swapchainMap.end() || !swapIt->second || swapIt->second->logicalDevice != logicalDevice)
+        auto swapIt = logicalDevice->swapchains.find(target.swapchain);
+        if (swapIt == logicalDevice->swapchains.end() || !swapIt->second || swapIt->second->logicalDevice != logicalDevice)
         {
             VKHOOK_LOG_DEBUG([&](std::string& s) {
                 s = "skip depth resolve snapshot: snapshot target swapchain not found for commandBuffer="
@@ -822,7 +822,7 @@ namespace VkHook
         recordDepthResolveSnapshot(logicalDevice, target.logicalSwapchain, commandBuffer, target.imageIndex, depthState);
     }
 
-    // Caller MUST hold globalLock while iterating swapchains and recording.
+    // Caller MUST hold logicalDevice->stateLock while iterating swapchains and recording.
     void recordDepthResolveSnapshotForAllSwapchains(LogicalDevice* logicalDevice,
                                                     VkCommandBuffer commandBuffer,
                                                     const DepthState& depthState)
@@ -840,7 +840,7 @@ namespace VkHook
             return;
         }
 
-        for (auto& [swapchainHandle, logicalSwapchain] : swapchainMap)
+        for (auto& [swapchainHandle, logicalSwapchain] : logicalDevice->swapchains)
         {
             if (!logicalSwapchain || logicalSwapchain->logicalDevice != logicalDevice)
                 continue;
@@ -869,115 +869,11 @@ namespace VkHook
         return trackedView;
     }
 
-    void destroyDepthResolveResources(LogicalSwapchain* logicalSwapchain)
+    // Retires every depth-resolve object of a swapchain generation (the GPU may
+    // still read them through recorded command buffers) and clears the fields.
+    static void releaseDepthResolve(LogicalSwapchain* logicalSwapchain)
     {
-        logicalSwapchain->depthResolveSourceView = VK_NULL_HANDLE;
-
-        for (auto& framebuffer : logicalSwapchain->depthResolveFramebuffers)
-        {
-            logicalSwapchain->logicalDevice->vkd.DestroyFramebuffer(logicalSwapchain->logicalDevice->device, framebuffer, nullptr);
-        }
-        logicalSwapchain->depthResolveFramebuffers.clear();
-
-        for (auto& framebuffer : logicalSwapchain->depthResolveMsaaFramebuffers)
-        {
-            logicalSwapchain->logicalDevice->vkd.DestroyFramebuffer(logicalSwapchain->logicalDevice->device, framebuffer, nullptr);
-        }
-        logicalSwapchain->depthResolveMsaaFramebuffers.clear();
-
-        for (auto& framebuffer : logicalSwapchain->depthResolveTransformFramebuffers)
-        {
-            logicalSwapchain->logicalDevice->vkd.DestroyFramebuffer(logicalSwapchain->logicalDevice->device, framebuffer, nullptr);
-        }
-        logicalSwapchain->depthResolveTransformFramebuffers.clear();
-
-        if (logicalSwapchain->depthResolveMsaaRenderPass)
-        {
-            logicalSwapchain->logicalDevice->vkd.DestroyRenderPass(
-                logicalSwapchain->logicalDevice->device, logicalSwapchain->depthResolveMsaaRenderPass, nullptr);
-            logicalSwapchain->depthResolveMsaaRenderPass = VK_NULL_HANDLE;
-        }
-
-        if (logicalSwapchain->depthResolveTransformRenderPass)
-        {
-            logicalSwapchain->logicalDevice->vkd.DestroyRenderPass(
-                logicalSwapchain->logicalDevice->device, logicalSwapchain->depthResolveTransformRenderPass, nullptr);
-            logicalSwapchain->depthResolveTransformRenderPass = VK_NULL_HANDLE;
-        }
-
-        if (logicalSwapchain->depthResolvePipeline)
-        {
-            logicalSwapchain->logicalDevice->vkd.DestroyPipeline(
-                logicalSwapchain->logicalDevice->device, logicalSwapchain->depthResolvePipeline, nullptr);
-            logicalSwapchain->depthResolvePipeline = VK_NULL_HANDLE;
-        }
-        if (logicalSwapchain->depthResolvePipelineLayout)
-        {
-            logicalSwapchain->logicalDevice->vkd.DestroyPipelineLayout(
-                logicalSwapchain->logicalDevice->device, logicalSwapchain->depthResolvePipelineLayout, nullptr);
-            logicalSwapchain->depthResolvePipelineLayout = VK_NULL_HANDLE;
-        }
-        if (logicalSwapchain->depthResolveRenderPass)
-        {
-            logicalSwapchain->logicalDevice->vkd.DestroyRenderPass(
-                logicalSwapchain->logicalDevice->device, logicalSwapchain->depthResolveRenderPass, nullptr);
-            logicalSwapchain->depthResolveRenderPass = VK_NULL_HANDLE;
-        }
-        if (logicalSwapchain->depthResolveDescriptorPool)
-        {
-            logicalSwapchain->logicalDevice->vkd.DestroyDescriptorPool(
-                logicalSwapchain->logicalDevice->device, logicalSwapchain->depthResolveDescriptorPool, nullptr);
-            logicalSwapchain->depthResolveDescriptorPool = VK_NULL_HANDLE;
-        }
-        if (logicalSwapchain->depthResolveDescriptorSetLayout)
-        {
-            logicalSwapchain->logicalDevice->vkd.DestroyDescriptorSetLayout(
-                logicalSwapchain->logicalDevice->device, logicalSwapchain->depthResolveDescriptorSetLayout, nullptr);
-            logicalSwapchain->depthResolveDescriptorSetLayout = VK_NULL_HANDLE;
-        }
-        if (logicalSwapchain->depthResolveSampler)
-        {
-            logicalSwapchain->logicalDevice->vkd.DestroySampler(
-                logicalSwapchain->logicalDevice->device, logicalSwapchain->depthResolveSampler, nullptr);
-            logicalSwapchain->depthResolveSampler = VK_NULL_HANDLE;
-        }
-
-        for (auto& perImg : logicalSwapchain->depthResolvePerImage)
-        {
-            if (perImg.imageView != VK_NULL_HANDLE)
-                logicalSwapchain->logicalDevice->vkd.DestroyImageView(
-                    logicalSwapchain->logicalDevice->device, perImg.imageView, nullptr);
-            if (perImg.image != VK_NULL_HANDLE)
-                logicalSwapchain->logicalDevice->vkd.DestroyImage(
-                    logicalSwapchain->logicalDevice->device, perImg.image, nullptr);
-            if (perImg.memory != VK_NULL_HANDLE)
-                logicalSwapchain->logicalDevice->vkd.FreeMemory(
-                    logicalSwapchain->logicalDevice->device, perImg.memory, nullptr);
-        }
-        logicalSwapchain->depthResolvePerImage.clear();
-
-        for (auto& perImg : logicalSwapchain->depthResolveTransformedPerImage)
-        {
-            if (perImg.imageView != VK_NULL_HANDLE)
-                logicalSwapchain->logicalDevice->vkd.DestroyImageView(
-                    logicalSwapchain->logicalDevice->device, perImg.imageView, nullptr);
-            if (perImg.image != VK_NULL_HANDLE)
-                logicalSwapchain->logicalDevice->vkd.DestroyImage(
-                    logicalSwapchain->logicalDevice->device, perImg.image, nullptr);
-            if (perImg.memory != VK_NULL_HANDLE)
-                logicalSwapchain->logicalDevice->vkd.FreeMemory(
-                    logicalSwapchain->logicalDevice->device, perImg.memory, nullptr);
-        }
-        logicalSwapchain->depthResolveTransformedPerImage.clear();
-
-        logicalSwapchain->depthResolveDescriptorSets.clear();
-        logicalSwapchain->depthResolveFormat = VK_FORMAT_UNDEFINED;
-        logicalSwapchain->depthResolveExtent = {0, 0, 1};
-        logicalSwapchain->depthResolveUsesShader = false;
-        logicalSwapchain->depthResolveIsMsaa = false;
-        logicalSwapchain->depthResolveMsaaTransform = false;
-        logicalSwapchain->depthResolveSourceSamples = VK_SAMPLE_COUNT_1_BIT;
-        logicalSwapchain->depthResolveMode = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
+        retireDepthResolveFields(logicalSwapchain->logicalDevice, *logicalSwapchain);
     }
 
     static std::vector<VkImageView> collectDepthResolveImageViews(const LogicalSwapchain* sc)
@@ -1074,7 +970,7 @@ namespace VkHook
             if (images.empty() || imageMemory == VK_NULL_HANDLE)
             {
                 Logger::err("initializeDepthResolveLayout: failed to create depth resolve image " + std::to_string(i));
-                destroyDepthResolveResources(logicalSwapchain);
+                releaseDepthResolve(logicalSwapchain);
                 return;
             }
             logicalSwapchain->depthResolvePerImage[i].image  = images[0];
@@ -1386,18 +1282,18 @@ namespace VkHook
         auto& s = logicalDevice->depthCaptureStorage;
         if (s.view != VK_NULL_HANDLE)
         {
-            logicalDevice->vkd.DestroyImageView(logicalDevice->device, s.view, nullptr);
+            logicalDevice->retire(VK_OBJECT_TYPE_IMAGE_VIEW, s.view);
             s.view = VK_NULL_HANDLE;
         }
         if (s.image != VK_NULL_HANDLE)
         {
-            logicalDevice->vkd.DestroyImage(logicalDevice->device, s.image, nullptr);
+            logicalDevice->retire(VK_OBJECT_TYPE_IMAGE, s.image);
             logicalDevice->depthImageMetadata.erase(s.image);
             s.image = VK_NULL_HANDLE;
         }
         if (s.memory != VK_NULL_HANDLE)
         {
-            logicalDevice->vkd.FreeMemory(logicalDevice->device, s.memory, nullptr);
+            logicalDevice->retire(VK_OBJECT_TYPE_DEVICE_MEMORY, s.memory);
             s.memory = VK_NULL_HANDLE;
         }
         s.extent = {0, 0, 1};
@@ -1515,6 +1411,12 @@ namespace VkHook
         Logger::info("persistent depth storage created: " + std::to_string(extent.width) + "x"
                      + std::to_string(extent.height) + " format=" + std::to_string(format));
     }
+
+    // Scratch builder: `logicalSwapchain` is an unpublished generation that no
+    // other thread can see, so this needs no lock and no fence check. Whatever
+    // stale depth-resolve state it holds is retired (the GPU may still read the
+    // previous generation's copies through its own command buffers; this one's
+    // fields are replaced, never mutated in place under a live generation).
     void ensureDepthResolveResources(LogicalSwapchain* logicalSwapchain, const DepthState& depth)
     {
         // Destroy resolve resources if depth state is no longer valid (e.g.
@@ -1522,7 +1424,7 @@ namespace VkHook
         // prevents command buffers from sampling stale resolve images.
         if (!hasDepthState(depth) || depth.extent.width == 0 || depth.extent.height == 0)
         {
-            destroyDepthResolveResources(logicalSwapchain);
+            releaseDepthResolve(logicalSwapchain);
             return;
         }
 
@@ -1583,7 +1485,7 @@ namespace VkHook
                          + " — rebuilding descriptor sets and MSAA framebuffers");
         }
 
-        destroyDepthResolveResources(logicalSwapchain);
+        releaseDepthResolve(logicalSwapchain);
         initializeDepthResolveLayout(logicalSwapchain, depth);
     }
 
@@ -1597,7 +1499,7 @@ namespace VkHook
         if (!logicalDevice)
             return;
 
-        auto& retry = depthRetryStates[logicalDevice];
+        auto& retry = logicalDevice->depthRetry;
         retry.disabled = true;
         retry.retryPending = true;
         retry.retryAt = std::chrono::steady_clock::now() + DEPTH_RETRY_DELAY;
@@ -1606,7 +1508,7 @@ namespace VkHook
         logicalDevice->activeDepthState = {};
         logicalDevice->pinnedDepthImageView = VK_NULL_HANDLE;
         logicalDevice->depthReallocPending = false;
-        for (auto& [_, swapchain] : swapchainMap)
+        for (auto& [_, swapchain] : logicalDevice->swapchains)
             if (swapchain && swapchain->logicalDevice == logicalDevice)
                 swapchain->depthReallocPending = true;
 
@@ -1618,59 +1520,19 @@ namespace VkHook
 
     bool depthRetryDueLocked(LogicalDevice* logicalDevice)
     {
-        auto it = depthRetryStates.find(logicalDevice);
-        if (it == depthRetryStates.end() || !it->second.retryPending)
+        const DepthRetryState& retry = logicalDevice->depthRetry;
+        if (!retry.retryPending)
             return false;
-        return std::chrono::steady_clock::now() >= it->second.retryAt;
+        return std::chrono::steady_clock::now() >= retry.retryAt;
     }
 
     void scheduleDepthRetryLocked(LogicalDevice* logicalDevice, bool fastPoll)
     {
-        auto& retry = depthRetryStates[logicalDevice];
+        auto& retry = logicalDevice->depthRetry;
         retry.disabled = true;
         retry.retryPending = true;
         retry.retryAt = std::chrono::steady_clock::now()
                       + (fastPoll ? DEPTH_REBUILD_POLL_DELAY : DEPTH_RETRY_DELAY);
-    }
-
-    bool depthRebuildFencesReady(LogicalDevice* logicalDevice, const LogicalSwapchain* sc)
-    {
-        if (!logicalDevice || !sc)
-            return false;
-
-        // Non-blocking safety check.  Never WaitForFences/QueueWaitIdle here:
-        // safe rebuild mode idles the queue before calling this, and fast mode
-        // accepts the wait-free gate.  If any effect command buffer is still in
-        // flight, simply try again on a later present.
-        for (size_t index = 0; index < sc->effectSubmitFences.size(); ++index)
-        {
-            // Newly allocated swapchain command buffers have unsignaled fences
-            // that have never been submitted; they are already safe to rewrite.
-            if (index >= sc->effectSubmitFenceUsed.size() || !sc->effectSubmitFenceUsed[index])
-                continue;
-
-            const VkFence fence = sc->effectSubmitFences[index];
-            if (fence == VK_NULL_HANDLE)
-                continue;
-
-            VkResult vr = logicalDevice->vkd.GetFenceStatus(logicalDevice->device, fence);
-            if (vr == VK_NOT_READY)
-                return false;
-            if (vr == VK_ERROR_DEVICE_LOST)
-            {
-                reportDeviceLostDiagnostics(logicalDevice, logicalDevice->queue,
-                                            "depth rebuild fence status", vr);
-                panicLayer(logicalDevice, "Device lost while checking depth rebuild fences");
-                return false;
-            }
-            if (vr != VK_SUCCESS)
-            {
-                Logger::warn("depth rebuild fence status returned " + std::to_string(vr));
-                return false;
-            }
-        }
-
-        return true;
     }
 
     // Get depth state from logical device (returns null handles if no depth images)
@@ -1734,58 +1596,11 @@ namespace VkHook
             });
         }
 
-        // Defer command-buffer rebuild to a non-blocking safe point in
-        // QueuePresentKHR, which coalesces bursts and (in safe mode) idles the
-        // queue first. Arming all swapchains here would rebuild on the very next
-        // present of each, skipping both.
+        // The chain rebuild runs at the next present boundary (it builds a whole
+        // new generation off-lock and swaps it in; it never waits for the GPU),
+        // and coalesces bursts of updates. Arming all swapchains here would
+        // rebuild on the very next present of each, skipping the coalescing.
         logicalDevice->depthReallocPending = true;
-    }
-
-    // Helper to reallocate and rewrite command buffers for a swapchain
-    void reallocateCommandBuffers(
-        LogicalDevice* logicalDevice,
-        LogicalSwapchain* logicalSwapchain,
-        const DepthState& depth)
-    {
-        // Every buffer this swapchain owns lives in its own pool; the pool may
-        // be gone if a passthrough swapchain is being rebuilt, so guard it.
-        const VkCommandPool pool = logicalSwapchain->commandPool != VK_NULL_HANDLE
-            ? logicalSwapchain->commandPool
-            : logicalDevice->commandPool;
-
-        // Free existing command buffers
-        if (pool != VK_NULL_HANDLE && !logicalSwapchain->commandBuffersEffect.empty())
-        {
-            logicalDevice->vkd.FreeCommandBuffers(
-                logicalDevice->device, pool,
-                logicalSwapchain->commandBuffersEffect.size(),
-                logicalSwapchain->commandBuffersEffect.data());
-        }
-        if (pool != VK_NULL_HANDLE && !logicalSwapchain->commandBuffersNoEffect.empty())
-        {
-            logicalDevice->vkd.FreeCommandBuffers(
-                logicalDevice->device, pool,
-                logicalSwapchain->commandBuffersNoEffect.size(),
-                logicalSwapchain->commandBuffersNoEffect.data());
-        }
-
-        ensureDepthResolveResources(logicalSwapchain, depth);
-
-        // Allocate and write effect command buffers
-        logicalSwapchain->commandBuffersEffect = allocateCommandBuffer(logicalDevice, logicalSwapchain->imageCount, pool);
-        writeCommandBuffers(logicalDevice,
-                            logicalSwapchain,
-                            logicalSwapchain->effects,
-                            logicalSwapchain->commandBuffersEffect,
-                            depth);
-
-        // Allocate and write no-effect command buffers
-        logicalSwapchain->commandBuffersNoEffect = allocateCommandBuffer(logicalDevice, logicalSwapchain->imageCount, pool);
-        writeCommandBuffers(logicalDevice,
-                            logicalSwapchain,
-                            {logicalSwapchain->defaultTransfer},
-                            logicalSwapchain->commandBuffersNoEffect,
-                            depth);
     }
 
 } // namespace VkHook

@@ -1,5 +1,10 @@
 #ifndef LOGICAL_SWAPCHAIN_HPP_INCLUDED
 #define LOGICAL_SWAPCHAIN_HPP_INCLUDED
+#include <atomic>
+#include <cstdint>
+#include <condition_variable>
+#include <mutex>
+#include <string>
 #include <vector>
 #include <memory>
 
@@ -24,31 +29,56 @@ namespace VkHook
         bool           initialized = false;
     };
 
-    struct LogicalSwapchain
+    // Swapchain-lifetime resources and the per-image frame ring, shared by every
+    // chain generation of one swapchain. The game holds the fake images, and the
+    // semaphores are waited on by queued presents, so none of it can follow a
+    // generation swap. Everything is retired through the device's RetireQueue
+    // when the last generation of the swapchain goes away.
+    struct SwapchainShared
     {
-        LogicalDevice*                       logicalDevice;
-        VkSwapchainCreateInfoKHR             swapchainCreateInfo;
-        VkExtent2D                           imageExtent;
-        VkFormat                             format;
-        uint32_t                             imageCount;
-        bool                                 useMutableFormat = false;
-        std::vector<VkImage>                 images;
-        std::vector<VkImageView>             imageViews;  // for overlay rendering
-        std::vector<VkImage>                 fakeImages;
-        // per-swapchain pool: a shared-pool reset invalidated the replacement
-        // swapchain's buffers while the old one was still being torn down
-        VkCommandPool                        commandPool = VK_NULL_HANDLE;
-        // real images served and presents passed through: zero-sized, layered,
-        // or fake allocation failed
-        bool                                 passthrough = false;
-        size_t                               maxEffectSlots = 0;  // Max number of effects supported
-        std::vector<VkCommandBuffer>         commandBuffersEffect;
-        std::vector<VkCommandBuffer>         commandBuffersNoEffect;
-        std::vector<VkSemaphore>             semaphores;
-        std::vector<VkSemaphore>             overlaySemaphores;
-        std::vector<std::shared_ptr<Effect>> effects;
-        std::shared_ptr<Effect>              defaultTransfer;
-        std::vector<VkDeviceMemory>          fakeImageMemories;
+        LogicalDevice*             logicalDevice = nullptr;
+        std::vector<VkImage>       fakeImages;
+        std::vector<VkDeviceMemory> fakeImageMemories;
+        std::vector<VkImageView>   imageViews;  // real images, for overlay rendering
+        std::vector<VkSemaphore>   semaphores;
+        std::vector<VkSemaphore>   overlaySemaphores;
+        // One fence per image, signalled by that image's last layer submission.
+        // Only the swapchain's present path (externally synchronised by the
+        // application) touches fenceUsed.
+        std::vector<VkFence>       effectFences;
+        std::vector<uint8_t>       effectFenceUsed;
+        // newest layer submission that reads or writes this swapchain's images
+        std::atomic<uint64_t>      lastSerial{0};
+
+        // First-generation build (vkGetSwapchainImagesKHR). The mutex guards the
+        // state variable only and is never held while building; a concurrent
+        // caller waits on the condition variable for the builder to finish.
+        enum class Build { None, Building, Done };
+        std::mutex              buildLock;
+        std::condition_variable buildDone;
+        Build                   build = Build::None;
+
+        // Held by the thread that is rebuilding this swapchain's chain; a second
+        // rebuild request skips instead of waiting (it never blocks).
+        std::atomic<bool> rebuildBusy{false};
+
+        // Releases every object now. `gpuIdle` says the caller proved the layer's
+        // submissions on this swapchain complete (vkDestroySwapchainKHR waited
+        // for its last serial): objects are then destroyed in place, before the
+        // real swapchain goes away; otherwise they are retired. Idempotent: the
+        // destructor releases whatever is left.
+        void release(bool gpuIdle);
+
+        explicit SwapchainShared(LogicalDevice* device) : logicalDevice(device) {}
+        SwapchainShared(const SwapchainShared&)            = delete;
+        SwapchainShared& operator=(const SwapchainShared&) = delete;
+        ~SwapchainShared();
+    };
+
+    // Per chain-generation depth-resolve resources. A rebuild builds a fresh set
+    // beside the live one and swaps whole generations (present/swapchain.cc).
+    struct DepthResolveFields
+    {
         std::vector<DepthResolvePerImage>       depthResolvePerImage;
         VkFormat                             depthResolveFormat = VK_FORMAT_UNDEFINED;
         VkExtent3D                           depthResolveExtent = {0, 0, 1};
@@ -78,21 +108,83 @@ namespace VkHook
         VkPipelineLayout                     depthResolvePipelineLayout = VK_NULL_HANDLE;
         VkPipeline                           depthResolvePipeline = VK_NULL_HANDLE;
         std::vector<VkFramebuffer>           depthResolveFramebuffers;
-
-        // Per-image fences to track effect command buffer completion.
-        // CRITICAL: We must NOT update descriptor sets or free command buffers
-        // while the GPU is still using them.  Each fence is signaled when the
-        // corresponding effect CB (and its dependent overlay CB) is submitted.
-        // Before re-recording or updating descriptor sets for imageIndex, we
-        // wait on effectSubmitFences[imageIndex] to ensure the GPU finished the
-        // previous frame's work.  Without this, UpdateDescriptorSets modifies a
-        // descriptor set that's still bound to an in-flight CB → VK_ERROR_DEVICE_LOST.
-        std::vector<VkFence>                  effectSubmitFences;
-        std::vector<bool>                     effectSubmitFenceUsed;
-        bool                                  depthReallocPending = false;
-
-        void destroy();
     };
+
+    // One chain generation of a swapchain: the effects, their command buffers
+    // and the depth-resolve resources those buffers reference (AGENTS.md
+    // invariant 6; formal/VkHookFormal/ChainRebuild.lean). A rebuild constructs
+    // the next generation with no lock held (cloneBase + build), the registry
+    // swaps the pointer under the device's stateLock at a present boundary, and
+    // destroying the old object retires its resources through the RetireQueue
+    // once the last present thread using it drops its reference.
+    struct LogicalSwapchain : DepthResolveFields
+    {
+        LogicalDevice*                       logicalDevice = nullptr;
+        VkSwapchainKHR                       handle        = VK_NULL_HANDLE;
+        // Deep copy: pNext is dropped (nothing after creation needs it) and
+        // pQueueFamilyIndices points into ownedQueueFamilyIndices.
+        VkSwapchainCreateInfoKHR             swapchainCreateInfo{};
+        std::vector<uint32_t>                ownedQueueFamilyIndices;
+        VkExtent2D                           imageExtent{};
+        VkFormat                             format = VK_FORMAT_UNDEFINED;
+        uint32_t                             imageCount = 0;
+        bool                                 useMutableFormat = false;
+        std::vector<VkImage>                 images;
+        std::vector<VkImageView>             imageViews;  // for overlay rendering
+        std::vector<VkImage>                 fakeImages;
+        // real images served and presents passed through: zero-sized, layered,
+        // a surface that cannot take TRANSFER_DST, or fake allocation failed.
+        // Fixed once GetSwapchainImages answered; a swapchain is never both.
+        bool                                 passthrough = false;
+        size_t                               maxEffectSlots = 0;  // Max number of effects supported
+        std::vector<VkSemaphore>             semaphores;
+        std::vector<VkSemaphore>             overlaySemaphores;
+        std::vector<VkFence>                 effectSubmitFences;
+        std::vector<VkDeviceMemory>          fakeImageMemories;
+        std::shared_ptr<SwapchainShared>     shared;
+
+        // --- generation-owned (replaced by a rebuild) ---
+        // per-generation pool (RESET_COMMAND_BUFFER: the buffers are re-recorded
+        // every frame effects change)
+        VkCommandPool                        commandPool = VK_NULL_HANDLE;
+        std::vector<VkCommandBuffer>         commandBuffersEffect;
+        // fake -> real copy only, recorded without depth: what CopyOnly submits
+        std::vector<VkCommandBuffer>         commandBuffersNoEffect;
+        std::vector<std::shared_ptr<Effect>> effects;
+        std::shared_ptr<Effect>              defaultTransfer;
+        uint64_t                             generation = 0;
+        // names of the effects `effects` was built from (a depth rebuild builds
+        // the same chain again)
+        std::vector<std::string>             effectNames;
+
+        bool depthReallocPending = false;
+
+        LogicalSwapchain() = default;
+        LogicalSwapchain(const LogicalSwapchain&)            = delete;
+        LogicalSwapchain& operator=(const LogicalSwapchain&) = delete;
+        ~LogicalSwapchain();
+
+        // The game-facing swapchain was replaced by fake images; every present
+        // then needs a layer submission (invariant 5).
+        bool faked() const { return !passthrough && !fakeImages.empty(); }
+
+        // The swapchain-lifetime part of this object, with an empty generation.
+        std::shared_ptr<LogicalSwapchain> cloneBase() const;
+
+        bool fenceUsed(uint32_t image) const
+        {
+            return shared && image < shared->effectFenceUsed.size() && shared->effectFenceUsed[image];
+        }
+
+        // Retires this generation's pool, command buffers and depth-resolve
+        // resources and drops its effects. Called by the destructor.
+        void releaseGeneration();
+    };
+
+    // Retires every depth-resolve object of the set (the pipeline, pass,
+    // framebuffers, views, images and memory a recorded buffer may reference)
+    // and resets it to empty.
+    void retireDepthResolveFields(LogicalDevice* logicalDevice, DepthResolveFields& fields);
 } // namespace VkHook
 
 #endif // LOGICAL_SWAPCHAIN_HPP_INCLUDED

@@ -75,7 +75,7 @@ namespace VkHook
         Logger::debug("fake image alignment: " + std::to_string(memoryRequirements.alignment));
 
         auto memoryTypeIndex = findMemoryTypeIndex(logicalDevice, memoryRequirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        if (memoryTypeIndex == 0xFFFFFFFF)
+        if (memoryTypeIndex == kInvalidMemoryTypeIndex)
         {
             Logger::err("createFakeSwapchainImages: no valid memory type");
             for (VkImage img : fakeImages)
