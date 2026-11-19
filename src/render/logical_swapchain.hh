@@ -90,10 +90,8 @@ namespace VkHook
         std::vector<VkFence>                  effectSubmitFences;
         std::vector<bool>                     effectSubmitFenceUsed;
         bool                                  depthReallocPending = false;
-        bool                                  rebuildEffectsOnNextPresent = false;
 
         void destroy();
-        void reloadEffects(Config* config);
     };
 } // namespace VkHook
 

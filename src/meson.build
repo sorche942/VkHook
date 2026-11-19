@@ -90,8 +90,18 @@ overlay_src = [
 ]
 
 VkHook_src = [
-    'core/vkhook.cc',
-    'core/vkhook_depth.cc',
+    'layer/entry.cc',
+    'layer/state.cc',
+    'layer/instance.cc',
+    'layer/device.cc',
+    'present/swapchain.cc',
+    'present/present.cc',
+    'present/submit.cc',
+    'depth/hooks.cc',
+    'depth/tracker.cc',
+    'control/frontend.cc',
+    'control/preset_import.cc',
+    'diag/gpu_crash.cc',
     'core/async_writer.cc',
     'render/buffer.cc',
     'render/command_buffer.cc',
