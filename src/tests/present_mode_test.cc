@@ -5,6 +5,7 @@
 
 #include "present/present_mode.hh"
 
+#include <type_traits>
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
@@ -27,7 +28,16 @@ namespace
     }
 #define CHECK(expr) check((expr), #expr, __LINE__)
 
-    VkSemaphore sem(uintptr_t n) { return reinterpret_cast<VkSemaphore>(n); }
+    // non-dispatchable handles are integers on 32-bit targets, pointers on 64-bit
+    template <typename Handle>
+    Handle handleOf(uint64_t n)
+    {
+        if constexpr (std::is_pointer_v<Handle>)
+            return reinterpret_cast<Handle>(static_cast<uintptr_t>(n));
+        else
+            return static_cast<Handle>(n);
+    }
+    VkSemaphore sem(uintptr_t n) { return handleOf<VkSemaphore>(n); }
     VkCommandBuffer cmd(uintptr_t n) { return reinterpret_cast<VkCommandBuffer>(n); }
     VkQueue         queueHandle() { return reinterpret_cast<VkQueue>(uintptr_t{0x1000}); }
 
@@ -156,7 +166,7 @@ namespace
     {
         // the overlay's fence is requested right before its submit: nothing of the overlay batch exists yet
         ++overlayFenceCalls;
-        return reinterpret_cast<VkFence>(uintptr_t{0x77});
+        return handleOf<VkFence>(0x77);
     }
 
     void testOverlayFollows()
@@ -179,7 +189,7 @@ namespace
         CHECK(recorded.size() == 2);
         CHECK(recorded[1].waits.size() == 1 && recorded[1].waits[0] == sem(100));
         CHECK(recorded[1].signals.size() == 1 && recorded[1].signals[0] == sem(200));
-        CHECK(recorded[1].fence == reinterpret_cast<VkFence>(uintptr_t{0x77}));
+        CHECK(recorded[1].fence == handleOf<VkFence>(0x77));
         CHECK(overlayFenceCalls == 1);
         CHECK(presentWaits.size() == 1 && presentWaits[0] == sem(200));
         checkWaitsConsumedOnce({sem(10)}, __LINE__);
