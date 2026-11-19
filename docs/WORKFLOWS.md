@@ -198,6 +198,13 @@ Temporal enables hardware optical-flow history; history strength ranges from 0
 strength. Parameters update without rebuilding the network; toggling temporal
 re-records the affected command buffers.
 
+`dlss5FlowResolution` in the active config (`auto`, `full`, `half` or `quarter`;
+default `auto`) sets the size of the image the optical-flow engine sees. `auto`
+halves each axis from 1920×1080 up and keeps smaller frames at full size.
+Vectors of a reduced image are matched again on the full-resolution frame
+before they are used; "Frame performance" below has the cost and the accuracy
+of each setting. The key is read when the effect is created.
+
 The default model directory is shown in the extraction command. Override it
 with `dlss5ModelPath` in the active config or `VKHOOK_DLSS5_MODEL`.
 Uninstalled builds also need the compiled asset directories:
@@ -261,7 +268,7 @@ debug shader reads the live optical-flow and reprojection buffers.
 | Value | View | Interpretation |
 | --- | --- | --- |
 | 0 | Off | Normal neural rendering. |
-| 1 | Optical flow | Raw current-to-previous displacement. Hue encodes direction: right red, down yellow-green, left cyan, up violet. Brightness encodes magnitude: zero is black, eight pixels is half brightness. |
+| 1 | Optical flow | Current-to-previous displacement as the reprojection reads it: the engine's vectors, refined when optical flow runs on a reduced image. Hue encodes direction: right red, down yellow-green, left cyan, up violet. Brightness encodes magnitude: zero is black, eight pixels is half brightness. |
 | 2 | History confidence | Green intensity is accepted-history confidence; black means no accepted history. Includes the frame-wide rejection gate. |
 | 3 | Reprojected history | The previous neural image warped into the current frame; rejected pixels are black. |
 | 4 | Temporal blend weight | Grayscale actual blend weight: neural sigmoid × history strength × confidence. Black means no explicit history blend; white means full history weight. |
@@ -269,7 +276,7 @@ debug shader reads the live optical-flow and reprojection buffers.
 The eight-pixel top strip reports **magenta** for temporal off/unavailable,
 **amber** for first/reset frames, **red** for frame rejection/no reuse, and
 **green** for an accepted frame. Off/unavailable and reset frames also show
-a matching checkerboard, not stale vectors. Raw flow may be meaningless on
+a matching checkerboard, not stale vectors. Flow may be meaningless on
 textureless surfaces; compare it with confidence rather than assuming every
 colored vector is used.
 
@@ -287,7 +294,13 @@ space are accepted; HDR is rejected. Alpha is preserved.
 
 VkHook has no engine motion-vector/reprojection inputs. Instead, the temporal
 path estimates current-to-previous and previous-to-current motion from the raw
-game image using NVIDIA hardware optical flow. It reprojects the previous neural
+game image using NVIDIA hardware optical flow, by default on a half-resolution
+copy from 1920×1080 up (`dlss5FlowResolution`). The engine resolves motion in
+pixels of the image it is given, so vectors of a reduced image are matched
+again on the full-resolution frame: each 4×4-cell vector is compared with the
+whole-pixel displacements up to two pixels around it and with its neighbours'
+vectors, and replaced only by one that matches clearly better. The path then
+reprojects the previous neural
 result with bounded Catmull-Rom filtering, rejecting out-of-bounds pixels,
 unreliable flow, inconsistent bidirectional motion, and photometric mismatches.
 A frame-wide consistency check rejects scene cuts without discarding a valid
@@ -299,7 +312,8 @@ frames, and submission gaps of 250 ms or more. First/reset frames and rejected
 pixels use OpenDLSS-NR's current-color no-history proxy. Disabling temporal
 bypasses optical flow, reprojection, and history reads/writes entirely.
 The normal path uses GPU semaphore/barrier synchronization, not CPU waits or
-readback, but adds two optical-flow passes plus conversion/reprojection work.
+readback, but adds two optical-flow passes plus conversion/reprojection work
+("Frame performance" below).
 
 Estimated flow is not engine velocity: disocclusions, transparency, lighting
 changes, HUD, and text remain imperfect inputs. HUD and text are processed as
@@ -340,17 +354,21 @@ The conditional Meson test `DLSS5 device feature preservation` covers applicatio
 feature preservation, promoted feature merging, duplicate loader nodes, input
 chain immutability, optional optical-flow negotiation, private/shared optical-queue
 selection (including protected/mixed-queue rejection), and unsupported-device
-rejection. The opt-in hardware test runs real optical flow and bridge shaders
-without proprietary weights:
+rejection. The opt-in hardware tests run real optical flow and bridge shaders
+without proprietary weights, at full and at half optical-flow resolution:
 
 ```bash
 VKHOOK_TEST_DLSS5_GPU=1 meson test -C build-gcc \
-  'DLSS5 optical-flow temporal GPU' --print-errorlogs
+  'DLSS5 optical-flow temporal GPU' \
+  'DLSS5 half-resolution optical-flow temporal GPU' --print-errorlogs
 ```
 
-On the RTX 5070 Ti, it recovered an 8×4-pixel translation, rejected disocclusion
+On the RTX 5070 Ti, the first recovered an 8×4-pixel translation, rejected disocclusion
 and scene-cut history, retained moving-object history on a textureless background,
 and checked temporal bypass, reset, alpha, zero intensity, and odd dimensions.
+The second runs the same checks on a 7×3-pixel translation, which a half-resolution
+engine input cannot represent: the engine alone put 0 of 759 vectors within a
+quarter pixel of it, the refined vectors 757.
 A full-model `vkcube` smoke also confirmed that the PTX graph consumes reprojected
 history and that live temporal off/on toggles bypass and restore reuse.
 Control's DX12 startup through Steam/CachyOS Proton was also exercised at
@@ -361,6 +379,145 @@ means the runtime path is unavailable, not that the image has no motion;
 check the `DLSS5 optical flow`/`DLSS5 temporal unavailable` startup messages.
 GPU inference requires the hardware above and locally extracted weights;
 lavapipe cannot prove it. These checks do not establish NVIDIA DLL parity.
+
+### Frame performance
+
+`vkhook-dlss5-frame-bench` (built with the backend) runs the effect's whole
+frame as a present does, through the `Dlss5Pipeline` the layer itself uses, on
+a private device without a window: the optical-flow hand-off between queues,
+flow refinement, reprojection, input features, the network, the composite and
+the copies.
+
+```bash
+B=build-gcc/src/vendor/opendlss_nr
+build-gcc/src/vkhook-dlss5-frame-bench --model build-gcc/dlss5-model-small \
+  --shaders "$B" --ptx "$B" --width 3840 --height 2160 --frames 150 \
+  --temporal 1 --pattern detail --motion 3.5,1.25
+```
+
+It prints the wall time of a frame from its first submission to its fence, the
+GPU span of the final submission, and the minimum and median of every stage.
+The source images show one picture moved by `--motion` pixels per frame
+(default `8,4`). `--pattern smooth|detail` selects a built-in picture, evaluated
+at the moved coordinates so that sub-pixel motion is real; `--image FILE` takes
+a raw RGBA8 frame instead and resamples it bilinearly. `--objects DX,DY` adds
+foreground squares with a motion of their own. `--flow-scale 0|1|2|4` is
+`dlss5FlowResolution` (0 is `auto`), `--flow-refine 0` leaves the engine's
+vectors as they are, and `--debug-view N --output FILE` writes the last frame
+as raw RGBA8, for example one of the debug views above.
+
+Whole frame with the small network on an RTX 5070 Ti: the least of 150 frames
+in three interleaved rounds, because another process shared the GPU. "Before"
+is the tree before this work (`f55ff11`). The current build ran the command
+above, whose motion sends every flow vector through the refinement's search:
+
+| Resolution | Temporal | Before | Now | Now, `dlss5FlowResolution = full` |
+| --- | --- | ---: | ---: | ---: |
+| 1920×1080 | off | 4.51 ms | 3.88 ms | |
+| 1920×1080 | on | 6.36 ms | 4.83 ms | 5.72 ms |
+| 2560×1440 | off | 6.91 ms | 5.83 ms | |
+| 2560×1440 | on | 9.98 ms | 7.32 ms | 8.95 ms |
+| 3840×2160 | off | 15.37 ms | 13.29 ms | |
+| 3840×2160 | on | 21.93 ms | 16.26 ms | 19.65 ms |
+
+The network's arithmetic did not change (its head is bit-identical, see
+below), so the gain is in the work around it, which at 3840×2160 with temporal
+history fell from 10.1 to 4.5 ms. The stages now, minimum in ms:
+
+| Stage | 1920×1080 | 2560×1440 | 3840×2160 |
+| --- | ---: | ---: | ---: |
+| Optical flow before the final submission (luma prepass, engine, queue hand-offs) | 0.67 | 0.99 | 1.86 |
+| Flow refinement | 0.10 | 0.15 | 0.36 |
+| Reprojection | 0.12 | 0.22 | 0.50 |
+| Input features | 0.13 | 0.24 | 0.55 |
+| Network | 3.54 | 5.28 | 11.75 |
+| Composite | 0.12 | 0.24 | 0.56 |
+| Output copy | 0.09 | 0.14 | 0.34 |
+
+What changed:
+
+- **Optical flow on a reduced image.** The engine's time follows the size of
+  its input: the part before the final submission takes 1.62 / 2.73 / 5.87 ms at
+  full resolution, 0.67 / 0.99 / 1.86 ms at half and 0.41 / 0.54 / 0.98 ms at a
+  quarter. The prepass box-filters luma to the engine's size, and the vectors
+  are then refined on the full-resolution frame (next section).
+- **F16 input features.** The preprocess shader writes the 16 feature channels
+  as the half floats the network's first kernel loads. The F32 buffer and the
+  conversion kernel are gone: 0.4 ms and 255 MiB less at 3840×2160.
+- **Less memory traffic around the network.** Preprocess stores whole vectors,
+  the composite recomputes the centred colour instead of reading the features
+  back, and the flow prepass and the frame share one packed copy of the source.
+
+Measured and left alone:
+
+- The network. Its output is held bit-identical, which fixes the arithmetic.
+  The full-resolution 32-channel blocks, 36% of the 4K network time, gain
+  nothing from more workgroups per SM: block 0 takes 2.39 / 1.66 / 1.43 / 1.41 ms
+  at 1 / 2 / 4 / 8 per SM.
+- The engine's performance level stays MEDIUM. FAST saved 0.12 ms at 1920×1080
+  and 0.41 ms at 3840×2160 on the half-resolution image and lost up to
+  12 points of accepted history; SLOW cost more and gained none.
+- Running the network every other frame and moving its last result along the
+  flow in between. With perfect whole-pixel motion the moved result is 44.9 dB
+  from a fresh one, but frames would alternate between 15.7 and 2.8 ms at
+  3840×2160. Spreading one inference over two frames instead needs the graph
+  split and disocclusion handling whose picture could not be judged here.
+
+#### Flow resolution and accuracy
+
+The engine answers in pixels of the image it is given, in 4×4-pixel cells. On
+a half-resolution image a motion of an odd number of source pixels falls
+between two of its pixels, and its vectors are then about a source pixel off.
+`dlss5_flow_refine.comp` therefore matches every vector of a reduced image
+again on full-resolution pixels: it compares the whole-pixel displacements up
+to two pixels around the vector, then the vectors of the four neighbouring
+cells, and for the backward vector the opposite of the forward one. A vector
+is replaced only when another matches clearly better, so the engine's
+sub-pixel answer stands on flat cells, along edges and between two pixels.
+
+Known translations of a real 2560×1440 frame; "history" is the reprojected
+history, where accepted, against the previous output moved by the true motion:
+
+| Motion per frame | Flow | Vector error (RMS) | History accepted | Accepted history vs truth |
+| --- | --- | ---: | ---: | ---: |
+| 8,4 | full | 0.05 px | 100.0% | 67.1 dB |
+| 8,4 | half, engine only | 0.05 px | 100.0% | 62.6 dB |
+| 8,4 | half | 0.05 px | 100.0% | 77.5 dB |
+| 7,3 | full | 0.06 px | 100.0% | 65.6 dB |
+| 7,3 | half, engine only | 1.09 px | 86.6% | 36.2 dB |
+| 7,3 | half | 0.54 px | 97.9% | 54.4 dB |
+| 7,3 | quarter, engine only | 1.16 px | 96.0% | 33.1 dB |
+| 7,3 | quarter | 0.39 px | 99.5% | 55.2 dB |
+| 17,9 | full | 0.08 px | 100.0% | 66.0 dB |
+| 17,9 | half, engine only | 1.11 px | 90.6% | 36.3 dB |
+| 17,9 | half | 0.59 px | 98.4% | 52.4 dB |
+
+With two motions in that frame (background 7,3, 128-pixel squares −5,1) the
+full-resolution engine kept 98.9% of the background's history and 90.8% of the
+squares', with 0.11% of the pixels accepted more than 8 code values from the
+truth. The half-resolution engine alone kept 84.5% and 75.4% with 7.69% wrong;
+refined, 95.0% and 84.6% with 0.65% wrong.
+
+Sub-pixel motion of the `detail` pattern (hard edges and 3-pixel stripes,
+which no vector reprojects exactly), as history accepted and accepted history
+against the truth:
+
+| Motion per frame | Full | Half, engine only | Half |
+| --- | ---: | ---: | ---: |
+| 5.25,2.75 | 98.7%, 37.5 dB | 83.4%, 28.2 dB | 94.6%, 35.4 dB |
+| 21.3,11.7 | 98.8%, 34.9 dB | 61.8%, 28.8 dB | 94.0%, 31.5 dB |
+| 3.5,1.25 | 68.1%, 31.1 dB | 86.3%, 29.4 dB | 71.3%, 30.6 dB |
+| 12.6,−6.3 | 85.5%, 32.1 dB | 91.3%, 29.4 dB | 71.8%, 29.6 dB |
+| 0.5,0.25 | 75.5%, 31.8 dB | 89.3%, 31.1 dB | 60.6%, 32.8 dB |
+
+Refined half-resolution flow is close to the full-resolution engine but is not
+it: on some sub-pixel motions of fine detail it accepts less history (the last
+two rows). `dlss5FlowResolution = full` runs the engine on the frame itself,
+without refinement and at the cost in the first table; its output is
+byte-identical to the previous implementation's. `quarter` costs less still
+(0.04 / 0.07 / 0.20 ms of refinement on top of the engine's time above), but
+its 16-pixel cells are coarse for small objects: in the two-motion scenes it
+kept 58–81% of the squares' history where `half` kept 83–88%.
 
 ### Network performance
 
@@ -430,24 +587,25 @@ a command buffer that is never submitted, learns which barrier-separated launche
 use each tensor, and binds tensors whose launch intervals never overlap to the
 same range of one allocation (64 KiB aligned, largest first). Unused tensors get
 no memory. Every later recording is checked against that plan and throws before
-recording a tensor outside its placed interval. The head stays valid after the
-recording; the caller's 16-channel F32 input features (510 MiB at 4K) keep their
-own memory. Only the debug capture options keep one allocation per tensor.
+recording; the caller's 16-channel input features keep their own memory. They
+are F16 since the network reads them as such (255 MiB at 4K; 510 MiB as F32
+before). Only the debug capture options keep one allocation per tensor.
 
 Peak process memory of `vkhook-dlss5-bench` (weights, network and input
 features; no swapchain, history or optical-flow images), RTX 5070 Ti, 30 frames:
 
-| Network | Resolution | Pooled activations | Before | After |
-| --- | --- | ---: | ---: | ---: |
-| small | 1920×1080 | 126 MiB | 1192 MiB | 669 MiB |
-| small | 2560×1440 | 215 MiB | 1754 MiB | 862 MiB |
-| small | 3840×2160 | 478 MiB | 3418 MiB | 1443 MiB |
-| original | 1920×1080 | 126 MiB | 1270 MiB | 745 MiB |
-| original | 2560×1440 | 215 MiB | 1832 MiB | 938 MiB |
-| original | 3840×2160 | 478 MiB | 3496 MiB | 1519 MiB |
+| Network | Resolution | Pooled activations | One allocation per tensor | Pooled | Pooled, F16 features |
+| --- | --- | ---: | ---: | ---: | ---: |
+| small | 1920×1080 | 126 MiB | 1192 MiB | 669 MiB | 601 MiB |
+| small | 2560×1440 | 215 MiB | 1754 MiB | 862 MiB | 747 MiB |
+| small | 3840×2160 | 478 MiB | 3418 MiB | 1443 MiB | 1188 MiB |
+| original | 1920×1080 | 126 MiB | 1270 MiB | 745 MiB | 677 MiB |
+| original | 2560×1440 | 215 MiB | 1832 MiB | 938 MiB | 823 MiB |
+| original | 3840×2160 | 478 MiB | 3496 MiB | 1519 MiB | 1264 MiB |
 
 With the effect and temporal history in an X11 `vkcube` at 3840×2028, peak
-process memory fell from 4872 to 2980 MiB. The head stayed bit-identical
+process memory fell from 4872 to 2980 MiB with pooling (not re-measured with
+F16 features). The head stayed bit-identical
 (`--compare`) at six resolutions from 1280×720 to 3840×2160, after 1 to 20
 frames, with `--chain 1`, under each `DLSS5VK_*` route switch, and for both
 networks. Interleaved 4K runs showed no GPU time change beyond noise.
