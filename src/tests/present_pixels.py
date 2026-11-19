@@ -135,10 +135,8 @@ def run_variant(binary, library, variant, work_root, app_args=()):
     text = layer_log.read_text(errors="replace")
     if "VkHook panic" in text:
         return bad("the layer panicked during the run")
-    if effect and not re.search(rf"\[effect-built\] {effect} passes=[1-9]", text):
-        # the baseline layer predates the marker; accept its own equivalent
-        if effect not in text:
-            return bad(f"{effect} was never built, the run exercised the pass-through path")
+    if effect and not re.search(rf"\[effect-built\] {re.escape(effect)}\.fx\|{re.escape(effect)} passes=[1-9]", text):
+        return bad(f"{effect} was never built, the run exercised the pass-through path")
     if proc.returncode != 0 or "RESULT PASS" not in out:
         return bad("pixel check failed: what the X server shows is not what the app rendered")
     summary = next(l for l in out.splitlines() if l.startswith("SUMMARY"))
