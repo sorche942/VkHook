@@ -31,90 +31,219 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Not run here: `just formal` (cd formal && lake build). The Lean models need a
+# built Veil checkout (Lean 4 toolchain, Mathlib and the z3/cvc5 solver builds,
+# tens of GB and an hour or more from cold) that a stock runner does not have,
+# and a cache of it would be larger than the runner's cache quota. Run it
+# locally before merging any change to a modeled protocol (AGENTS.md section 6).
+
 jobs:
+  # Build and unit tests with both compilers, plus the shader corpus once.
   build:
+    name: build (${{ matrix.cc }})
+    runs-on: ubuntu-26.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { cc: clang, cxx: clang++ }
+          - { cc: gcc, cxx: g++ }
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Install dependencies
+        run: scripts/ci-install-deps.sh build
+
+      - name: Configure
+        run: CC=${{ matrix.cc }} CXX=${{ matrix.cxx }} meson setup build --buildtype=release --prefix=/usr -Ddlss5=disabled
+
+      - name: Build layer and tests
+        run: meson compile -C build
+
+      - name: Unit tests
+        run: meson test -C build --print-errorlogs
+
+      - name: Restore shader package archives
+        if: matrix.cc == 'clang'
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684
+        with:
+          path: ~/.cache/vkhook-shader-archives
+          # the pins file names the exact commits, so it is the whole cache key
+          key: shader-archives-${{ hashFiles('src/tests/fixtures/effect-package-pins.ini', 'assets/EffectPackages.ini') }}
+
+      - name: Compile the ReShade shader corpus
+        if: matrix.cc == 'clang'
+        # The repository's own assets/EffectPackages.ini, with every package taken at the
+        # commit pinned in src/tests/fixtures/effect-package-pins.ini.
+        run: |
+          python3 src/tests/test_reshade_shaders.py \
+            --shader-check build/src/vkhook-shader-check \
+            --cache-dir ~/.cache/vkhook-shader-archives
+
+  # AddressSanitizer + UndefinedBehaviorSanitizer over the whole suite.
+  asan-ubsan:
+    name: ASan + UBSan
     runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
 
       - name: Install dependencies
+        run: scripts/ci-install-deps.sh build
+
+      - name: Configure
         run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends -y \
-            clang \
-            glslang-tools \
-            libvulkan-dev \
-            libx11-dev \
-            libxi-dev \
-            libxtst-dev \
-            libwayland-dev \
-            libxkbcommon-dev \
-            meson \
-            pkg-config \
-            spirv-headers \
-            wayland-protocols
+          # -fno-sanitize-recover makes the first undefined-behaviour report fail the test
+          # instead of printing and carrying on.
+          CC=clang CXX=clang++ meson setup build --buildtype=debugoptimized -Ddlss5=disabled \
+            -Db_sanitize=address,undefined -Db_lundef=false \
+            -Dc_args=-fno-sanitize-recover=undefined -Dcpp_args=-fno-sanitize-recover=undefined
 
-      - name: Generate build inputs
-        run: CC=clang CXX=clang++ meson setup --buildtype=release --prefix=/usr build
-
-      - name: Build project and tests
+      - name: Build
         run: meson compile -C build
 
-      - name: Run config serialization tests
+      - name: Unit tests
+        env:
+          ASAN_OPTIONS: detect_leaks=1:strict_string_checks=1:detect_stack_use_after_return=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
         run: meson test -C build --print-errorlogs
 
-      - name: Compile ReShade EffectPackages shaders
-        run: python3 src/tests/test_reshade_shaders.py --shader-check build/src/vkhook-shader-check
+  # ThreadSanitizer over the tests that exist to hammer a lock: the persistence queue,
+  # the retire queue, the syncobj gate, the overlay command queue, the config store and
+  # serializer caches, the compile cache and the depth copy state. They carry the meson suite `threaded`.
+  tsan:
+    name: TSan (threaded tests)
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
 
-      - name: Install smoke test dependencies
-        run: |
-          # xauth is named explicitly because it is only a Recommends of xvfb, and
-          # --no-install-recommends leaves it out. xvfb-run shells out to xauth to
-          # authorise the display it starts, so without it the wrapper dies before
-          # vkcube ever runs and the step fails with nothing useful in the log.
-          sudo apt-get install --no-install-recommends -y \
-            mesa-vulkan-drivers \
-            vulkan-tools \
-            xauth \
-            xvfb
+      - name: Install dependencies
+        run: scripts/ci-install-deps.sh build
 
-      - name: Smoke test the layer under vkcube
+      - name: Allow ThreadSanitizer's shadow memory mapping
+        # runners ship vm.mmap_rnd_bits=32, which makes TSan abort at startup
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+
+      - name: Configure
         run: |
-          # A runner has no GPU, so lavapipe supplies a software Vulkan
-          # implementation, and xvfb supplies the display vkcube needs to open a
-          # window. The script fails the build when the loader never picked up
-          # the freshly built layer, so a green run cannot be a vacuous one where
-          # the layer silently never loaded and vkcube ran untouched.
-          command -v xauth >/dev/null || { echo "xauth missing; xvfb-run cannot work" >&2; exit 1; }
-          # Two things vary by distro. Ubuntu ships an arch-independent
-          # lvp_icd.json where Fedora ships lvp_icd.x86_64.json, so the pattern
-          # must not require a suffix. And several distros ship i686 alongside
-          # the native build, so a bare head -1 can pick the 32-bit driver and
-          # then vkcube reports no compatible ICD. Prefer the native arch, fall
-          # back to the unsuffixed one, and never take an i686 ICD.
-          ICD_DIR=/usr/share/vulkan/icd.d
-          LVP_ICD=""
-          for candidate in "$ICD_DIR/lvp_icd.$(uname -m).json" "$ICD_DIR/lvp_icd.json"; do
-            if [ -f "$candidate" ]; then LVP_ICD="$candidate"; break; fi
-          done
-          if [ -z "$LVP_ICD" ]; then
-            LVP_ICD=$(ls "$ICD_DIR"/lvp_icd*.json 2>/dev/null | grep -v i686 | head -1)
-          fi
-          if [ -z "$LVP_ICD" ]; then
-            echo "lavapipe ICD not found; mesa-vulkan-drivers did not install" >&2
-            ls /usr/share/vulkan/icd.d/ >&2
-            exit 1
-          fi
-          echo "using software vulkan: $LVP_ICD"
-          VK_ICD_FILENAMES="$LVP_ICD" xvfb-run -a src/tests/smoke_vkcube.sh build/src/libvkhook.so 11
+          CC=clang CXX=clang++ meson setup build --buildtype=debugoptimized -Ddlss5=disabled \
+            -Db_sanitize=thread -Db_lundef=false
+
+      - name: Build
+        run: meson compile -C build
+
+      - name: Threaded tests
+        env:
+          TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
+        run: meson test -C build --suite threaded --print-errorlogs
+
+  # The layer under vkcube on a software Vulkan implementation: it must load, build
+  # an effect, survive, and (with validation on) report no validation errors; then
+  # the pixel readback test proves what is presented is the game's frame.
+  smoke:
+    name: smoke (lavapipe, Xvfb)
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Install dependencies
+        run: scripts/ci-install-deps.sh build smoke
+
+      - name: Select the lavapipe ICD
+        run: echo "VK_ICD_FILENAMES=$(scripts/ci-lavapipe-icd.sh)" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: |
+          CC=clang CXX=clang++ meson setup build --buildtype=debugoptimized -Ddlss5=disabled
+          meson compile -C build
+
+      - name: Smoke test under vkcube, with Khronos validation
+        # The script fails when the loader never picked up the freshly built layer, so a
+        # green run cannot be one where the layer silently never loaded. With
+        # VKHOOK_SMOKE_VALIDATION=1 it also inserts VK_LAYER_KHRONOS_validation, checks the
+        # loader's insert line and fails on any validation error.
+        # WAYLAND_DISPLAY is unset so vkcube takes the X11 path on Xvfb.
+        run: |
+          env -u WAYLAND_DISPLAY VKHOOK_SMOKE_VALIDATION=1 \
+            xvfb-run -a src/tests/smoke_vkcube.sh build/src/libvkhook.so 11
+
+      - name: Pixel readback test
+        # Presents changing frames through the layer (depth capture off, no depth buffer,
+        # present-mode and format changes) and reads the window back from the X server.
+        run: env -u WAYLAND_DISPLAY meson test -C build 'present pixels' --print-errorlogs
 
       - name: Report smoke test diagnostics
         if: failure()
         run: |
           # the script deliberately keeps its temp dir on failure, so print what it
           # found rather than leaving the next person with a bare red step
-          for log in /tmp/tmp.*/vkcube.log; do
+          for log in /tmp/tmp.*/vkcube.log /tmp/tmp.*/*.log; do
             [ -f "$log" ] || continue
             echo "=== $log ==="
             cat "$log"
           done
+
+  # The i686 layer, built with Zig as the packaged one is (docs/WORKFLOWS.md).
+  i686:
+    name: i686 (Zig)
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Install dependencies
+        run: scripts/ci-install-deps.sh build i686
+
+      - name: Install Zig
+        run: |
+          curl --fail --location --silent --show-error -o zig.tar.xz \
+            https://ziglang.org/download/0.17.1/zig-x86_64-linux-0.17.1.tar.xz
+          echo "3581863e3cbcfd0fce0efc682ce7e9e93da96668a977791d356a26d2a7e9b17a  zig.tar.xz" | sha256sum -c -
+          mkdir "$HOME/zig"
+          tar -xJf zig.tar.xz -C "$HOME/zig" --strip-components=1
+          echo "$HOME/zig" >> "$GITHUB_PATH"
+
+      - name: Build
+        run: scripts/build-i686.sh build-i686 -Ddlss5=disabled
+
+      - name: Unit tests
+        run: meson test -C build-i686 --print-errorlogs
+
+  # -Ddlss5=enabled must keep compiling. Compile only: the backend needs an NVIDIA GPU.
+  # The Vulkan headers and glslang are built at pinned commits because the distribution
+  # packages do not reliably carry VK_EXT_shader_float8 or glslang >= 16.6.
+  dlss5:
+    name: DLSS5 build (-Ddlss5=enabled)
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Install dependencies
+        run: scripts/ci-install-deps.sh build dlss5
+
+      - name: Build pinned Vulkan headers and glslang
+        run: |
+          prefix="$HOME/toolchain"
+          git clone --quiet https://github.com/KhronosGroup/Vulkan-Headers.git vulkan-headers
+          git -C vulkan-headers checkout --quiet 8864cdc896bbc2a9b6eb36b3218fc9ef57908d77   # v1.4.350
+          cmake -S vulkan-headers -B vulkan-headers/build -G Ninja -DCMAKE_INSTALL_PREFIX="$prefix"
+          cmake --install vulkan-headers/build
+          git clone --quiet https://github.com/KhronosGroup/glslang.git glslang
+          git -C glslang checkout --quiet e1b562a8bed273a02f30b59b66a5d499793cede5           # 16.6.0
+          cmake -S glslang -B glslang/build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$prefix" -DBUILD_EXTERNAL=OFF -DENABLE_OPT=OFF -DGLSLANG_TESTS=OFF
+          cmake --build glslang/build
+          cmake --install glslang/build
+          echo "$prefix/bin" >> "$GITHUB_PATH"
+          echo "CPPFLAGS=-I$prefix/include" >> "$GITHUB_ENV"
+          echo "VK_REGISTRY=$prefix/share/vulkan/registry/vk.xml" >> "$GITHUB_ENV"
+
+      - name: Configure
+        run: |
+          CC=clang CXX=clang++ meson setup build --buildtype=release -Ddlss5=enabled \
+            -Ddlss5_vulkan_registry="$VK_REGISTRY"
+
+      - name: Build
+        run: meson compile -C build

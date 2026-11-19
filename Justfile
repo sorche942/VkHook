@@ -23,6 +23,36 @@ flatpak_repo_dir := repo_root / "build/flatpak-repo"
 formal:
     cd {{ repo_root }}/formal && lake build
 
+# Unit tests (no GPU).
+test:
+    meson test -C {{ build_dir }} --print-errorlogs
+
+# The layer under vkcube on Xvfb (set VK_ICD_FILENAMES for lavapipe; VKHOOK_SMOKE_VALIDATION=1 adds Khronos validation).
+smoke seconds='11':
+    env -u WAYLAND_DISPLAY xvfb-run -a src/tests/smoke_vkcube.sh {{ build_dir }}/src/libvkhook.so {{ seconds }}
+
+# Pixel readback: what the X server shows must be the frames the app rendered.
+pixels:
+    meson test -C {{ build_dir }} 'present pixels' --print-errorlogs
+
+# Sanitizer builds in their own build dirs: asan (+UBSan) runs everything, tsan the threaded suite.
+sanitize kind='asan':
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dir={{ repo_root }}/build-{{ kind }}
+    case {{ kind }} in
+      asan) opts="-Db_sanitize=address,undefined"; suite="" ;;
+      tsan) opts="-Db_sanitize=thread"; suite="--suite threaded" ;;
+      *) echo "kind is asan or tsan" >&2; exit 2 ;;
+    esac
+    [ -f "$dir/build.ninja" ] || CC=clang CXX=clang++ meson setup "$dir" {{ repo_root }} \
+      --buildtype=debugoptimized -Ddlss5=disabled -Db_lundef=false $opts
+    meson test -C "$dir" $suite --print-errorlogs
+
+# Cross-compile the i686 layer with Zig (docs/WORKFLOWS.md, "Building the i686 layer").
+i686:
+    scripts/build-i686.sh {{ repo_root }}/build-i686
+
 flatpak-build:
     flatpak-builder \
       --force-clean \

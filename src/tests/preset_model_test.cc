@@ -211,7 +211,9 @@ namespace
 
         const auto* mxao = find(stack, "qUINT_mxao");
         expect(mxao && mxao->type == "qUINT_mxao.fx" && mxao->enabled, "MXAO lands on the installed file");
-        expect(mxao && mxao->techniques == std::vector<PresetTechnique>{{"MXAO", true}},
+        // named, not a temporary: GCC 16 reports a false -Wdangling-pointer on the temporary
+        const std::vector<PresetTechnique> mxaoTechniques{{"MXAO", true}};
+        expect(mxao && mxao->techniques == mxaoTechniques,
                "technique name is kept apart from the instance name");
         expect(mxao && macro(mxao->macros, "MXAO_MIPLEVEL_IL") == "2", "per-effect definitions parse");
         expect(mxao && param(*mxao, "MXAO_SAMPLE_RADIUS") &&
@@ -261,8 +263,8 @@ namespace
         expect(names(stack) == std::vector<std::string>({"LumaStack", "Vibrance"}),
                "several techniques of one file are one instance");
         const auto* luma = find(stack, "LumaStack");
-        expect(luma && luma->techniques ==
-                           std::vector<PresetTechnique>({{"LumaPre", true}, {"LumaPost", true}, {"LumaDebug", false}}),
+        const std::vector<PresetTechnique> lumaTechniques{{"LumaPre", true}, {"LumaPost", true}, {"LumaDebug", false}};
+        expect(luma && luma->techniques == lumaTechniques,
                "every technique of the file is kept, with its own enabled flag");
         const SerializedPreset out = serialize(stack);
         expect(out.ini.find("Techniques=LumaPre@LumaStack.fx,LumaPost@LumaStack.fx,Vibrance@Vibrance.fx\n") !=

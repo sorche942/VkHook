@@ -57,12 +57,15 @@ local_ini="$build.cross-local.ini"
     echo "[built-in options]"
     echo "c_args = ['-idirafter', '$include']"
     echo "cpp_args = ['-idirafter', '$include']"
+    # System 32-bit libraries are built against a newer glibc than the 2.34 the layer
+    # targets (for example __isoc23_strtol@GLIBC_2.38 in libxkbcommon); they only need to
+    # resolve at run time on the host, so the cross link must not reject them.
+    link="'-Wl,--allow-shlib-undefined'"
     if [[ -n "${VKHOOK_I686_DEPS:-}" ]]; then
-        # The extracted libraries were built against a newer glibc than the 2.34 the
-        # layer targets; they only need to resolve at run time on the host.
-        echo "c_link_args = ['-Wl,-rpath,\$ORIGIN/runtime-libs', '-Wl,--allow-shlib-undefined']"
-        echo "cpp_link_args = ['-Wl,-rpath,\$ORIGIN/runtime-libs', '-Wl,--allow-shlib-undefined']"
+        link="'-Wl,-rpath,\$ORIGIN/runtime-libs', $link"
     fi
+    echo "c_link_args = [$link]"
+    echo "cpp_link_args = [$link]"
 } >"$local_ini"
 
 if [[ ! -f "$build/build.ninja" ]]; then

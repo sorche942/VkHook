@@ -341,7 +341,7 @@ endif
 config_serializer_tests = executable('vkhook-config-serializer-tests',
     'tests/config_serializer_test.cc',
     dependencies : vkhook_core_dep)
-test('config serializer', config_serializer_tests)
+test('config serializer', config_serializer_tests, suite : ['threaded'])
 
 # The preset model (parse/serialize of ReShade presets plus the VkHook sidecar) is
 # pure: golden files in tests/fixtures/presets pin the on-disk format.
