@@ -91,8 +91,17 @@ namespace VkHook
         // Position/size the capture surface to cover every hitbox in the list and
         // set its input region to the union, so popups that stick out past the main
         // window are captured too. Pass nullptr/0 to disable it (empty region),
-        // letting the pointer pass through to the game.
+        // letting the pointer pass through to the game. Rects are in framebuffer
+        // pixels, like everything the overlay draws.
         void setCaptureRects(const InputRect* rects, int count);
+
+        // The overlay's framebuffer (the swapchain extent) for this frame. With
+        // the game's buffer scale or viewport it gives the framebuffer pixels per
+        // surface-local unit, which the pointer and capture surface are mapped by.
+        void setFramebufferExtent(uint32_t width, uint32_t height);
+        // Framebuffer pixels per surface-local unit, per axis (1 until known).
+        double framebufferPerLogicalX() const { return m_fbPerLogicalX.load(std::memory_order_acquire); }
+        double framebufferPerLogicalY() const { return m_fbPerLogicalY.load(std::memory_order_acquire); }
 
         // Destroys every protocol object, newest first (see ReleaseStack), and
         // the keyboard state. The next poll creates them again.
@@ -178,14 +187,20 @@ namespace VkHook
         int m_inputShmFd = -1;
         int m_inputBufferWidth = 0;
         int m_inputBufferHeight = 0;
+        // the capture surface's position in surface-local units
         float m_inputSurfaceX = 0.0f;
         float m_inputSurfaceY = 0.0f;
         CaptureAttachment m_attachment;
         // the hitboxes last requested, and the ones the compositor has; they
         // differ only until the next publish, so an unchanged overlay does not
-        // churn the compositor every frame
+        // churn the compositor every frame. The scale they were published at
+        // is part of that: the same rects map elsewhere at another scale.
         std::vector<InputRect> m_desiredRects;
         std::vector<InputRect> m_publishedRects;
+        double m_publishedPerLogicalX = 0.0;
+        double m_publishedPerLogicalY = 0.0;
+        std::atomic<double> m_fbPerLogicalX{1.0};
+        std::atomic<double> m_fbPerLogicalY{1.0};
 
         std::atomic<bool> m_keyboardFocus{false};
         std::atomic<bool> m_pointerFocus{false};

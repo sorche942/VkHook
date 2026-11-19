@@ -581,6 +581,7 @@ namespace VkHook
         const InputRect captureRect{0.0f, 0.0f, static_cast<float>(width), static_cast<float>(height)};
         if (input)
         {
+            input->setFramebufferExtent(width, height);
             input->setBlocked(captureInput);
             input->setInteractive(captureInput);
             input->setWaylandCaptureRects(captureInput ? &captureRect : nullptr, captureInput ? 1 : 0);

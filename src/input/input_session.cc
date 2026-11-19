@@ -360,12 +360,21 @@ namespace VkHook
             m_wayland->setCaptureRects(rects, count);
     }
 
+    void InputSession::setFramebufferExtent(uint32_t width, uint32_t height)
+    {
+        if (m_wayland && !m_destroyed.load(std::memory_order_acquire))
+            m_wayland->setFramebufferExtent(width, height);
+    }
+
     // ── game pointer, fed by the Wayland interposer ──────────────────────────
 
     void InputSession::noteGamePointer(double x, double y)
     {
-        m_gamePointerX.store(x, std::memory_order_release);
-        m_gamePointerY.store(y, std::memory_order_release);
+        // hitboxes are in framebuffer pixels
+        const double perX = m_wayland ? m_wayland->framebufferPerLogicalX() : 1.0;
+        const double perY = m_wayland ? m_wayland->framebufferPerLogicalY() : 1.0;
+        m_gamePointerX.store(x * perX, std::memory_order_release);
+        m_gamePointerY.store(y * perY, std::memory_order_release);
     }
 
     bool InputSession::gamePointerBlocked() const

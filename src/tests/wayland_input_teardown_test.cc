@@ -39,6 +39,14 @@ namespace VkHook
     void withholdGameKeys(bool)
     {
     }
+
+    // The game drew a 3840x2160 swapchain into a 2259x1271 window, as SDL does
+    // on a 1.7 output scale with wp_viewport.
+    void gameSurfaceLogicalSize(wl_proxy*, uint32_t bufferWidth, uint32_t bufferHeight, double& width, double& height)
+    {
+        width = bufferWidth * (2259.0 / 3840.0);
+        height = bufferHeight * (1271.0 / 2160.0);
+    }
 } // namespace VkHook
 
 namespace
@@ -91,6 +99,9 @@ namespace
         std::mutex mutex;
         std::vector<SubsurfaceEvent> subsurfaceEvents;
         std::atomic<int> liveSubsurfaces{0};
+        // the latest capture buffer and subsurface position the client sent
+        std::atomic<int> bufferWidth{0}, bufferHeight{0};
+        std::atomic<int> positionX{-1}, positionY{-1};
     };
 
     Server server;
@@ -128,6 +139,17 @@ namespace
                 close(args[arg].h);
             }
             ++arg;
+        }
+
+        if (std::strcmp(iface, "wl_shm_pool") == 0 && std::strcmp(message->name, "create_buffer") == 0)
+        {
+            server.bufferWidth = args[2].i;
+            server.bufferHeight = args[3].i;
+        }
+        if (std::strcmp(iface, "wl_subsurface") == 0 && std::strcmp(message->name, "set_position") == 0)
+        {
+            server.positionX = args[0].i;
+            server.positionY = args[1].i;
         }
 
         if (std::strcmp(message->name, "destroy") == 0 || std::strcmp(message->name, "release") == 0)
@@ -302,6 +324,21 @@ int main()
                   "the new capture hangs off the new surface");
         }
         check(server.liveSubsurfaces.load() == 1, "exactly one capture subsurface is live");
+
+        // The overlay's hitboxes are framebuffer pixels; the subsurface lives in
+        // the window's surface-local units. A full-frame capture must cover the
+        // window exactly: sized in pixels it grew the window 1.7x, and the game
+        // answered with a bigger swapchain.
+        input.setFramebufferExtent(3840, 2160);
+        const VkHook::InputRect fullFrame{0.0f, 0.0f, 3840.0f, 2160.0f};
+        input.setCaptureRects(&fullFrame, 1);
+        wl_display_roundtrip(display);
+        check(eventually([] { return server.bufferWidth.load() == 2259 && server.bufferHeight.load() == 1271; }),
+              "a full-frame capture is the window's logical size, not its pixel size");
+        check(eventually([] { return server.positionX.load() == 0 && server.positionY.load() == 0; }),
+              "and sits at the window's origin");
+        check(input.framebufferPerLogicalX() > 1.69 && input.framebufferPerLogicalX() < 1.71,
+              "pointer coordinates are scaled by the framebuffer's pixels per logical unit");
 
         input.shutdown();
         check(eventually([] { return server.liveSubsurfaces.load() == 0; }),

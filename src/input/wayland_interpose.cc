@@ -84,6 +84,124 @@ namespace VkHook
         std::lock_guard<std::mutex> lock(proxyMutex);
         return overlayProxies.count(proxy) > 0;
     }
+
+    // What the game told the compositor about the size of each of its surfaces:
+    // wl_surface.set_buffer_scale and the wp_viewport destination. Surface-local
+    // (logical) coordinates differ from buffer pixels by exactly this, which is
+    // what the overlay needs to map the pointer and its capture surface.
+    namespace
+    {
+        struct SurfaceSizing
+        {
+            int32_t bufferScale = 1;
+            int32_t destinationWidth = -1;  // -1: unset, the buffer decides
+            int32_t destinationHeight = -1;
+        };
+
+        std::mutex sizingMutex;
+        std::unordered_map<wl_proxy*, SurfaceSizing> surfaceSizing;
+        std::unordered_map<wl_proxy*, wl_proxy*> viewportSurface;  // wp_viewport -> its wl_surface
+    } // namespace
+
+    void gameSurfaceLogicalSize(wl_proxy* surface, uint32_t bufferWidth, uint32_t bufferHeight,
+                                double& width, double& height)
+    {
+        SurfaceSizing sizing;
+        {
+            std::lock_guard<std::mutex> lock(sizingMutex);
+            auto it = surfaceSizing.find(surface);
+            if (it != surfaceSizing.end())
+                sizing = it->second;
+        }
+        if (sizing.destinationWidth > 0 && sizing.destinationHeight > 0)
+        {
+            width = sizing.destinationWidth;
+            height = sizing.destinationHeight;
+            return;
+        }
+        const int32_t scale = std::max(sizing.bufferScale, 1);
+        width = static_cast<double>(bufferWidth) / scale;
+        height = static_cast<double>(bufferHeight) / scale;
+    }
+
+    // A viewport the game created before this library was loaded has no known
+    // surface. Its set_destination is double-buffered state of that surface, and
+    // the game commits the surface right after, on the same thread: the next
+    // commit from that thread names the surface.
+    namespace
+    {
+        struct PendingDestination
+        {
+            wl_proxy* viewport = nullptr;
+            int32_t width = -1;
+            int32_t height = -1;
+        };
+        thread_local PendingDestination pendingDestination;
+    } // namespace
+
+    // Called for every request before it is sent (and once more after a
+    // get_viewport, with `created` its new proxy). Only the few requests that
+    // size a surface are looked at.
+    static void noteSizingRequest(wl_proxy* proxy, uint32_t opcode, uint32_t flags, const wl_argument* args,
+                                  wl_proxy* created)
+    {
+        const bool destroy = (flags & WL_MARSHAL_FLAG_DESTROY) != 0;
+        if (!destroy && opcode != 1 && opcode != 2 && opcode != 6 && opcode != 8)
+            return;
+        if (opcode == 6 && !pendingDestination.viewport)
+            return;  // the common case: a commit with nothing to attribute
+        const char* cls = wl_proxy_get_class(proxy);
+        if (!cls)
+            return;
+
+        std::lock_guard<std::mutex> lock(sizingMutex);
+        if (std::strcmp(cls, "wl_surface") == 0)
+        {
+            if (destroy)
+                surfaceSizing.erase(proxy);
+            else if (opcode == 8)  // set_buffer_scale
+                surfaceSizing[proxy].bufferScale = args[0].i;
+            else if (opcode == 6 && pendingDestination.viewport)  // commit
+            {
+                viewportSurface[pendingDestination.viewport] = proxy;
+                SurfaceSizing& sizing = surfaceSizing[proxy];
+                sizing.destinationWidth = pendingDestination.width;
+                sizing.destinationHeight = pendingDestination.height;
+                pendingDestination = {};
+            }
+        }
+        else if (std::strcmp(cls, "wp_viewporter") == 0)
+        {
+            if (opcode == 1 && created && args[1].o)  // get_viewport(new_id, surface)
+                viewportSurface[created] = reinterpret_cast<wl_proxy*>(args[1].o);
+        }
+        else if (std::strcmp(cls, "wp_viewport") == 0)
+        {
+            auto it = viewportSurface.find(proxy);
+            if (it == viewportSurface.end())
+            {
+                if (destroy && pendingDestination.viewport == proxy)
+                    pendingDestination = {};
+                else if (opcode == 2)
+                    pendingDestination = {proxy, args[0].i, args[1].i};
+                return;
+            }
+            if (destroy)
+            {
+                // a destroyed viewport takes its destination with it
+                auto sizing = surfaceSizing.find(it->second);
+                if (sizing != surfaceSizing.end())
+                    sizing->second.destinationWidth = sizing->second.destinationHeight = -1;
+                viewportSurface.erase(it);
+            }
+            else if (opcode == 2)  // set_destination(width, height)
+            {
+                SurfaceSizing& sizing = surfaceSizing[it->second];
+                sizing.destinationWidth = args[0].i;
+                sizing.destinationHeight = args[1].i;
+            }
+        }
+    }
 } // namespace VkHook
 
 // Pointer position and overlay hit tests live in the current InputSession: the
@@ -711,12 +829,19 @@ wl_proxy* wl_proxy_marshal_array_flags(struct wl_proxy* proxy,
         const char* cls = wl_proxy_get_class(proxy);
         if (cls && std::strcmp(cls, "wl_surface") == 0)
         {
+            VkHook::noteSizingRequest(proxy, opcode, flags, args, nullptr);
             VkHook::WaylandSyncobjGate::CommitScope commit(wl_proxy_get_id(proxy));
             return real(proxy, opcode, iface, version, flags, args);
         }
     }
 
-    return real(proxy, opcode, iface, version, flags, args);
+    // Surface sizing requests are noted before the send: a destroying request
+    // frees the proxy. get_viewport is noted after, once its proxy exists.
+    VkHook::noteSizingRequest(proxy, opcode, flags, args, nullptr);
+    wl_proxy* created = real(proxy, opcode, iface, version, flags, args);
+    if (opcode == 1 && created)
+        VkHook::noteSizingRequest(proxy, opcode, flags, args, created);
+    return created;
 }
 
 extern "C" __attribute__((visibility("default")))

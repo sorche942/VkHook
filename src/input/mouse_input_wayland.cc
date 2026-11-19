@@ -101,16 +101,16 @@ namespace VkHook
         };
     };
 
-    // Events on our capture surface are surface-local; shift them into the
-    // game's framebuffer space, which is what ImGui draws in. Caller holds
-    // m_mouseMutex.
+    // Events are surface-local, on our capture surface or the game's; map them
+    // into the game's framebuffer pixels, which is what ImGui draws in. Caller
+    // holds m_mouseMutex.
     void WaylandInput::setPointerPosition(int32_t sx, int32_t sy)
     {
         const bool onInputSurface = m_inputSurface != nullptr && m_pointerFocusSurface == m_inputSurface;
-        const int originX = onInputSurface ? static_cast<int>(m_inputSurfaceX) : 0;
-        const int originY = onInputSurface ? static_cast<int>(m_inputSurfaceY) : 0;
-        m_pointerX = wl_fixed_to_int(sx) + originX;
-        m_pointerY = wl_fixed_to_int(sy) + originY;
+        const double originX = onInputSurface ? m_inputSurfaceX : 0.0;
+        const double originY = onInputSurface ? m_inputSurfaceY : 0.0;
+        m_pointerX = static_cast<int>((wl_fixed_to_double(sx) + originX) * framebufferPerLogicalX());
+        m_pointerY = static_cast<int>((wl_fixed_to_double(sy) + originY) * framebufferPerLogicalY());
     }
 
     void WaylandInput::onPointerEnter(wl_surface* surface, int32_t sx, int32_t sy)

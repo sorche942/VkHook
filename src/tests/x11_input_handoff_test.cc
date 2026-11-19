@@ -27,6 +27,11 @@ namespace VkHook
     void registerOverlayProxy(wl_proxy*) {}
     void unregisterOverlayProxy(wl_proxy*) {}
     void withholdGameKeys(bool) {}
+    void gameSurfaceLogicalSize(wl_proxy*, uint32_t w, uint32_t h, double& width, double& height)
+    {
+        width = w;
+        height = h;
+    }
 }
 
 static void pump(Display* d, const char* tag, int* sawPress, int* sawRelease, int* sawGrabFocus)

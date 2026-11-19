@@ -101,13 +101,17 @@ namespace VkHook
         KeyboardState keyboardState();
         MouseState mouseState();
 
-        // Hitboxes of the Wayland capture subsurface; no-op on X11.
+        // Hitboxes of the Wayland capture subsurface, in framebuffer pixels; no-op on X11.
         void setWaylandCaptureRects(const InputRect* rects, int count);
+        // The overlay framebuffer's size, which Wayland maps surface-local
+        // coordinates to; no-op on X11, where both are pixels.
+        void setFramebufferExtent(uint32_t width, uint32_t height);
 
         // --- game pointer, fed by the Wayland interposer ---
-        // The game's own pointer position (surface-local) and whether it sits
-        // where the overlay owns input. Buttons are mirrored because the game's
-        // implicit grab delivers releases our private pointer never sees.
+        // The game's own pointer position (surface-local, stored in framebuffer
+        // pixels) and whether it sits where the overlay owns input. Buttons are
+        // mirrored because the game's implicit grab delivers releases our
+        // private pointer never sees.
         void noteGamePointer(double x, double y);
         bool gamePointerBlocked() const;
         void mirrorGameButton(uint32_t button, bool pressed);

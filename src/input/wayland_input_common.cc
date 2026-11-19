@@ -7,6 +7,7 @@
 #include <wayland-client.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 
@@ -364,17 +365,43 @@ namespace VkHook
         publishCaptureRects();
     }
 
+    void WaylandInput::setFramebufferExtent(uint32_t width, uint32_t height)
+    {
+        const uintptr_t parent = m_parentAtomic.load(std::memory_order_acquire);
+        if (!parent || width == 0 || height == 0)
+            return;
+        double logicalWidth = 0.0, logicalHeight = 0.0;
+        gameSurfaceLogicalSize(reinterpret_cast<wl_proxy*>(parent), width, height, logicalWidth, logicalHeight);
+        if (logicalWidth <= 0.0 || logicalHeight <= 0.0)
+            return;
+        const double perX = width / logicalWidth;
+        const double perY = height / logicalHeight;
+        const bool changedX = m_fbPerLogicalX.exchange(perX, std::memory_order_acq_rel) != perX;
+        const bool changedY = m_fbPerLogicalY.exchange(perY, std::memory_order_acq_rel) != perY;
+        if (changedX || changedY)
+        {
+            Logger::debug([&] {
+                return "Wayland: framebuffer " + std::to_string(width) + "x" + std::to_string(height) + " in a "
+                    + std::to_string(logicalWidth) + "x" + std::to_string(logicalHeight) + " surface";
+            });
+        }
+    }
+
     void WaylandInput::publishCaptureRects()
     {
         if (!m_inputSurface)
             return;
 
         // the overlay calls this every frame; only churn the compositor when the
-        // hitbox set actually changes.
+        // hitbox set or the scale it maps by actually changes.
         const std::vector<InputRect>& valid = m_desiredRects;
-        if (valid == m_publishedRects)
+        const double perX = framebufferPerLogicalX();
+        const double perY = framebufferPerLogicalY();
+        if (valid == m_publishedRects && perX == m_publishedPerLogicalX && perY == m_publishedPerLogicalY)
             return;
         m_publishedRects = valid;
+        m_publishedPerLogicalX = perX;
+        m_publishedPerLogicalY = perY;
 
         // a region is immutable once handed to set_input_region, so rebuild it.
         if (m_inputRegion)
@@ -396,34 +423,46 @@ namespace VkHook
             return;
         }
 
+        // Hitboxes are in framebuffer pixels; the subsurface and its region are
+        // surface-local. Outward rounding keeps every hitbox covered, and a
+        // capture surface no larger than the window keeps the window's size.
+        struct LogicalRect
+        {
+            int x0, y0, x1, y1;
+        };
+        auto toLogical = [&](const InputRect& r) {
+            return LogicalRect{static_cast<int>(std::floor(r.x / perX)), static_cast<int>(std::floor(r.y / perY)),
+                               static_cast<int>(std::ceil((r.x + r.width) / perX)),
+                               static_cast<int>(std::ceil((r.y + r.height) / perY))};
+        };
+
         // the capture surface is one rectangle, so cover the bounding box of
         // every hitbox and add each one to the region. popups stick out past the
         // main window, and this is what keeps them from leaking to the game.
-        float minX = valid[0].x, minY = valid[0].y;
-        float maxX = valid[0].x + valid[0].width, maxY = valid[0].y + valid[0].height;
+        LogicalRect bounds = toLogical(valid[0]);
         for (const InputRect& r : valid)
         {
-            minX = std::min(minX, r.x);
-            minY = std::min(minY, r.y);
-            maxX = std::max(maxX, r.x + r.width);
-            maxY = std::max(maxY, r.y + r.height);
+            const LogicalRect l = toLogical(r);
+            bounds.x0 = std::min(bounds.x0, l.x0);
+            bounds.y0 = std::min(bounds.y0, l.y0);
+            bounds.x1 = std::max(bounds.x1, l.x1);
+            bounds.y1 = std::max(bounds.y1, l.y1);
         }
 
-        const int w = static_cast<int>(maxX - minX);
-        const int h = static_cast<int>(maxY - minY);
+        const int w = bounds.x1 - bounds.x0;
+        const int h = bounds.y1 - bounds.y0;
         if (w <= 0 || h <= 0 || !ensureInputBuffer(w, h))
             return;
 
-        m_inputSurfaceX = minX;
-        m_inputSurfaceY = minY;
+        m_inputSurfaceX = static_cast<float>(bounds.x0);
+        m_inputSurfaceY = static_cast<float>(bounds.y0);
 
         for (const InputRect& r : valid)
         {
-            wl_region_add(m_inputRegion,
-                          static_cast<int>(r.x - minX), static_cast<int>(r.y - minY),
-                          static_cast<int>(r.width), static_cast<int>(r.height));
+            const LogicalRect l = toLogical(r);
+            wl_region_add(m_inputRegion, l.x0 - bounds.x0, l.y0 - bounds.y0, l.x1 - l.x0, l.y1 - l.y0);
         }
-        wl_subsurface_set_position(m_inputSubsurface, static_cast<int>(minX), static_cast<int>(minY));
+        wl_subsurface_set_position(m_inputSubsurface, bounds.x0, bounds.y0);
         if (m_inputViewport)
             wp_viewport_set_destination(m_inputViewport, w, h);
         wl_surface_set_input_region(m_inputSurface, m_inputRegion);

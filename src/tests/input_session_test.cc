@@ -43,6 +43,12 @@ namespace VkHook
     {
         withholdCalls.push_back(withhold);
     }
+
+    void gameSurfaceLogicalSize(wl_proxy*, uint32_t bufferWidth, uint32_t bufferHeight, double& width, double& height)
+    {
+        width = bufferWidth;
+        height = bufferHeight;
+    }
 } // namespace VkHook
 
 using namespace VkHook;
