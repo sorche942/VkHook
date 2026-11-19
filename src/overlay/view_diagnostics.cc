@@ -2,8 +2,7 @@
 #include "config_serializer.hh"
 #include "logger.hh"
 #include "overlay/ui_theme.hh"
-#include "input_blocker.hh"
-#include "wayland_display.hh"
+#include "input_session.hh"
 
 #include <fstream>
 #include <filesystem>
@@ -13,7 +12,6 @@
 #include <cmath>
 #include <dlfcn.h>
 #include <memory>
-#include <mutex>
 
 #include "vendor/imgui/imgui.h"
 
@@ -123,83 +121,102 @@ namespace VkHook
 
         static constexpr nvmlReturn_t NVML_SUCCESS = 0;
 
-        struct NvmlState
+        // One NVML binding per DiagnosticsState (so per VkDevice's OverlayUi). It is
+        // created empty, loads libnvidia-ml on the first ensure(), and
+        // nvmlShutdown()s + dlcloses in its destructor. Only the present thread
+        // touches it, so it has no lock and there is no process-wide state.
+        class Nvml
         {
+        public:
+            Nvml() = default;
+            Nvml(const Nvml&) = delete;
+            Nvml& operator=(const Nvml&) = delete;
+            ~Nvml()
+            {
+                if (lib)
+                    close();
+            }
+
+            // Loads and initializes NVML once; later calls return the first result.
+            bool ensure()
+            {
+                if (attempted)
+                    return lib != nullptr;
+                attempted = true;
+
+                lib = dlopen("libnvidia-ml.so.1", RTLD_LAZY);
+                if (!lib)
+                    lib = dlopen("libnvidia-ml.so", RTLD_LAZY);
+                if (!lib)
+                {
+                    const char* err = dlerror();
+                    Logger::debug("NVML not available: " + std::string(err ? err : "unknown"));
+                    return false;
+                }
+
+                Init = (decltype(Init))dlsym(lib, "nvmlInit_v2");
+                if (!Init)
+                    Init = (decltype(Init))dlsym(lib, "nvmlInit");
+                Shutdown = (decltype(Shutdown))dlsym(lib, "nvmlShutdown");
+                DeviceGetHandleByIndex = (decltype(DeviceGetHandleByIndex))dlsym(lib, "nvmlDeviceGetHandleByIndex_v2");
+                if (!DeviceGetHandleByIndex)
+                    DeviceGetHandleByIndex = (decltype(DeviceGetHandleByIndex))dlsym(lib, "nvmlDeviceGetHandleByIndex");
+                DeviceGetUtilizationRates = (decltype(DeviceGetUtilizationRates))dlsym(lib, "nvmlDeviceGetUtilizationRates");
+                DeviceGetMemoryInfo = (decltype(DeviceGetMemoryInfo))dlsym(lib, "nvmlDeviceGetMemoryInfo");
+
+                if (!Init || !DeviceGetHandleByIndex || !DeviceGetUtilizationRates || !DeviceGetMemoryInfo)
+                {
+                    Logger::debug("NVML: missing required symbols");
+                    Shutdown = nullptr;  // never shut down an NVML that did not initialize
+                    close();
+                    return false;
+                }
+                if (Init() != NVML_SUCCESS)
+                {
+                    Logger::debug("NVML: nvmlInit failed");
+                    Shutdown = nullptr;
+                    close();
+                    return false;
+                }
+                if (DeviceGetHandleByIndex(0, &device) != NVML_SUCCESS)
+                {
+                    Logger::debug("NVML: could not get device handle");
+                    close();
+                    return false;
+                }
+
+                Logger::info("NVML initialized for GPU diagnostics");
+                return true;
+            }
+
+            bool utilization(nvmlUtilization_t& out) const
+            {
+                return lib && DeviceGetUtilizationRates(device, &out) == NVML_SUCCESS;
+            }
+            bool memory(nvmlMemory_t& out) const
+            {
+                return lib && DeviceGetMemoryInfo(device, &out) == NVML_SUCCESS;
+            }
+
+        private:
+            void close()
+            {
+                if (Shutdown)
+                    Shutdown();
+                dlclose(lib);
+                lib = nullptr;
+            }
+
             void* lib = nullptr;
             nvmlDevice_t device = nullptr;
-            bool initialized = false;
+            bool attempted = false;
 
-            // Function pointers
             nvmlReturn_t (*Init)() = nullptr;
             nvmlReturn_t (*Shutdown)() = nullptr;
             nvmlReturn_t (*DeviceGetHandleByIndex)(unsigned int, nvmlDevice_t*) = nullptr;
             nvmlReturn_t (*DeviceGetUtilizationRates)(nvmlDevice_t, nvmlUtilization_t*) = nullptr;
             nvmlReturn_t (*DeviceGetMemoryInfo)(nvmlDevice_t, nvmlMemory_t*) = nullptr;
-            nvmlReturn_t (*DeviceGetCount)(unsigned int*) = nullptr;
         };
-
-        static NvmlState nvml;
-
-        static bool initNvml()
-        {
-            // NVML state is process-wide; two overlays may race to load it
-            static std::mutex nvmlMutex;
-            std::lock_guard<std::mutex> lock(nvmlMutex);
-            if (nvml.initialized)
-                return nvml.lib != nullptr;
-            nvml.initialized = true;
-
-            nvml.lib = dlopen("libnvidia-ml.so.1", RTLD_LAZY);
-            if (!nvml.lib)
-                nvml.lib = dlopen("libnvidia-ml.so", RTLD_LAZY);
-            if (!nvml.lib)
-            {
-                Logger::debug("NVML not available: " + std::string(dlerror()));
-                return false;
-            }
-
-            nvml.Init = (decltype(nvml.Init))dlsym(nvml.lib, "nvmlInit_v2");
-            if (!nvml.Init)
-                nvml.Init = (decltype(nvml.Init))dlsym(nvml.lib, "nvmlInit");
-            nvml.Shutdown = (decltype(nvml.Shutdown))dlsym(nvml.lib, "nvmlShutdown");
-            nvml.DeviceGetHandleByIndex = (decltype(nvml.DeviceGetHandleByIndex))dlsym(nvml.lib, "nvmlDeviceGetHandleByIndex_v2");
-            if (!nvml.DeviceGetHandleByIndex)
-                nvml.DeviceGetHandleByIndex = (decltype(nvml.DeviceGetHandleByIndex))dlsym(nvml.lib, "nvmlDeviceGetHandleByIndex");
-            nvml.DeviceGetUtilizationRates = (decltype(nvml.DeviceGetUtilizationRates))dlsym(nvml.lib, "nvmlDeviceGetUtilizationRates");
-            nvml.DeviceGetMemoryInfo = (decltype(nvml.DeviceGetMemoryInfo))dlsym(nvml.lib, "nvmlDeviceGetMemoryInfo");
-            nvml.DeviceGetCount = (decltype(nvml.DeviceGetCount))dlsym(nvml.lib, "nvmlDeviceGetCount_v2");
-            if (!nvml.DeviceGetCount)
-                nvml.DeviceGetCount = (decltype(nvml.DeviceGetCount))dlsym(nvml.lib, "nvmlDeviceGetCount");
-
-            if (!nvml.Init || !nvml.DeviceGetHandleByIndex || !nvml.DeviceGetUtilizationRates || !nvml.DeviceGetMemoryInfo)
-            {
-                Logger::debug("NVML: missing required symbols");
-                dlclose(nvml.lib);
-                nvml.lib = nullptr;
-                return false;
-            }
-
-            if (nvml.Init() != NVML_SUCCESS)
-            {
-                Logger::debug("NVML: nvmlInit failed");
-                dlclose(nvml.lib);
-                nvml.lib = nullptr;
-                return false;
-            }
-
-            // Get first GPU handle (index 0)
-            if (nvml.DeviceGetHandleByIndex(0, &nvml.device) != NVML_SUCCESS)
-            {
-                Logger::debug("NVML: could not get device handle");
-                nvml.Shutdown();
-                dlclose(nvml.lib);
-                nvml.lib = nullptr;
-                return false;
-            }
-
-            Logger::info("NVML initialized for GPU diagnostics");
-            return true;
-        }
 
         // ── GPU discovery ───────────────────────────────────────────────────
 
@@ -214,7 +231,7 @@ namespace VkHook
             return id;
         }
 
-        static GpuInfo findGpu(const DeviceInfo& device)
+        static GpuInfo findGpu(const DeviceInfo& device, Nvml& nvml)
         {
             GpuInfo info;
 
@@ -293,7 +310,7 @@ namespace VkHook
                         info.vendor = GpuVendor::NVIDIA;
                         info.drmCardPath = cardPath;
                         info.vendorName = "NVIDIA";
-                        if (initNvml())
+                        if (nvml.ensure())
                         {
                             info.hasGpuUsage = true;
                             info.hasVram = true;
@@ -320,7 +337,7 @@ namespace VkHook
 
         // ── Per-vendor stat readers ─────────────────────────────────────────
 
-        float getGpuUsage(const GpuInfo& gpuInfo)
+        float getGpuUsage(const GpuInfo& gpuInfo, const Nvml& nvml)
         {
             if (gpuInfo.vendor == GpuVendor::AMD)
             {
@@ -339,17 +356,17 @@ namespace VkHook
                     return std::min(100.0f, (static_cast<float>(actFreq) / static_cast<float>(maxFreq)) * 100.0f);
                 }
             }
-            else if (gpuInfo.vendor == GpuVendor::NVIDIA && nvml.lib)
+            else if (gpuInfo.vendor == GpuVendor::NVIDIA)
             {
                 nvmlUtilization_t util = {};
-                if (nvml.DeviceGetUtilizationRates(nvml.device, &util) == NVML_SUCCESS)
+                if (nvml.utilization(util))
                     return static_cast<float>(util.gpu);
             }
 
             return -1.0f;
         }
 
-        bool getVramUsage(const GpuInfo& gpuInfo, float& usedMB, float& totalMB)
+        bool getVramUsage(const GpuInfo& gpuInfo, const Nvml& nvml, float& usedMB, float& totalMB)
         {
             if (gpuInfo.vendor == GpuVendor::AMD || gpuInfo.vendor == GpuVendor::Intel)
             {
@@ -363,10 +380,10 @@ namespace VkHook
                     return true;
                 }
             }
-            else if (gpuInfo.vendor == GpuVendor::NVIDIA && nvml.lib)
+            else if (gpuInfo.vendor == GpuVendor::NVIDIA)
             {
                 nvmlMemory_t mem = {};
-                if (nvml.DeviceGetMemoryInfo(nvml.device, &mem) == NVML_SUCCESS && mem.total > 0)
+                if (nvml.memory(mem) && mem.total > 0)
                 {
                     usedMB = static_cast<float>(mem.used) / (1024.0f * 1024.0f);
                     totalMB = static_cast<float>(mem.total) / (1024.0f * 1024.0f);
@@ -426,7 +443,7 @@ namespace VkHook
     }
 
     // Everything the diagnostics tab samples. One per overlay (owned through
-    // OverlayUi::diagnostics), so two overlays never share history.
+    // OverlayUi::diagnostics), so two overlays never share history or an NVML binding.
     struct DiagnosticsState
     {
         RingBuffer<float, 300> frameTimeHistory;
@@ -435,6 +452,7 @@ namespace VkHook
         RingBuffer<float, 300> gttUsageHistory;
         std::chrono::steady_clock::time_point lastFrameTime;
         GpuInfo gpuInfo;
+        Nvml nvml;  // created lazily by findGpu(); shut down with this state
         std::string detectedGameName;
         std::string autoDetectedConfig;
 
@@ -467,7 +485,7 @@ namespace VkHook
         {
             if (d.initialized)
                 Logger::info("Diagnostics: GPU changed to " + deviceInfo.gpuName + ", re-resolving");
-            d.gpuInfo = findGpu(deviceInfo);
+            d.gpuInfo = findGpu(deviceInfo, d.nvml);
             d.resolvedSlot = deviceInfo.gpuPciSlot;
             d.detectedGameName = ConfigSerializer::detectGameName();
             d.autoDetectedConfig = ConfigSerializer::autoDetectConfig();
@@ -498,8 +516,8 @@ namespace VkHook
             const float p999 = d.frameTimeHistory.percentile(0.999f);
             d.dispFps1Low  = p99  > 0.0f ? 1000.0f / p99  : 0.0f;
             d.dispFps01Low = p999 > 0.0f ? 1000.0f / p999 : 0.0f;
-            d.dispGpuUsage = d.gpuInfo.hasGpuUsage ? getGpuUsage(d.gpuInfo) : -1.0f;
-            d.dispHasVram = getVramUsage(d.gpuInfo, d.dispVramUsed, d.dispVramTotal);
+            d.dispGpuUsage = d.gpuInfo.hasGpuUsage ? getGpuUsage(d.gpuInfo, d.nvml) : -1.0f;
+            d.dispHasVram = getVramUsage(d.gpuInfo, d.nvml, d.dispVramUsed, d.dispVramTotal);
             d.dispHasGtt = getGttUsage(d.gpuInfo, d.dispGttUsed, d.dispGttTotal);
             // keep the leftover rather than snapping to exactly 1.0s, which under-counts.
             d.fpsWindowStart += std::chrono::milliseconds(static_cast<int64_t>(windowSeconds * 1000.0));
@@ -513,12 +531,12 @@ namespace VkHook
         {
             d.lastGpuSampleTime = now;
 
-            const float gpuUsage = getGpuUsage(d.gpuInfo);
+            const float gpuUsage = getGpuUsage(d.gpuInfo, d.nvml);
             if (gpuUsage >= 0)
                 d.gpuUsageHistory.push(gpuUsage);
 
             float vramUsed, vramTotal;
-            if (getVramUsage(d.gpuInfo, vramUsed, vramTotal))
+            if (getVramUsage(d.gpuInfo, d.nvml, vramUsed, vramTotal))
                 d.vramUsageHistory.push((vramUsed / vramTotal) * 100.0f);
 
             float gttUsed, gttTotal;
@@ -527,7 +545,7 @@ namespace VkHook
         }
     }
 
-    void OverlayUi::renderDiagnosticsView()
+    void OverlayUi::renderDiagnosticsView(const InputSession* input)
     {
         if (!diagnostics)
             diagnostics = std::make_shared<DiagnosticsState>();
@@ -645,7 +663,7 @@ namespace VkHook
         ImGui::Spacing();
         ImGui::SeparatorText("Input");
         {
-            const SurfaceKind kind = getSurfaceKind();
+            const SurfaceKind kind = input ? input->kind() : SurfaceKind::Unknown;
             const bool wayland = kind == SurfaceKind::Wayland;
             const bool x11 = kind == SurfaceKind::X11;
 
@@ -656,7 +674,7 @@ namespace VkHook
             else
                 ImGui::TextColored(UI::Warning(), "Unknown (unsupported surface)");
 
-            const bool enabled = inputBlockingEnabled();
+            const bool enabled = input && input->blockingEnabled();
             ImGui::Text("Blocking:");
             ImGui::SameLine();
             if (enabled)
@@ -668,7 +686,7 @@ namespace VkHook
             {
                 ImGui::Text("Keys withheld from the game:");
                 ImGui::SameLine();
-                if (inputKeyboardWithheld())
+                if (input && input->keyboardWithheld())
                     ImGui::TextColored(UI::Success(), "yes");
                 else
                     ImGui::TextDisabled("no");
@@ -677,7 +695,7 @@ namespace VkHook
             {
                 ImGui::Text("Grab held:");
                 ImGui::SameLine();
-                if (inputGrabActive())
+                if (input && input->grabActive())
                     ImGui::TextColored(UI::Success(), "yes");
                 else
                     ImGui::TextDisabled("no");
@@ -685,7 +703,7 @@ namespace VkHook
 
             ImGui::Text("Overlay on screen:");
             ImGui::SameLine();
-            if (isInputBlocked())
+            if (input && input->blocked())
                 ImGui::TextColored(UI::Success(), "yes");
             else
                 ImGui::TextDisabled("no");
@@ -694,7 +712,7 @@ namespace VkHook
             {
                 ImGui::Text("Pointer over overlay:");
                 ImGui::SameLine();
-                if (inputPointerOverOverlay())
+                if (input && input->pointerOverOverlay())
                     ImGui::TextColored(UI::Success(), "yes");
                 else
                     ImGui::TextDisabled("no");

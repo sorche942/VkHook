@@ -20,7 +20,10 @@
 //              overlay_renderer.cc and never waits.
 //   record     once per present, on the present thread, after the effect
 //              submission that wrote `imageView`:
-//                VkCommandBuffer cmd = overlay->record(index, imageView, w, h);
+//                VkCommandBuffer cmd = overlay->record(index, imageView, w, h, input);
+//              `input` is the swapchain's InputSession (SwapchainShared::input),
+//              or null for no input this frame; the overlay reads the pointer
+//              and keyboard from it and publishes its hitboxes and blocking to it.
 //              A null result means there is nothing to draw; present the effect
 //              semaphore directly. Otherwise submit `cmd` on the present queue,
 //              waiting on the effect semaphore and signalling the overlay one,
@@ -44,6 +47,7 @@
 namespace VkHook
 {
     struct LogicalDevice;
+    class InputSession;
     class OverlayUi;
 
     class OverlayRenderer
@@ -59,7 +63,8 @@ namespace VkHook
         // VK_NULL_HANDLE when there is nothing to draw, the index is outside
         // the per-image resources, or the previous use of this image's command
         // buffer has not finished.
-        VkCommandBuffer record(uint32_t imageIndex, VkImageView imageView, uint32_t width, uint32_t height);
+        VkCommandBuffer record(uint32_t imageIndex, VkImageView imageView, uint32_t width, uint32_t height,
+                               InputSession* input = nullptr);
 
         // The fence for the submit that executes record()'s command buffer.
         VkFence fenceForSubmit(uint32_t imageIndex);

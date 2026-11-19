@@ -3,11 +3,15 @@
 
 // OverlayUi: the ImGui side of the overlay, one per device.
 //
-// It owns the ImGuiContext, the views and the input state, and nothing that
+// It owns the ImGuiContext and the views, and nothing that
 // belongs to a swapchain. Views read an immutable CoreSnapshot and answer with
 // Commands (commands.hh); no view reaches the layer's state. What a swapchain
 // needs to put a frame on screen (render pass, command buffers, fences,
 // framebuffers) lives in OverlayRenderer (overlay_renderer.hh).
+//
+// Input: the overlay holds no input state of its own. The swapchain's
+// InputSession is an argument of every frame call, so each window's pointer,
+// keys and blocking stay with that window.
 //
 // Threading: every method except pushToast() runs on the present thread. The
 // ImGuiContext is made current only inside the methods that need it and the
@@ -27,8 +31,7 @@
 
 #include "commands.hh"
 #include "core_snapshot.hh"
-#include "input_blocker.hh"
-#include "keyboard_input.hh"
+#include "input_session.hh"
 #include "logger.hh"
 #include "vulkan_include.hh"
 
@@ -84,15 +87,20 @@ namespace VkHook
 
         // --- the frame protocol OverlayRenderer::record drives ---
 
+        // `input` is the InputSession of the swapchain's surface: the overlay
+        // reads the pointer and keyboard from it and publishes its hitboxes and
+        // blocking to it. It is used only during the call and may be null (no
+        // input this frame, nothing is blocked or released).
+        //
         // False when there is nothing to put on screen (hidden and no toasts) or
         // ImGui's pipeline cannot be made to match `renderPass`; the input
-        // blocker is released as a side effect of the first case.
-        bool beginFrameCheck(VkFormat format, VkRenderPass renderPass);
+        // blocking on `input` is released as a side effect of the first case.
+        bool beginFrameCheck(InputSession* input, VkFormat format, VkRenderPass renderPass);
 
         // Builds this frame's UI for a surface of width x height and returns
-        // its draw data, or null on failure. Keyboard, mouse and pacing are
-        // sampled here. The caller records the data with drawFrame().
-        ImDrawData* buildFrame(uint32_t width, uint32_t height);
+        // its draw data, or null on failure. Keyboard and mouse are
+        // sampled from `input` (see beginFrameCheck), pacing here. The caller records the data with drawFrame().
+        ImDrawData* buildFrame(uint32_t width, uint32_t height, InputSession* input);
 
         // Records the draw data into `commandBuffer`, inside the caller's render pass.
         void drawFrame(ImDrawData* drawData, VkCommandBuffer commandBuffer);
@@ -154,7 +162,7 @@ namespace VkHook
         void startShaderTest();          // Initialize shader test queue and start
         void processShaderTest();        // Process one shader per frame (runs every frame)
         void renderMainView();
-        void renderDiagnosticsView();
+        void renderDiagnosticsView(const InputSession* input);
         // Samples frame time, FPS and GPU stats. Called every overlay frame, not
         // just while the Diagnostics tab is open, so the tab has real history.
         void sampleDiagnostics();
