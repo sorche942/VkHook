@@ -13,6 +13,10 @@
 
 namespace VkHook
 {
+    constexpr uint32_t kInvalidMemoryTypeIndex = 0xFFFFFFFFu;
+
+    // Returns kInvalidMemoryTypeIndex when no allowed type qualifies. Callers must
+    // check it: it is not a valid index.
     uint32_t findMemoryTypeIndex(LogicalDevice* logicalDevice, uint32_t typeFilter, VkMemoryPropertyFlags properties);
 }
 

@@ -7,6 +7,7 @@
 #include <sstream>
 
 #include "reshade_parser.hh"
+#include "settings_manager.hh"
 #include "config_serializer.hh"
 #include "logger.hh"
 #include "dlss5_config.hh"
@@ -263,35 +264,39 @@ namespace VkHook
         std::filesystem::path p(path);
         config.effectType = p.stem().string();
 
+        // Extract the user-configurable macros first and apply the saved values,
+        // so the parse below sees the same macros the runtime compile will and
+        // macro-gated uniforms show up when their macro is set.
+        // Config format: effectName@MACRO = value
+        config.preprocessorDefs =
+            extractPreprocessorDefinitions(name, path, preprocessSetup(compileWidth, compileHeight, 8, {}));
+        for (auto& def : config.preprocessorDefs)
+        {
+            std::string configKey = name + "@" + def.name;
+            std::string savedValue = rootConfig->getOption<std::string>(configKey, "");
+            if (!savedValue.empty())
+            {
+                def.value = savedValue;
+                Logger::debug("EffectRegistry: loaded preprocessor def " + configKey + " = " + savedValue);
+            }
+        }
+
         // parseReshadeEffect runs the full preprocessor/parser/codegen pass, so it
-        // is already the compile check; a separate testShaderCompilation call just
-        // compiled the same shader a second time.
+        // is already the compile check.
         std::string parseError;
-        config.parameters = parseReshadeEffect(name, path, rootConfig, &config.techniqueNames, &parseError);
+        config.parameters = parseReshadeEffect(
+            name, path, rootConfig,
+            preprocessSetup(compileWidth, compileHeight, 8, config.preprocessorDefs),
+            &config.techniqueNames, &parseError);
         if (!parseError.empty())
         {
             config.compileError = parseError;
             config.enabled = false;  // Disable failed effects by default
+            config.preprocessorDefs.clear();
             Logger::err("EffectRegistry: failed to compile " + name + ": " + parseError);
         }
         else
         {
-            // Extract preprocessor definitions (user-configurable macros)
-            config.preprocessorDefs = extractPreprocessorDefinitions(name, path);
-
-            // Override default values with any saved values from config
-            // Config format: effectName@MACRO = value
-            for (auto& def : config.preprocessorDefs)
-            {
-                std::string configKey = name + "@" + def.name;
-                std::string savedValue = rootConfig->getOption<std::string>(configKey, "");
-                if (!savedValue.empty())
-                {
-                    def.value = savedValue;
-                    Logger::debug("EffectRegistry: loaded preprocessor def " + configKey + " = " + savedValue);
-                }
-            }
-
             Logger::debug("EffectRegistry: loaded ReShade effect " + name + " with " +
                           std::to_string(config.parameters.size()) + " parameters and " +
                           std::to_string(config.preprocessorDefs.size()) + " preprocessor defs");
@@ -301,18 +306,26 @@ namespace VkHook
         paramGeneration.fetch_add(1, std::memory_order_release);
     }
 
-    std::vector<const EffectConfig*> EffectRegistry::getEnabledEffects() const
+    ReshadePreprocessSetup EffectRegistry::preprocessSetup(uint32_t bufferWidth,
+                                                           uint32_t bufferHeight,
+                                                           uint32_t colorBitDepth,
+                                                           std::vector<PreprocessorDefinition> userDefs) const
+    {
+        ReshadePreprocessSetup setup;
+        setup.bufferWidth = bufferWidth;
+        setup.bufferHeight = bufferHeight;
+        setup.colorBitDepth = colorBitDepth;
+        setup.depthSourceMode = settingsManager.getDepthSourceChannel();
+        setup.userDefs = std::move(userDefs);
+        setup.includePaths = ConfigSerializer::loadShaderManagerConfig().discoveredShaderPaths;
+        return setup;
+    }
+
+    void EffectRegistry::setCompileExtent(uint32_t width, uint32_t height)
     {
         std::lock_guard<std::mutex> lock(mutex);
-        std::vector<const EffectConfig*> enabled;
-
-        for (const auto& effect : effects)
-        {
-            if (effect.enabled)
-                enabled.push_back(&effect);
-        }
-
-        return enabled;
+        compileWidth = width;
+        compileHeight = height;
     }
 
     std::vector<std::unique_ptr<EffectParam>> EffectRegistry::getAllParameters() const
@@ -385,55 +398,6 @@ namespace VkHook
 
         auto effect = findEffect(effectName);
         return effect ? (*effect)->enabled : false;
-    }
-
-    std::map<std::string, bool> EffectRegistry::getEffectEnabledStates() const
-    {
-        std::lock_guard<std::mutex> lock(mutex);
-
-        std::map<std::string, bool> states;
-        for (const auto& effect : effects)
-            states[effect.name] = effect.enabled;
-        return states;
-    }
-
-    void EffectRegistry::setParameterValue(const std::string& effectName, const std::string& paramName, float value)
-    {
-        std::lock_guard<std::mutex> lock(mutex);
-
-        auto effect = findEffect(effectName);
-        if (!effect)
-            return;
-
-        auto param = findParam(**effect, paramName);
-        if (param && (*param)->getType() == ParamType::Float)
-            static_cast<FloatParam*>(*param)->value = value;
-    }
-
-    void EffectRegistry::setParameterValue(const std::string& effectName, const std::string& paramName, int value)
-    {
-        std::lock_guard<std::mutex> lock(mutex);
-
-        auto effect = findEffect(effectName);
-        if (!effect)
-            return;
-
-        auto param = findParam(**effect, paramName);
-        if (param && (*param)->getType() == ParamType::Int)
-            static_cast<IntParam*>(*param)->value = value;
-    }
-
-    void EffectRegistry::setParameterValue(const std::string& effectName, const std::string& paramName, bool value)
-    {
-        std::lock_guard<std::mutex> lock(mutex);
-
-        auto effect = findEffect(effectName);
-        if (!effect)
-            return;
-
-        auto param = findParam(**effect, paramName);
-        if (param && (*param)->getType() == ParamType::Bool)
-            static_cast<BoolParam*>(*param)->value = value;
     }
 
     std::optional<EffectParam*> EffectRegistry::getParameter(const std::string& effectName, const std::string& paramName)

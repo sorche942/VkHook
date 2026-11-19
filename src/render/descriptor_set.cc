@@ -200,9 +200,10 @@ namespace VkHook
             {
                 imageInfos[j].sampler   = samplers[j];
                 imageInfos[j].imageView = imageViewsVectors[j][i];
-                imageInfos[j].imageLayout = (bindingTypes[j] == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) ?
-                    VK_IMAGE_LAYOUT_GENERAL :
-                    VK_IMAGE_LAYOUT_GENERAL;
+                // Storage images require GENERAL, and every effect image the
+                // layer samples is kept in GENERAL too, so both kinds of
+                // binding use it.
+                imageInfos[j].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
                 writeDescriptorSets[j].dstBinding = j;
                 writeDescriptorSets[j].descriptorType = bindingTypes[j];

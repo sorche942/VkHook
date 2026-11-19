@@ -7,12 +7,22 @@
 #include <vector>
 #include <unordered_map>
 #include <memory>
+#include <stdexcept>
 
 #include "vulkan_include.hh"
 #include "params/effect_param.hh"
 
 namespace VkHook
 {
+    // Thrown by an effect's constructor when it cannot be built (compile failure,
+    // Vulkan error, unusable resource). The effect has already released whatever
+    // it created; the creator drops the effect and carries on without it.
+    class EffectBuildError : public std::runtime_error
+    {
+    public:
+        using std::runtime_error::runtime_error;
+    };
+
     class Effect
     {
     public:
@@ -31,7 +41,6 @@ namespace VkHook
         void virtual useDepthImage(uint32_t /* imageIndex */,
                                    VkImageView /* depthImageView */,
                                    VkImageLayout /* depthImageLayout */ = VK_IMAGE_LAYOUT_UNDEFINED){};
-        virtual std::vector<std::unique_ptr<EffectParam>> getParameters() const { return {}; }
         virtual ~Effect() = default;
 
     private:

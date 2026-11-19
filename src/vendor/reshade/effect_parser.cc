@@ -19,7 +19,23 @@ struct on_scope_exit
 {
 	template <typename F>
 	on_scope_exit(F lambda) : leave(lambda) { }
-	~on_scope_exit() { leave(); }
+	// The cleanup callbacks end code generation, and the assert override above
+	// throws when that is not valid, e.g. after a parse error before the
+	// function body started. A destructor that throws is noexcept by default and
+	// would std::terminate the host process, so allow the exception out of the
+	// parser (the caller turns it into an error result), except while another
+	// exception is already unwinding, where it is dropped.
+	~on_scope_exit() noexcept(false)
+	{
+		if (std::uncaught_exceptions() > 0)
+		{
+			try { leave(); } catch (...) { }
+		}
+		else
+		{
+			leave();
+		}
+	}
 	std::function<void()> leave;
 };
 

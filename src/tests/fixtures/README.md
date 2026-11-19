@@ -50,3 +50,6 @@ build/src/vkhook-shader-check --include src/tests/fixtures src/tests/fixtures/Di
 
 `success: true` and `usesDepth: true` are both required. A fixture that stops
 using depth would silently turn the smoke test back into a pass-through run.
+
+`compile/` holds small first-party fixtures for `vkhook-reshade-compile-tests`
+(macro-gated uniforms, extent-derived defaults, a shader that must fail).

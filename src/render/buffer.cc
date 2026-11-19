@@ -32,6 +32,13 @@ namespace VkHook
         allocInfo.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
         allocInfo.allocationSize  = memRequirements.size;
         allocInfo.memoryTypeIndex = findMemoryTypeIndex(logicalDevice, memRequirements.memoryTypeBits, properties);
+        if (allocInfo.memoryTypeIndex == kInvalidMemoryTypeIndex)
+        {
+            Logger::err("createBuffer: no suitable memory type");
+            logicalDevice->vkd.DestroyBuffer(logicalDevice->device, buffer, nullptr);
+            buffer = VK_NULL_HANDLE;
+            return;
+        }
 
         result = logicalDevice->vkd.AllocateMemory(logicalDevice->device, &allocInfo, nullptr, &bufferMemory);
         if (result != VK_SUCCESS)

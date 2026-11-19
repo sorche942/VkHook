@@ -15,81 +15,224 @@ namespace VkHook
     // Thread-safe RNG (avoids std::rand() which is not thread-safe)
     static thread_local std::mt19937 tlRng{std::random_device{}()};
 
-    void enumerateReshadeUniforms(reshadefx::module module)
+    namespace
     {
-        for (auto& uniform : module.uniforms)
+        // Bytes each source writes at its offset. A uniform declared smaller than
+        // this would be written past its slot (and possibly past the buffer).
+        uint32_t sourceWriteSize(const std::string& source)
         {
-            auto it = std::find_if(uniform.annotations.begin(), uniform.annotations.end(), [](const auto& a) {
-                          return a.name == "source";
-                      });
-            if (it == uniform.annotations.end())
-            {
-                Logger::debug("uniform without source annotation (offset: " + std::to_string(uniform.offset) + ")");
-                continue;
-            }
-            Logger::debug(it->value.string_data);
-            Logger::debug("size: " + std::to_string(uniform.size));
-            Logger::debug("offset: " + std::to_string(uniform.offset));
+            if (source == "date")
+                return sizeof(float) * 4;
+            if (source == "pingpong")
+                return sizeof(float) * 2;
+            return sizeof(float);
         }
-    }
 
-    std::vector<std::shared_ptr<ReshadeUniform>> createReshadeUniforms(reshadefx::module module)
+        // Sources the layer has no data for: they read back as zeros.
+        bool isZeroSource(const std::string& source)
+        {
+            return source == "key" || source == "mousebutton" || source == "mousepoint" || source == "mousedelta";
+        }
+    } // namespace
+
+    std::vector<std::shared_ptr<ReshadeUniform>> createReshadeUniforms(const reshadefx::module& module,
+                                                                       std::vector<std::string>* zeroedSources)
     {
         std::vector<std::shared_ptr<ReshadeUniform>> uniforms;
-        for (auto& uniform : module.uniforms)
+        for (const auto& uniform : module.uniforms)
         {
             auto it = std::find_if(uniform.annotations.begin(), uniform.annotations.end(), [](const auto& a) {
                            return a.name == "source";
                        });
             if (it == uniform.annotations.end())
                 continue;
-            auto source = it->value.string_data;
+            const std::string& source = it->value.string_data;
+
+            const bool inBuffer = uniform.offset <= module.total_uniform_size &&
+                                  uniform.size <= module.total_uniform_size - uniform.offset;
+            if (!inBuffer)
+            {
+                Logger::warn("uniform '" + uniform.name + "' (source '" + source + "') lies outside the uniform buffer; ignored");
+                continue;
+            }
+
+            if (isZeroSource(source) || uniform.size < sourceWriteSize(source) ||
+                !(source == "frametime" || source == "framecount" || source == "date" || source == "timer" ||
+                  source == "pingpong" || source == "random" || source == "bufready_depth"))
+            {
+                // Unknown source, or a slot too small for what the source writes.
+                uniforms.push_back(std::make_shared<ZeroUniform>(uniform));
+                if (zeroedSources)
+                    zeroedSources->push_back(source);
+                continue;
+            }
+
             if (source == "frametime")
-            {
                 uniforms.push_back(std::make_shared<FrameTimeUniform>(uniform));
-            }
             else if (source == "framecount")
-            {
                 uniforms.push_back(std::make_shared<FrameCountUniform>(uniform));
-            }
             else if (source == "date")
-            {
                 uniforms.push_back(std::make_shared<DateUniform>(uniform));
-            }
             else if (source == "timer")
-            {
                 uniforms.push_back(std::make_shared<TimerUniform>(uniform));
-            }
             else if (source == "pingpong")
-            {
                 uniforms.push_back(std::make_shared<PingPongUniform>(uniform));
-            }
             else if (source == "random")
-            {
                 uniforms.push_back(std::make_shared<RandomUniform>(uniform));
-            }
-            else if (source == "key")
-            {
-                uniforms.push_back(std::make_shared<KeyUniform>(uniform));
-            }
-            else if (source == "mousebutton")
-            {
-                uniforms.push_back(std::make_shared<MouseButtonUniform>(uniform));
-            }
-            else if (source == "mousepoint")
-            {
-                uniforms.push_back(std::make_shared<MousePointUniform>(uniform));
-            }
-            else if (source == "mousedelta")
-            {
-                uniforms.push_back(std::make_shared<MouseDeltaUniform>(uniform));
-            }
-            else if (source == "bufready_depth")
-            {
+            else
                 uniforms.push_back(std::make_shared<DepthUniform>(uniform));
-            }
         }
         return uniforms;
+    }
+
+    //////////////////////////////////////////////////////////////////////////////////////////////////////////
+    ZeroUniform::ZeroUniform(const reshadefx::uniform_info& uniformInfo)
+    {
+        offset = uniformInfo.offset;
+        size   = uniformInfo.size;
+    }
+    void ZeroUniform::update(void* mapedBuffer)
+    {
+        std::memset(static_cast<uint8_t*>(mapedBuffer) + offset, 0, size);
+    }
+    ZeroUniform::~ZeroUniform()
+    {
+    }
+
+    namespace
+    {
+        bool hasSourceAnnotation(const reshadefx::uniform_info& uniform)
+        {
+            return std::any_of(uniform.annotations.begin(), uniform.annotations.end(), [](const auto& a) {
+                return a.name == "source";
+            });
+        }
+
+        // The shader's declared initial value, for a uniform with no parameter.
+        void writeDefaultUniformValue(void* buffer, uint32_t bufferSize, const reshadefx::uniform_info& uniform)
+        {
+            if (!uniform.has_initializer_value)
+                return;
+
+            const uint32_t componentCount = std::min<uint32_t>(uniform.type.components(), 16u);
+            if (componentCount == 0 || uniform.offset > bufferSize ||
+                componentCount * sizeof(uint32_t) > bufferSize - uniform.offset)
+                return;
+
+            uint8_t* dst = static_cast<uint8_t*>(buffer) + uniform.offset;
+            switch (uniform.type.base)
+            {
+                case reshadefx::type::t_float:
+                    std::memcpy(dst, uniform.initializer_value.as_float, componentCount * sizeof(float));
+                    break;
+                case reshadefx::type::t_bool:
+                {
+                    VkBool32 values[16] = {};
+                    for (uint32_t i = 0; i < componentCount; ++i)
+                        values[i] = uniform.initializer_value.as_uint[i] != 0 ? VK_TRUE : VK_FALSE;
+                    std::memcpy(dst, values, componentCount * sizeof(VkBool32));
+                    break;
+                }
+                case reshadefx::type::t_int:
+                    std::memcpy(dst, uniform.initializer_value.as_int, componentCount * sizeof(int32_t));
+                    break;
+                case reshadefx::type::t_uint:
+                    std::memcpy(dst, uniform.initializer_value.as_uint, componentCount * sizeof(uint32_t));
+                    break;
+                default:
+                    break;
+            }
+        }
+
+        bool bindParam(const reshadefx::uniform_info& uniform, const EffectParam& param, UniformBinding& binding)
+        {
+            const uint32_t uniformComponents = std::min<uint32_t>(uniform.type.components(), 4u);
+            binding.offset = uniform.offset;
+            binding.isBool = false;
+            switch (param.getType())
+            {
+                case ParamType::Float:
+                    binding.src = &static_cast<const FloatParam&>(param).value;
+                    binding.bytes = sizeof(float);
+                    return true;
+                case ParamType::FloatVec:
+                {
+                    const auto& p = static_cast<const FloatVecParam&>(param);
+                    binding.src = p.value;
+                    binding.bytes = std::min(p.componentCount, uniformComponents) * sizeof(float);
+                    return true;
+                }
+                case ParamType::Int:
+                    binding.src = &static_cast<const IntParam&>(param).value;
+                    binding.bytes = sizeof(int32_t);
+                    return true;
+                case ParamType::IntVec:
+                {
+                    const auto& p = static_cast<const IntVecParam&>(param);
+                    binding.src = p.value;
+                    binding.bytes = std::min(p.componentCount, uniformComponents) * sizeof(int32_t);
+                    return true;
+                }
+                case ParamType::Uint:
+                    binding.src = &static_cast<const UintParam&>(param).value;
+                    binding.bytes = sizeof(uint32_t);
+                    return true;
+                case ParamType::UintVec:
+                {
+                    const auto& p = static_cast<const UintVecParam&>(param);
+                    binding.src = p.value;
+                    binding.bytes = std::min(p.componentCount, uniformComponents) * sizeof(uint32_t);
+                    return true;
+                }
+                case ParamType::Bool:
+                    binding.src = &static_cast<const BoolParam&>(param).value;
+                    binding.bytes = sizeof(VkBool32);
+                    binding.isBool = true;
+                    return true;
+            }
+            return false;
+        }
+    } // namespace
+
+    std::vector<UniformBinding> buildUniformBindings(const reshadefx::module& module,
+                                                     uint32_t bufferSize,
+                                                     void* buffer,
+                                                     const UniformParamLookup& lookup)
+    {
+        std::vector<UniformBinding> bindings;
+        for (const auto& uniform : module.uniforms)
+        {
+            if (uniform.name.empty() || hasSourceAnnotation(uniform))
+                continue;
+
+            const EffectParam* param = lookup(uniform.name);
+            UniformBinding binding;
+            if (param == nullptr || !bindParam(uniform, *param, binding) || binding.bytes == 0 ||
+                binding.offset > bufferSize || binding.bytes > bufferSize - binding.offset)
+            {
+                writeDefaultUniformValue(buffer, bufferSize, uniform);
+                continue;
+            }
+            bindings.push_back(binding);
+        }
+        return bindings;
+    }
+
+    void applyUniformBindings(const std::vector<UniformBinding>& bindings, void* buffer)
+    {
+        uint8_t* base = static_cast<uint8_t*>(buffer);
+        for (const UniformBinding& binding : bindings)
+        {
+            if (binding.isBool)
+            {
+                const VkBool32 value = *static_cast<const bool*>(binding.src) ? VK_TRUE : VK_FALSE;
+                std::memcpy(base + binding.offset, &value, sizeof(value));
+            }
+            else
+            {
+                std::memcpy(base + binding.offset, binding.src, binding.bytes);
+            }
+        }
     }
 
     //////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -310,86 +453,6 @@ namespace VkHook
         std::memcpy((uint8_t*) mapedBuffer + offset, &(value), sizeof(int32_t));
     }
     RandomUniform::~RandomUniform()
-    {
-    }
-
-    //////////////////////////////////////////////////////////////////////////////////////////////////////////
-    KeyUniform::KeyUniform(reshadefx::uniform_info uniformInfo)
-    {
-        auto source = std::find_if(uniformInfo.annotations.begin(), uniformInfo.annotations.end(), [](const auto& a) { return a.name == "source"; });
-        if (source->value.string_data != "key")
-        {
-            Logger::err("Tried to create a KeyUniform from a non key uniform_info");
-        }
-        offset = uniformInfo.offset;
-        size   = uniformInfo.size;
-    }
-    void KeyUniform::update(void* mapedBuffer)
-    {
-        VkBool32 keyDown = VK_FALSE; // TODO
-        std::memcpy((uint8_t*) mapedBuffer + offset, &(keyDown), sizeof(VkBool32));
-    }
-    KeyUniform::~KeyUniform()
-    {
-    }
-
-    //////////////////////////////////////////////////////////////////////////////////////////////////////////
-    MouseButtonUniform::MouseButtonUniform(reshadefx::uniform_info uniformInfo)
-    {
-        auto source = std::find_if(uniformInfo.annotations.begin(), uniformInfo.annotations.end(), [](const auto& a) { return a.name == "source"; });
-        if (source->value.string_data != "mousebutton")
-        {
-            Logger::err("Tried to create a MouseButtonUniform from a non mousebutton uniform_info");
-        }
-        offset = uniformInfo.offset;
-        size   = uniformInfo.size;
-    }
-    void MouseButtonUniform::update(void* mapedBuffer)
-    {
-        VkBool32 keyDown = VK_FALSE; // TODO
-        std::memcpy((uint8_t*) mapedBuffer + offset, &(keyDown), sizeof(VkBool32));
-    }
-    MouseButtonUniform::~MouseButtonUniform()
-    {
-    }
-
-    //////////////////////////////////////////////////////////////////////////////////////////////////////////
-    MousePointUniform::MousePointUniform(reshadefx::uniform_info uniformInfo)
-    {
-        auto source = std::find_if(uniformInfo.annotations.begin(), uniformInfo.annotations.end(), [](const auto& a) { return a.name == "source"; });
-        if (source->value.string_data != "mousepoint")
-        {
-            Logger::err("Tried to create a MousePointUniform from a non mousepoint uniform_info");
-        }
-        offset = uniformInfo.offset;
-        size   = uniformInfo.size;
-    }
-    void MousePointUniform::update(void* mapedBuffer)
-    {
-        float point[2] = {0.0f, 0.0f}; // TODO
-        std::memcpy((uint8_t*) mapedBuffer + offset, point, sizeof(float) * 2);
-    }
-    MousePointUniform::~MousePointUniform()
-    {
-    }
-
-    //////////////////////////////////////////////////////////////////////////////////////////////////////////
-    MouseDeltaUniform::MouseDeltaUniform(reshadefx::uniform_info uniformInfo)
-    {
-        auto source = std::find_if(uniformInfo.annotations.begin(), uniformInfo.annotations.end(), [](const auto& a) { return a.name == "source"; });
-        if (source->value.string_data != "mousedelta")
-        {
-            Logger::err("Tried to create a MouseDeltaUniform from a non mousedelta uniform_info");
-        }
-        offset = uniformInfo.offset;
-        size   = uniformInfo.size;
-    }
-    void MouseDeltaUniform::update(void* mapedBuffer)
-    {
-        float delta[2] = {0.0f, 0.0f}; // TODO
-        std::memcpy((uint8_t*) mapedBuffer + offset, delta, sizeof(float) * 2);
-    }
-    MouseDeltaUniform::~MouseDeltaUniform()
     {
     }
 

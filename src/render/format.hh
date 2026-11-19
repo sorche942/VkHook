@@ -21,7 +21,6 @@ namespace VkHook
     bool isSRGB(VkFormat format);
     // Returns true if format is UNORM
     // TODO currently return false if format is UNORM and no matching sRGB format exist
-    bool isUNORM(VkFormat format);
 
     VkFormat getSupportedFormat(LogicalDevice*        logicalDevice,
                                 std::vector<VkFormat> formats,

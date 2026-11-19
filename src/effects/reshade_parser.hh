@@ -6,6 +6,7 @@
 #include <memory>
 
 #include "effects/effect_config.hh"
+#include "effects/reshade_compile.hh"
 #include "effects/params/effect_param.hh"
 #include "config.hh"
 
@@ -24,14 +25,16 @@ namespace VkHook
     // Parse a ReShade .fx file and extract its parameters without creating Vulkan resources.
     // effectName: display name for the effect (used in EffectParam.effectName)
     // effectPath: full path to the .fx file
-    // config: config for getting includePath and current param values
+    // config: config for current param values
+    // setup: the shared preprocess setup (extent, user macros, include paths)
     // outError, when given, is set to a non-empty message on any fatal
-    // preprocessor/parse failure. That lets a caller use this parse as its
-    // compile check instead of compiling the same shader a second time.
+    // preprocessor/parse failure, including a throwing compiler. That lets a
+    // caller use this parse as its compile check.
     std::vector<std::unique_ptr<EffectParam>> parseReshadeEffect(
         const std::string& effectName,
         const std::string& effectPath,
         Config* config,
+        const ReshadePreprocessSetup& setup,
         std::vector<std::string>* techniqueNames = nullptr,
         std::string* outError = nullptr);
 
@@ -46,19 +49,13 @@ namespace VkHook
         const std::string& effectPath,
         const std::vector<std::string>& includePaths);
 
-    // Check if a compiled shader uses depth buffer (has DEPTH semantic textures).
-    // Uses cached test results if available, otherwise compiles the shader.
-    bool checkShaderUsesDepth(
-        const std::string& effectName,
-        const std::string& effectPath,
-        const std::vector<std::string>& includePaths);
-
     // Extract user-configurable preprocessor definitions from a ReShade shader.
     // These are macros used via #ifndef/#ifdef that aren't built-in (like __RESHADE__).
     // Returns empty vector for built-in effects or if no user macros are found.
     std::vector<PreprocessorDefinition> extractPreprocessorDefinitions(
         const std::string& effectName,
-        const std::string& effectPath);
+        const std::string& effectPath,
+        const ReshadePreprocessSetup& setup);
 
 } // namespace VkHook
 
