@@ -1,5 +1,3 @@
-#include "keyboard_input_x11.hh"
-
 #include "logger.hh"
 #include "x11_input.hh"
 
@@ -115,14 +113,6 @@ namespace VkHook
     {
         std::lock_guard<std::recursive_mutex> lock(m_mutex);
         m_keymapFrameId++;
-    }
-
-    uint32_t convertToKeySymX11(std::string key)
-    {
-        const uint32_t result = (uint32_t)XStringToKeysym(key.c_str());
-        if (!result)
-            Logger::err("invalid key");
-        return result;
     }
 
     bool X11Input::isKeyPressed(uint32_t ks)

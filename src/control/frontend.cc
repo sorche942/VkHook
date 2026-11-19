@@ -584,6 +584,11 @@ namespace VkHook
             Logger::info("hot-reload initialized, config: " + state.config->getConfigFilePath());
             state.initLogged = true;
         }
+        if (!session && !state.noSessionLogged)
+        {
+            Logger::debug("present has no input session: hotkeys and the overlay key are not polled");
+            state.noSessionLogged = true;
+        }
 
         // Toggle effect on/off (keyboard)
         if (handleKeyPress(session, state.keySymbol, state.pressed))

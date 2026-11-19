@@ -1,5 +1,3 @@
-#include "keyboard_input_wayland.hh"
-
 #include "c_resource.hh"
 #include "logger.hh"
 #include "wayland_input.hh"
@@ -82,6 +80,11 @@ namespace VkHook
         xkb_state_update_key(m_xkbState, xkbKeycode, XKB_KEY_DOWN);
 
         xkb_keysym_t keysym = xkb_state_key_get_one_sym(m_xkbState, xkbKeycode);
+        Logger::debug([&] {
+            char name[64] = "?";
+            xkb_keysym_get_name(keysym, name, sizeof(name));
+            return "Wayland: key press " + std::to_string(keycode) + " -> " + name;
+        });
 
         // Track press event for edge detection (survives same-frame release)
         m_keyPressEvents.insert((uint32_t)keysym);
@@ -278,21 +281,6 @@ namespace VkHook
         m_typedChars.clear();
         m_lastKeyName.clear();
         m_navPresses.clear();
-    }
-
-    uint32_t convertToKeySymWayland(std::string key)
-    {
-        // XKB keysym names are the same as X11 keysym names
-        xkb_keysym_t sym = xkb_keysym_from_name(key.c_str(), XKB_KEYSYM_NO_FLAGS);
-        if (sym == XKB_KEY_NoSymbol)
-        {
-            // Try case-insensitive
-            sym = xkb_keysym_from_name(key.c_str(), XKB_KEYSYM_CASE_INSENSITIVE);
-        }
-        if (sym == XKB_KEY_NoSymbol)
-            Logger::err("Wayland: invalid key name: " + key);
-
-        return (uint32_t)sym;
     }
 
     bool WaylandInput::isKeyPressed(uint32_t ks)

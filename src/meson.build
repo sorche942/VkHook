@@ -495,6 +495,7 @@ test('wayland capture attachment and teardown order', wayland_capture_tests)
 # process-wide dlsym override.
 input_session_tests = executable('vkhook-input-session-tests',
     'tests/input_session_test.cc',
+    'input/keyboard_input.cc',
     link_with : input_backend_libs,
     dependencies : [vkhook_core_dep] + input_backend_deps)
 test('input session', input_session_tests)

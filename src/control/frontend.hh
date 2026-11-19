@@ -79,6 +79,7 @@ namespace VkHook
         uint32_t reloadKeySymbol = 0;
         uint32_t overlayKeySymbol = 0;
         bool     initLogged      = false;
+        bool     noSessionLogged = false;
 
         bool pressed        = false;
         bool presentEffect  = true;

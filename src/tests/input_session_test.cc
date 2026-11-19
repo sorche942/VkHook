@@ -3,6 +3,7 @@
 // free-function facade. No DISPLAY is set, so X11 sessions never open a connection, and
 // the Wayland session is never polled, so its display pointer is never used.
 #include "input_session.hh"
+#include "keyboard_input.hh"
 
 #include "wayland_display.hh"
 #include "wayland_interpose.hh"
@@ -183,6 +184,17 @@ namespace
         session->destroy();
         check(InputSession::current() == nullptr && !isX11(), "a destroyed session is no longer current");
     }
+
+    // The device resolves its hotkeys when it is created, which an application
+    // may do before it creates any surface: the lookup must not need a session.
+    void keysymTests()
+    {
+        check(InputSession::current() == nullptr, "no session for the keysym lookup");
+        check(convertToKeySym("Home") == 0xff50 && convertToKeySym("End") == 0xff57 && convertToKeySym("F10") == 0xffc7,
+              "hotkey names resolve without a session");
+        check(convertToKeySym("home") == 0xff50, "names are matched case-insensitively as a fallback");
+        check(convertToKeySym("NotAKey") == 0, "an unknown name resolves to no key");
+    }
 } // namespace
 
 int main()
@@ -195,6 +207,7 @@ int main()
     withholdTests();
     threadTests();
     facadeTests();
+    keysymTests();
 
     std::printf("%d failure(s)\n", failures);
     return failures == 0 ? 0 : 1;
