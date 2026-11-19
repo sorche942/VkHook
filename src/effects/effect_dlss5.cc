@@ -229,7 +229,7 @@ namespace VkHook
             device->queueFamilyIndex, 0, device->downstreamGIPA, layerDeviceProcAddr());
         if (device->dlss5OpticalFlowQueue)
         {
-            s.flow = std::make_unique<Dlss5OpticalFlow>(*s.context, device->dlss5OpticalFlowQueueFamily,
+            s.flow = std::make_unique<Dlss5OpticalFlow>(*s.context, device->queues, device->dlss5OpticalFlowQueueFamily,
                 device->dlss5OpticalFlowQueue, extent, format, motionSources, shaderPath,
                 device->downstreamGIPA, layerDeviceProcAddr());
         }

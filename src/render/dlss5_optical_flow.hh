@@ -1,16 +1,18 @@
 #pragma once
 
+#include "gpu/queue.hh"
 #include "vk_context.h"
 #include <memory>
 
 namespace VkHook
 {
-    // Borrows the context and optical queue. The caller serializes submissions and
+    // Borrows the context, the queue table and the optical queue; both queues must be
+    // known to `queues` (every submit takes that queue's mutex). The caller serializes submissions and
     // retires all work (including partial failed prepares) before destruction.
     class Dlss5OpticalFlow
     {
     public:
-        Dlss5OpticalFlow(vk::Context& context, uint32_t opticalQueueFamily, VkQueue opticalQueue,
+        Dlss5OpticalFlow(vk::Context& context, QueueTable& queues, uint32_t opticalQueueFamily, VkQueue opticalQueue,
                         VkExtent2D extent, VkFormat sourceFormat, const std::vector<VkImage>& sources,
                         const std::string& shaderPath, PFN_vkGetInstanceProcAddr gipa,
                         PFN_vkGetDeviceProcAddr gdpa);

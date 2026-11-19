@@ -860,7 +860,7 @@ VKHOOK_I686_DEPS=$PWD/build-deps32 scripts/build-i686.sh build-i686
 The ReShade subtree has small local C++20/libc++ compatibility fixes (qualified
 `reshadefx::module`, explicit `<cstdlib>` and `<alloca.h>` includes). Retain them
 when updating that subtree. libc++ before 21 has no `std::atomic<std::shared_ptr>`, so
-published snapshots go through `CowSlot` (`src/cow_slot.hh`). The source also
+published snapshots go through `CowSlot` (`src/core/cow_slot.hh`). The source also
 preserves full-width Vulkan handles on i386 and handles both ELF32 REL and ELF64 RELA
 relocations, including Wayland's non-PLT `GLOB_DAT` GOT entries.
 

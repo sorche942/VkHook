@@ -3,6 +3,7 @@
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
 #include "dlss5_device.hh"
+#include "gpu/queue.hh"
 #include "dlss5_optical_flow.hh"
 #include "dlss5_parameters.hh"
 #include <algorithm>
@@ -183,7 +184,14 @@ int main(int argc, char** argv)
         require(allocation.memoryTypeIndex != UINT32_MAX, "image memory unavailable");
         VK_CHECK(vkAllocateMemory(runtime.device, &allocation, nullptr, &runtime.source.memory));
         VK_CHECK(vkBindImageMemory(runtime.device, runtime.source.image, runtime.source.memory, 0));
-        Dlss5OpticalFlow flow(context, optical, opticalQueue, {width, height}, imageInfo.format,
+        Timeline timeline;
+        QueueDispatch queueDispatch;
+        fillQueueDispatch(runtime.device, vkGetDeviceProcAddr, &queueDispatch);
+        QueueTable queueTable;
+        queueTable.init(runtime.device, queueDispatch, timeline);
+        queueTable.add(context.queue(), graphics, 0);
+        queueTable.add(opticalQueue, optical, 0);
+        Dlss5OpticalFlow flow(context, queueTable, optical, opticalQueue, {width, height}, imageInfo.format,
                              {runtime.source.image}, argv[1], vkGetInstanceProcAddr, vkGetDeviceProcAddr);
         auto input = context.createBuffer(pixels * 4, false, "test input");
         auto previous = context.createBuffer(pixels * 4, false, "test previous input");

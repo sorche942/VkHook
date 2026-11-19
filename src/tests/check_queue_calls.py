@@ -51,9 +51,7 @@ TYPE_ALLOWED = {"gpu/queue.hh", "gpu/queue.cc", "render/vkfuncs.hh",
 SKIP_DIRS = {"vendor", "tests"}
 # Baseline of known, not-yet-fixed violations: exact violation count per file.
 # More than the baseline fails, fewer fails too (delete the entry once fixed).
-# dlss5_optical_flow.cc submits through s.dispatch.vkQueueSubmit on the present
-# and optical queues; follow-up: route through QueueTable.
-KNOWN_VIOLATIONS = {"render/dlss5_optical_flow.cc": 2}
+KNOWN_VIOLATIONS = {}
 
 
 def strip(src):

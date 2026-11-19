@@ -345,7 +345,8 @@ namespace
             {
                 guardLayerWork(logicalDevice, "overlay record", [&] {
                     const VkCommandBuffer overlayCmd = shared.overlay->record(
-                        index, shared.imageViews[index], sc->imageExtent.width, sc->imageExtent.height);
+                        index, shared.imageViews[index], sc->imageExtent.width, sc->imageExtent.height,
+                        shared.input.get());
                     if (overlayCmd != VK_NULL_HANDLE)
                     {
                         target.overlayCommandBuffer = overlayCmd;

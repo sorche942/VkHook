@@ -8,7 +8,7 @@
 #include <string>
 #include <string_view>
 
-#include "layer/cow_slot.hh"
+#include "cow_slot.hh"
 #include "settings_schema.hh"
 
 namespace VkHook

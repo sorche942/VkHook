@@ -1,5 +1,7 @@
 #include "dlss5_optical_flow.hh"
 
+#include "gpu/queue.hh"
+
 #include <algorithm>
 #include <array>
 #include <limits>
@@ -29,6 +31,7 @@ namespace VkHook
     struct Dlss5OpticalFlow::State
     {
         vk::Context& context;
+        QueueTable& queues;
         const vk::Dispatch& dispatch;
         VkDevice device;
         VkQueue opticalQueue = VK_NULL_HANDLE;
@@ -79,7 +82,7 @@ namespace VkHook
         bool initialized = false;
         VkResult failure = VK_SUCCESS;
 
-        explicit State(vk::Context& ctx) : context(ctx), dispatch(ctx.dispatch()), device(ctx.device()) {}
+        State(vk::Context& ctx, QueueTable& table) : context(ctx), queues(table), dispatch(ctx.dispatch()), device(ctx.device()) {}
 
         ~State()
         {
@@ -336,10 +339,10 @@ namespace VkHook
         }
     };
 
-    Dlss5OpticalFlow::Dlss5OpticalFlow(vk::Context& context, uint32_t opticalQueueFamily, VkQueue opticalQueue,
+    Dlss5OpticalFlow::Dlss5OpticalFlow(vk::Context& context, QueueTable& queues, uint32_t opticalQueueFamily, VkQueue opticalQueue,
         VkExtent2D extent, VkFormat sourceFormat, const std::vector<VkImage>& sources,
         const std::string& shaderPath, PFN_vkGetInstanceProcAddr gipa, PFN_vkGetDeviceProcAddr gdpa)
-        : state(std::make_unique<State>(context))
+        : state(std::make_unique<State>(context, queues))
     {
         auto& s = *state;
         s.load(gipa, gdpa);
@@ -464,7 +467,7 @@ namespace VkHook
         prepass.pCommandBuffers = commands + (s.initialized ? 1 : 0);
         prepass.signalSemaphoreCount = 1;
         prepass.pSignalSemaphores = &frame.lumaReady;
-        VkResult result = s.dispatch.vkQueueSubmit(s.context.queue(), 1, &prepass, VK_NULL_HANDLE);
+        VkResult result = s.queues.submit(s.context.queue(), 1, &prepass, VK_NULL_HANDLE);
         if (result != VK_SUCCESS) return s.failure = result;
         s.initialized = true;
         VkSubmitInfo optical{VK_STRUCTURE_TYPE_SUBMIT_INFO};
@@ -475,7 +478,7 @@ namespace VkHook
         optical.pCommandBuffers = &frame.optical;
         optical.signalSemaphoreCount = 1;
         optical.pSignalSemaphores = &frame.flowReady;
-        result = s.dispatch.vkQueueSubmit(s.opticalQueue, 1, &optical, VK_NULL_HANDLE);
+        result = s.queues.submit(s.opticalQueue, 1, &optical, VK_NULL_HANDLE);
         if (result != VK_SUCCESS) return s.failure = result;
         nextSubmit.waitSemaphoreCount = 1;
         nextSubmit.pWaitSemaphores = &frame.flowReady;

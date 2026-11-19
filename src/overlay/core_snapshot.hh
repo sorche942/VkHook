@@ -7,7 +7,7 @@
 #include <string>
 #include <vector>
 
-#include "layer/cow_slot.hh"
+#include "cow_slot.hh"
 #include "effects/effect_config.hh"
 #include "settings_schema.hh"
 #include "vulkan_include.hh"

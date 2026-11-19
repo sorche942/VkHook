@@ -388,6 +388,8 @@ if dlss5_available
         'tests/dlss5_temporal_gpu_smoke.cc',
         'render/dlss5_device.cc',
         'render/dlss5_optical_flow.cc',
+        'gpu/queue.cc',
+        'gpu/timeline.cc',
         dlss5_chain,
         dependencies : [vkhook_core_dep, opendlss_nr_dep, libdl_dep],
         link_depends : dlss5_assets)

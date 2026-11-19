@@ -15,7 +15,7 @@
 // submit under the queue mutex, then a wait with nothing held.
 
 #include "gpu/timeline.hh"
-#include "layer/cow_slot.hh"
+#include "cow_slot.hh"
 #include "vulkan_include.hh"
 
 #include <cstdint>
