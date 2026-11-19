@@ -1,0 +1,17 @@
+[VKHOOK]
+Effects=Bloom@qUINT_bloom.fx, LumaStack@LumaStack.fx, Bloom.2@qUINT_bloom.fx, *Vibrance@Vibrance.fx, DLSS5, Tonemap@Tonemap.fx
+
+[Bloom]
+PreprocessorDefinitions=BLOOM_QUALITY=2
+BLOOM_INT=0.500000
+BLOOM_TINT=1.000000,0.500000,0.250000
+
+[Bloom.2]
+PreprocessorDefinitions=BLOOM_QUALITY=float2(1,,2)
+BLOOM_INT=1.500000
+BLOOM_TINT=0.000000,0.000000,1.000000
+
+[Vibrance]
+PreprocessorDefinitions=VIB_TINT=float3(1,,0,,0),VIB_MODE=1
+Vibrance=0.750000
+Vibrance_RGB_balance=1.000000,0.900000,0.800000

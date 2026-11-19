@@ -4,9 +4,7 @@
 #include "layer/device_plan.hh"
 #include "persist.hh"
 
-#include "keyboard_input_wayland.hh"
-#include "mouse_input_wayland.hh"
-#include "wayland_display.hh"
+#include "input_session.hh"
 #include "wayland_interpose_patch.hh"
 #include "logger.hh"
 #include "util.hh"
@@ -142,20 +140,22 @@ namespace
     {
         Logger::trace("vkCreateWaylandSurfaceKHR");
 
-        // Capture the wl_display and wl_surface for Wayland input
-        guardLayerWork(nullptr, "vkCreateWaylandSurfaceKHR", [&] {
-            if (pCreateInfo && pCreateInfo->display)
-                setWaylandDisplay(pCreateInfo->display);
-            if (pCreateInfo && pCreateInfo->surface)
-                setWaylandSurface(pCreateInfo->surface);
-        });
-
         // Forward to the real implementation via the next layer
         auto nextFunc = (PFN_vkCreateWaylandSurfaceKHR) resolveNextInstanceProc(instance, "vkCreateWaylandSurfaceKHR");
         if (!nextFunc)
             return VK_ERROR_EXTENSION_NOT_PRESENT;
 
-        return nextFunc(instance, pCreateInfo, pAllocator, pSurface);
+        const VkResult result = nextFunc(instance, pCreateInfo, pAllocator, pSurface);
+        if (result != VK_SUCCESS || !pCreateInfo)
+            return result;
+
+        // The surface's input session: the game's wl_display and wl_surface, captured
+        // only for a surface that was actually created
+        guardLayerWork(nullptr, "vkCreateWaylandSurfaceKHR", [&] {
+            registerSurface(*pSurface, InputSession::create(SurfaceKind::Wayland, pCreateInfo->display,
+                                                            reinterpret_cast<uintptr_t>(pCreateInfo->surface)));
+        });
+        return result;
     }
 
     VKAPI_ATTR VkResult VKAPI_CALL VkHook_CreateXlibSurfaceKHR(
@@ -165,14 +165,18 @@ namespace
         VkSurfaceKHR*                        pSurface)
     {
         Logger::trace("vkCreateXlibSurfaceKHR");
-        if (pCreateInfo && pCreateInfo->window)
-            setX11Window((unsigned long)pCreateInfo->window);
 
         auto nextFunc = (PFN_vkCreateXlibSurfaceKHR) resolveNextInstanceProc(instance, "vkCreateXlibSurfaceKHR");
         if (!nextFunc)
             return VK_ERROR_EXTENSION_NOT_PRESENT;
 
-        return nextFunc(instance, pCreateInfo, pAllocator, pSurface);
+        const VkResult result = nextFunc(instance, pCreateInfo, pAllocator, pSurface);
+        if (result == VK_SUCCESS && pCreateInfo)
+            guardLayerWork(nullptr, "vkCreateXlibSurfaceKHR", [&] {
+                registerSurface(*pSurface, InputSession::create(SurfaceKind::X11, pCreateInfo->dpy,
+                                                                static_cast<uintptr_t>(pCreateInfo->window)));
+            });
+        return result;
     }
 
     VKAPI_ATTR VkResult VKAPI_CALL VkHook_CreateXcbSurfaceKHR(
@@ -182,14 +186,36 @@ namespace
         VkSurfaceKHR*                       pSurface)
     {
         Logger::trace("vkCreateXcbSurfaceKHR");
-        if (pCreateInfo && pCreateInfo->window)
-            setX11Window((unsigned long)pCreateInfo->window);
 
         auto nextFunc = (PFN_vkCreateXcbSurfaceKHR) resolveNextInstanceProc(instance, "vkCreateXcbSurfaceKHR");
         if (!nextFunc)
             return VK_ERROR_EXTENSION_NOT_PRESENT;
 
-        return nextFunc(instance, pCreateInfo, pAllocator, pSurface);
+        const VkResult result = nextFunc(instance, pCreateInfo, pAllocator, pSurface);
+        if (result == VK_SUCCESS && pCreateInfo)
+            guardLayerWork(nullptr, "vkCreateXcbSurfaceKHR", [&] {
+                registerSurface(*pSurface, InputSession::create(SurfaceKind::X11, pCreateInfo->connection,
+                                                                static_cast<uintptr_t>(pCreateInfo->window)));
+            });
+        return result;
+    }
+
+    VKAPI_ATTR void VKAPI_CALL VkHook_DestroySurfaceKHR(VkInstance                   instance,
+                                                          VkSurfaceKHR                 surface,
+                                                          const VkAllocationCallbacks* pAllocator)
+    {
+        Logger::trace("vkDestroySurfaceKHR");
+
+        // the session goes first: its grabs and Wayland objects belong to the window
+        // the application is about to destroy
+        guardLayerWork(nullptr, "vkDestroySurfaceKHR", [&] {
+            if (const std::shared_ptr<InputSession> session = unregisterSurface(surface))
+                session->destroy();
+        });
+
+        auto nextFunc = (PFN_vkDestroySurfaceKHR) resolveNextInstanceProc(instance, "vkDestroySurfaceKHR");
+        if (nextFunc)
+            nextFunc(instance, surface, pAllocator);
     }
 
     const InterceptEntry kInstanceIntercepts[] = {
@@ -198,6 +224,7 @@ namespace
         VKHOOK_INTERCEPT(Unconditional, CreateWaylandSurfaceKHR),
         VKHOOK_INTERCEPT(Unconditional, CreateXlibSurfaceKHR),
         VKHOOK_INTERCEPT(Unconditional, CreateXcbSurfaceKHR),
+        VKHOOK_INTERCEPT(Unconditional, DestroySurfaceKHR),
     };
 } // namespace
 

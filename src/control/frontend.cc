@@ -4,15 +4,11 @@
 #include "present/swapchain.hh"
 
 #include "keyboard_input.hh"
-#include "keyboard_input_wayland.hh"
-#include "wayland_input_common.hh"
-#include "wayland_display.hh"
-#include "input_blocker.hh"
+#include "input_session.hh"
 #include "config.hh"
 #include "config_serializer.hh"
-#include "settings_manager.hh"
+#include "store.hh"
 #include "effects/effect_registry.hh"
-#include "imgui_overlay.hh"
 #include "logger.hh"
 #include "util.hh"
 
@@ -36,7 +32,7 @@ namespace VkHook
     // reads the persisted setting once
     void latchDepthCaptureSetting()
     {
-        g_depthCaptureLatched = settingsManager.getDepthCapture();
+        g_depthCaptureLatched = ConfigStore::instance().getDepthCapture();
         g_depthCaptureLatchedValid = true;
     }
 
@@ -60,7 +56,6 @@ namespace VkHook
     std::string activeProfilePath;
     std::string activeShaderProfilePath;
 
-    ResizeDebounceState resizeDebounce;
     static constexpr int64_t RESIZE_DEBOUNCE_MS = 200;
 
     // Cached available effects data (to avoid re-parsing config every frame)
@@ -74,9 +69,9 @@ namespace VkHook
     };
     CachedEffectsData cachedEffects;
 
-    bool handleKeyPress(uint32_t keySymbol, bool& wasPressed)
+    bool handleKeyPress(InputSession* session, uint32_t keySymbol, bool& wasPressed)
     {
-        if (isKeyPressed(keySymbol))
+        if (session && session->isKeyPressed(keySymbol))
         {
             if (!wasPressed)
             {
@@ -91,16 +86,9 @@ namespace VkHook
         return false;
     }
 
-    void beginInputFrame()
+    DeviceControlState::DeviceControlState(LogicalDevice* device) : overlay(device)
     {
-        if (isWayland())
-            beginWaylandInputFrame();
-        beginKeyboardInputFrame();
-    }
-
-    DeviceControlState::DeviceControlState()
-    {
-        const auto settings = settingsManager.snapshot();
+        const auto settings = ConfigStore::instance().snapshot();
         keySymbol        = convertToKeySym(settings->toggleKey);
         reloadKeySymbol  = convertToKeySym(settings->reloadKey);
         overlayKeySymbol = convertToKeySym(settings->overlayKey);
@@ -108,35 +96,50 @@ namespace VkHook
         lastEffectsOn.store(presentEffect, std::memory_order_relaxed);
     }
 
+    void DeviceControlState::noteResize()
+    {
+        lastResizeNs.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               std::chrono::steady_clock::now().time_since_epoch()).count(),
+                           std::memory_order_relaxed);
+        resizePending.store(true, std::memory_order_release);
+    }
+
     namespace
     {
-        // Own small mutex: the map is touched by present threads of every device
-        // and by vkDestroyDevice. States are heap-allocated, so a reference
-        // stays valid until releaseDeviceControl for that device.
-        std::mutex deviceControlMutex;
-        std::unordered_map<LogicalDevice*, std::unique_ptr<DeviceControlState>> deviceControlStates;
-
         // Clears LogicalDevice::frontendBusy when the frame ends, on every path.
         struct FrontendBusyGuard
         {
             LogicalDevice* device;
             ~FrontendBusyGuard() { device->frontendBusy.store(false, std::memory_order_release); }
         };
-    }
 
-    DeviceControlState& deviceControl(LogicalDevice* logicalDevice)
-    {
-        std::lock_guard<std::mutex> lock(deviceControlMutex);
-        auto& slot = deviceControlStates[logicalDevice];
-        if (!slot)
-            slot = std::make_unique<DeviceControlState>();
-        return *slot;
-    }
+        // Effects of the registry that are switched on, in chain order.
+        std::vector<std::string> activeEffectNames()
+        {
+            std::vector<std::string> active;
+            for (const auto& effectName : effectRegistry.getSelectedEffects())
+            {
+                if (effectRegistry.isEffectEnabled(effectName))
+                    active.push_back(effectName);
+            }
+            return active;
+        }
 
-    void releaseDeviceControl(LogicalDevice* logicalDevice)
-    {
-        std::lock_guard<std::mutex> lock(deviceControlMutex);
-        deviceControlStates.erase(logicalDevice);
+        // The registry's chain becomes `effects`; the ones in `disabled` stay listed but off.
+        void selectEffects(const std::vector<std::string>& effects, const std::vector<std::string>& disabled)
+        {
+            effectRegistry.setSelectedEffects(effects);
+            const std::set<std::string> disabledSet(disabled.begin(), disabled.end());
+            for (const auto& effectName : effects)
+                effectRegistry.setEffectEnabled(effectName, disabledSet.find(effectName) == disabledSet.end());
+        }
+
+        // The selected effects of the config just loaded
+        void selectEffectsFromConfig()
+        {
+            selectEffects(config->getOption<std::vector<std::string>>("effects", {}),
+                          config->getOption<std::vector<std::string>>("disabledEffects", {}));
+        }
     }
 
     // Initialize configs: base (VkHook.conf) + current (from game profile / env / default)
@@ -154,12 +157,9 @@ namespace VkHook
             // keep the config dir's version file in step with the built library
             ConfigSerializer::ensureVersionFile();
 
-            // move shaders out of the old reshade/packages/ tree before anything
-            // scans for them
-            ConfigSerializer::migrateLegacyReshadePackages();
-
-            // Initialize settings manager (single source of truth for settings)
-            settingsManager.initialize();
+            // Initialize the settings store (single source of truth for settings);
+            // it runs the pending config migrations before anything scans for shaders
+            ConfigStore::instance().initialize();
 
             // latch depth capture for the process: the hooks run inside the game's
             // command recording, so a mid-frame re-arm is off the table
@@ -451,10 +451,12 @@ namespace VkHook
         cachedEffects.initialized = false;
     }
 
-    // Build and update overlay state for rendering
-    static void updateOverlayState(LogicalDevice* logicalDevice, bool effectsEnabled, DeviceControlState& state)
+    // The add-effects page's data and the snapshot the views read this frame.
+    static void updateOverlayState(DeviceControlState& state, bool effectsEnabled)
     {
-        if (!logicalDevice->imguiOverlay || !logicalDevice->imguiOverlay->isVisible())
+        OverlayControl& overlay = state.overlay;
+        const OverlayUi* ui = overlay.ui();
+        if (!ui || !ui->isVisible())
             return;
 
         OverlayState overlayState;
@@ -467,7 +469,7 @@ namespace VkHook
         overlayState.configPath = config->getConfigFilePath();
 
         // Cache the filename extraction — config path rarely changes
-                if (overlayState.configPath != state.cachedConfigPath)
+        if (overlayState.configPath != state.cachedConfigPath)
         {
             state.cachedConfigPath = overlayState.configPath;
             state.cachedConfigName = std::filesystem::path(state.cachedConfigPath).filename().string();
@@ -476,7 +478,7 @@ namespace VkHook
         overlayState.effectsEnabled = effectsEnabled;
 
         // Ensure all selected effects are in the registry
-        for (const auto& effectName : logicalDevice->imguiOverlay->getSelectedEffects())
+        for (const auto& effectName : effectRegistry.getSelectedEffects())
         {
             if (effectRegistry.hasEffect(effectName))
                 continue;
@@ -485,11 +487,11 @@ namespace VkHook
             effectRegistry.ensureEffect(effectName, effectPath);
         }
 
-        // Parameters now read directly from EffectRegistry, no need to pass via state
-        logicalDevice->imguiOverlay->updateState(std::move(overlayState));
+        overlay.setAvailable(std::move(overlayState));
+        overlay.publishSnapshot();
     }
 
-    bool runFrontendFrame(LogicalDevice* logicalDevice, DeviceControlState& state)
+    bool runFrontendFrame(LogicalDevice* logicalDevice, DeviceControlState& state, InputSession* session)
     {
         // One present thread runs the control step per device; the others reuse
         // its last decision instead of racing on the hotkey/reload state.
@@ -499,26 +501,33 @@ namespace VkHook
 
         // No layer lock is held here: the step does file I/O (config change
         // checks, reloads), shader scans and overlay work. stateLock is taken
-        // only for the short pending-reload / depthReallocPending accesses.
-        const auto settings = settingsManager.snapshot();
+        // only for the short pending-reload accesses.
+        OverlayControl& overlay = state.overlay;
+        overlay.initProfiles();
 
-        // Check if settings were saved (the UI already published the new settings)
-        if (logicalDevice->imguiOverlay && logicalDevice->imguiOverlay->hasSettingsSaved())
+        // What the user did in the overlay since the last frame
+        const OverlayRequests requests = overlay.applyCommands();
+
+        // Settings were saved (the store already published the new values)
+        if (requests.settingsSaved)
         {
+            const auto settings = ConfigStore::instance().snapshot();
             state.keySymbol = convertToKeySym(settings->toggleKey);
             state.reloadKeySymbol = convertToKeySym(settings->reloadKey);
             state.overlayKeySymbol = convertToKeySym(settings->overlayKey);
-            initInputBlocker(settings->overlayBlockInput);
-            setInputBlocked(logicalDevice->imguiOverlay->isVisible());
-            logicalDevice->imguiOverlay->clearSettingsSaved();
-            Logger::info("Settings reloaded from SettingsManager");
+            if (session)
+            {
+                session->initBlocker(settings->overlayBlockInput);
+                const OverlayUi* ui = overlay.ui();
+                session->setBlocked(ui && ui->isVisible());
+            }
+            Logger::info("Settings reloaded from ConfigStore");
         }
 
         // Check if shader paths were changed (refresh available effects list)
-        if (logicalDevice->imguiOverlay && logicalDevice->imguiOverlay->hasShaderPathsChanged())
+        if (requests.shaderPathsChanged)
         {
             invalidateAvailableEffects();  // force re-scan of available effects
-            logicalDevice->imguiOverlay->clearShaderPathsChanged();
             Logger::info("Shader paths changed, effect list refreshed");
         }
 
@@ -550,13 +559,13 @@ namespace VkHook
         }
 
         // Toggle effect on/off (keyboard)
-        if (handleKeyPress(state.keySymbol, state.pressed))
+        if (handleKeyPress(session, state.keySymbol, state.pressed))
             state.presentEffect = !state.presentEffect;
 
         // Hot-reload: check for key press or config file change
         bool shouldReload = false;
         bool reloadFromDisk = false;
-        if (handleKeyPress(state.reloadKeySymbol, state.reloadPressed))
+        if (handleKeyPress(session, state.reloadKeySymbol, state.reloadPressed))
         {
             Logger::debug("reload key pressed");
             shouldReload = true;
@@ -568,101 +577,68 @@ namespace VkHook
             shouldReload = true;
             reloadFromDisk = true;
         }
+        // the overlay's "Reload config from disk" takes the same path as the reload key
+        if (requests.reloadFromDisk)
+            reloadFromDisk = true;
 
         // Toggle overlay on/off
-        if (handleKeyPress(state.overlayKeySymbol, state.overlayPressed))
+        if (handleKeyPress(session, state.overlayKeySymbol, state.overlayPressed))
         {
-            if (logicalDevice->imguiOverlay)
-                logicalDevice->imguiOverlay->toggle();
+            if (OverlayUi* ui = overlay.ui())
+                ui->toggle();
         }
 
         // Toggle effects on/off via overlay checkbox
-        if (logicalDevice->imguiOverlay && logicalDevice->imguiOverlay->hasToggleEffectsRequest())
-        {
+        if (requests.toggleEffects)
             state.presentEffect = !state.presentEffect;
-            logicalDevice->imguiOverlay->clearToggleEffectsRequest();
-        }
 
-        // only the resolve path needs rebuilding, which the deferred realloc
-        // does per swapchain generation. the full chain reload this used to
-        // trigger recompiles every shader and re-records every command buffer
-        // for a change that does not touch the chain.
-        if (logicalDevice->imguiOverlay && logicalDevice->imguiOverlay->hasDepthPinChanged())
-        {
-            logicalDevice->imguiOverlay->clearDepthPinChanged();
-            std::lock_guard<std::mutex> lock(logicalDevice->stateLock);
-            logicalDevice->depthReallocPending = true;
-        }
-
-        if (logicalDevice->imguiOverlay && logicalDevice->imguiOverlay->hasModifiedParams())
+        if (requests.rebuild)
         {
             // Modified parameters live in EffectRegistry — effects pick
-            // them up at reload time, so all we need to do here is clear
-            // the request and trigger a reload.
-            logicalDevice->imguiOverlay->clearApplyRequest();
+            // them up at reload time, so all we need to do here is
+            // trigger a reload.
             shouldReload = true;
         }
 
         if (shouldReload)
         {
-            if (logicalDevice->imguiOverlay)
-                logicalDevice->imguiOverlay->refreshShaderProfiles();
+            overlay.refreshShaderProfiles();
             Logger::info("hot-reloading config and effects...");
             auto reloadSelectedEffects = [&]() {
                 invalidateAvailableEffects();
-                std::vector<std::string> effects = logicalDevice->imguiOverlay
-                    ? logicalDevice->imguiOverlay->getActiveEffects()
-                    : config->getOption<std::vector<std::string>>("effects", {});
+                std::vector<std::string> effects = activeEffectNames();
                 std::lock_guard<std::mutex> lock(logicalDevice->stateLock);
                 logicalDevice->pendingChainEffects = std::move(effects);
                 logicalDevice->pendingChainReload = true;
             };
 
-            // the overlay owns the active profile; the static is only for
-            // early calls before it exists.
-            std::string overlayShaderPath = logicalDevice->imguiOverlay
-                ? logicalDevice->imguiOverlay->getActiveShaderProfilePath()
-                : std::string();
+            // the overlay's control owns the active profile; the global is only
+            // for early calls before the first frame ran.
+            std::string overlayShaderPath = overlay.activeShaderProfilePath();
             if (overlayShaderPath.empty())
                 overlayShaderPath = activeShaderProfilePath;
 
-            // Check if overlay wants to load a different config
-            if (logicalDevice->imguiOverlay && logicalDevice->imguiOverlay->hasPendingConfig())
+            // Check if the overlay wants to load a different config
+            if (!requests.pendingConfigPath.empty())
             {
-                std::string newConfigPath = logicalDevice->imguiOverlay->getPendingConfigPath();
-                switchConfig(newConfigPath, overlayShaderPath);
-                // Update overlay with effects from the new config
-                std::vector<std::string> newEffects = config->getOption<std::vector<std::string>>("effects", {});
-                std::vector<std::string> disabledEffects = config->getOption<std::vector<std::string>>("disabledEffects", {});
-                logicalDevice->imguiOverlay->setSelectedEffects(newEffects, disabledEffects);
-                logicalDevice->imguiOverlay->clearPendingConfig();
+                switchConfig(requests.pendingConfigPath, overlayShaderPath);
+                // Update the registry with the effects from the new config
+                selectEffectsFromConfig();
                 reloadSelectedEffects();
             }
-            else if (logicalDevice->imguiOverlay && logicalDevice->imguiOverlay->hasPendingShaderProfile())
+            else if (requests.pendingShaderProfile)
             {
-                const std::string shaderPath = logicalDevice->imguiOverlay->getPendingShaderProfilePath();
-                if (!shaderPath.empty())
-                {
-                    switchConfig(config->getConfigFilePath(), shaderPath);
-                    std::vector<std::string> newEffects = config->getOption<std::vector<std::string>>("effects", {});
-                    std::vector<std::string> disabledEffects = config->getOption<std::vector<std::string>>("disabledEffects", {});
-                    logicalDevice->imguiOverlay->setSelectedEffects(newEffects, disabledEffects);
-                }
-                else
-                {
-                    switchConfig(config->getConfigFilePath(), "");
-                    const std::vector<std::string> newEffects = config->getOption<std::vector<std::string>>("effects", {});
-                    const std::vector<std::string> disabledEffects = config->getOption<std::vector<std::string>>("disabledEffects", {});
-                    logicalDevice->imguiOverlay->setSelectedEffects(newEffects, disabledEffects);
-                }
-                logicalDevice->imguiOverlay->clearPendingShaderProfile();
+                // an empty path drops the preset's overrides
+                switchConfig(config->getConfigFilePath(), requests.pendingShaderProfilePath);
+                selectEffectsFromConfig();
                 reloadSelectedEffects();
             }
             else
             {
-                // only the reload key or an external file change re-reads the
-                // config and re-applies the profile; a UI apply rebuilds the
-                // chain from the registry, which is already the truth
+                // only the reload key, an external file change or the overlay's
+                // reload re-reads the config and re-applies the profile; a UI
+                // apply rebuilds the chain from the registry, which is already
+                // the truth
                 if (reloadFromDisk)
                 {
                     config->reload();
@@ -674,15 +650,15 @@ namespace VkHook
 
         // Check for debounced resize reload (separate from config reload)
         // Only call steady_clock::now() when a resize is actually pending
-        if (resizeDebounce.pending)
+        if (state.resizePending.load(std::memory_order_acquire))
         {
-            auto resizeElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - resizeDebounce.lastResizeTime).count();
+            const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            const int64_t resizeElapsed = (nowNs - state.lastResizeNs.load(std::memory_order_relaxed)) / 1'000'000;
 
-            if (resizeElapsed >= RESIZE_DEBOUNCE_MS)
+            if (resizeElapsed >= RESIZE_DEBOUNCE_MS && state.resizePending.exchange(false, std::memory_order_acq_rel))
             {
                 Logger::info("debounced resize reload after " + std::to_string(resizeElapsed) + "ms");
-                resizeDebounce.pending = false;
 
                 // Get selected effects from registry (single source of truth);
                 // the reload runs at the start of the next control step.
@@ -693,7 +669,7 @@ namespace VkHook
             }
         }
 
-        updateOverlayState(logicalDevice, state.presentEffect, state);
+        updateOverlayState(state, state.presentEffect);
         state.lastEffectsOn.store(state.presentEffect, std::memory_order_release);
         return state.presentEffect;
     }

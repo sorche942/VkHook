@@ -1,5 +1,7 @@
 #include "layer/registry.hh"
 
+#include "gpu/retire.hh"
+#include "input_session.hh"
 #include "logger.hh"
 
 #include <mutex>
@@ -12,13 +14,13 @@ namespace VkHook
 {
 namespace
 {
-    template <typename Value>
+    template <typename Key, typename Value>
     class KeyedRegistry
     {
     public:
-        using Map = std::unordered_map<void*, Value>;
+        using Map = std::unordered_map<Key, Value>;
 
-        Value find(void* key) const
+        Value find(Key key) const
         {
             auto snapshot = slot.load();
             if (!snapshot)
@@ -27,7 +29,7 @@ namespace
             return it == snapshot->end() ? nullptr : it->second;
         }
 
-        void insert(void* key, Value value)
+        void insert(Key key, Value value)
         {
             std::lock_guard<std::mutex> l(writeLock);
             auto next = std::make_shared<Map>(copy());
@@ -41,7 +43,22 @@ namespace
             return !snapshot || snapshot->empty();
         }
 
-        void erase(void* key)
+        // Removes `key` and returns what it held.
+        Value take(Key key)
+        {
+            std::lock_guard<std::mutex> l(writeLock);
+            auto next = std::make_shared<Map>(copy());
+            Value value{};
+            if (auto it = next->find(key); it != next->end())
+            {
+                value = std::move(it->second);
+                next->erase(it);
+            }
+            slot.store(std::move(next));
+            return value;
+        }
+
+        void erase(Key key)
         {
             std::lock_guard<std::mutex> l(writeLock);
             auto next = std::make_shared<Map>(copy());
@@ -60,18 +77,40 @@ namespace
         std::mutex   writeLock;  // create/destroy only; lookups never take it
     };
 
-    KeyedRegistry<std::shared_ptr<const InstanceState>>& instances()
+    KeyedRegistry<void*, std::shared_ptr<const InstanceState>>& instances()
     {
-        static KeyedRegistry<std::shared_ptr<const InstanceState>> registry;
+        static KeyedRegistry<void*, std::shared_ptr<const InstanceState>> registry;
         return registry;
     }
 
-    KeyedRegistry<std::shared_ptr<LogicalDevice>>& devices()
+    KeyedRegistry<void*, std::shared_ptr<LogicalDevice>>& devices()
     {
-        static KeyedRegistry<std::shared_ptr<LogicalDevice>> registry;
+        static KeyedRegistry<void*, std::shared_ptr<LogicalDevice>> registry;
+        return registry;
+    }
+
+    // VkSurfaceKHR is a 64-bit handle on every ABI; the key never narrows it.
+    KeyedRegistry<uint64_t, std::shared_ptr<InputSession>>& surfaces()
+    {
+        static KeyedRegistry<uint64_t, std::shared_ptr<InputSession>> registry;
         return registry;
     }
 } // namespace
+
+    void registerSurface(VkSurfaceKHR surface, std::shared_ptr<InputSession> session)
+    {
+        surfaces().insert(handleToU64(surface), std::move(session));
+    }
+
+    std::shared_ptr<InputSession> unregisterSurface(VkSurfaceKHR surface)
+    {
+        return surfaces().take(handleToU64(surface));
+    }
+
+    std::shared_ptr<InputSession> findSurfaceSession(VkSurfaceKHR surface)
+    {
+        return surfaces().find(handleToU64(surface));
+    }
 
     bool noInstancesRegistered() { return instances().empty(); }
 

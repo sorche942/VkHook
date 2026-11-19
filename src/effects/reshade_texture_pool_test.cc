@@ -12,15 +12,6 @@
 #include <unordered_map>
 #include <vector>
 
-// The headless executable never creates overlay objects. Complete these
-// forward-declared owners so LogicalDevice's null unique_ptrs can be destroyed
-// without linking the unrelated ImGui renderer.
-namespace VkHook
-{
-    struct OverlayPersistentState {};
-    class ImGuiOverlay {};
-}
-
 using namespace VkHook;
 
 namespace

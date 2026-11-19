@@ -55,8 +55,7 @@ namespace VkHook
         VkExtent2D                            blockedExtent{0, 0};
     };
 
-    struct OverlayPersistentState;  // Forward declaration
-    class ImGuiOverlay;  // Forward declaration
+    struct DeviceControlState;  // control/frontend.hh
 
     struct LogicalDevice
     {
@@ -189,11 +188,10 @@ namespace VkHook
         bool pendingChainReload = false;
         std::vector<std::string> pendingChainEffects;
 
-        // Persistent overlay state that survives swapchain recreation
-        std::unique_ptr<OverlayPersistentState> overlayPersistentState;
-
-        // ImGui overlay - lives at device level to survive swapchain recreation
-        std::unique_ptr<ImGuiOverlay> imguiOverlay;
+        // Hotkeys, overlay UI and its command/snapshot hand-off for this device
+        // (control/frontend.hh). Created with the device, reset in vkDestroyDevice
+        // after every swapchain (whose overlay renderers draw with its UI) is gone.
+        std::shared_ptr<DeviceControlState> control;
 
         // Set by panicLayer() when the layer hits a fatal error. While true,
         // interceptors take the pass-through fast path: the swapchain keeps

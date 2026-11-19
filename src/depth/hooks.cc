@@ -7,7 +7,7 @@
 
 #include "command_buffer.hh"
 #include "format.hh"
-#include "settings_manager.hh"
+#include "store.hh"
 #include "diag/gpu_crash.hh"
 #include "logger.hh"
 #include "util.hh"
@@ -662,7 +662,7 @@ namespace
     // NO command recording happens here.
     void finishTrackedDepthScope(LogicalDevice* logicalDevice, VkCommandBuffer commandBuffer, const char* reason)
     {
-        const auto settings = settingsManager.snapshot();
+        const auto settings = ConfigStore::instance().snapshot();
         const int  method   = settings->depthCaptureMethod;
         std::lock_guard<std::mutex> l(logicalDevice->stateLock);
         DepthState promoted = {};

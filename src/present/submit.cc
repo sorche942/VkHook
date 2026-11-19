@@ -8,7 +8,7 @@
 
 #include "command_buffer.hh"
 #include "format.hh"
-#include "settings_manager.hh"
+#include "store.hh"
 #include "logger.hh"
 
 #include <algorithm>
@@ -73,7 +73,7 @@ namespace
             recordSubmittedBatch(logicalDevice, "app", UINT32_MAX, appWait, appSignal, fence);
         }
 
-        const auto settings = settingsManager.snapshot();
+        const auto settings = ConfigStore::instance().snapshot();
         const int  method   = std::clamp(settings->depthCaptureMethod, 0, 2);
         if (method < 1 || method > 2
             || !depthCaptureActive()

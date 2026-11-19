@@ -2,7 +2,7 @@
 // In particular, a usable source must not allow a nested shader render pass.
 #include "command_buffer.hh"
 #include "logical_swapchain.hh"
-#include "settings_manager.hh"
+#include "store.hh"
 
 #include <cstdio>
 #include <string>
@@ -11,12 +11,12 @@
 
 namespace VkHook
 {
-    // Match the other headless LogicalDevice tests: these owners stay null.
-    struct OverlayPersistentState {};
-    class ImGuiOverlay {};
-
     // Use the real inline settings accessors without loading a user config.
-    SettingsManager settingsManager{};
+    ConfigStore& ConfigStore::instance()
+    {
+        static ConfigStore store;
+        return store;
+    }
 }
 
 using namespace VkHook;
@@ -296,10 +296,10 @@ namespace
 
 int main()
 {
-    settingsManager.setDepthSourceChannel(0);
-    settingsManager.setDepthInvert(false);
-    settingsManager.setDepthFlip(false);
-    settingsManager.setDepthFlop(false);
+    ConfigStore::instance().set("depthSourceChannel", 0);
+    ConfigStore::instance().set("depthInvert", false);
+    ConfigStore::instance().set("depthFlip", false);
+    ConfigStore::instance().set("depthFlop", false);
     for (bool shader : {false, true})
     {
         for (bool initialized : {false, true})

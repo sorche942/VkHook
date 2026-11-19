@@ -1,16 +1,14 @@
-#include "wayland_input_common.hh"
-#include "wayland_display.hh"
-#include "input_blocker.hh"
 #include "logger.hh"
+#include "wayland_input.hh"
+#include "wayland_interpose.hh"
 
 #include "viewporter-client-protocol.h"
 
-#include <atomic>
+#include <wayland-client.h>
+
 #include <algorithm>
-#include <cstring>
 #include <cstdio>
-#include <poll.h>
-#include <vector>
+#include <cstring>
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -18,162 +16,166 @@
 
 namespace VkHook
 {
-    static wl_display* displayWrapper = nullptr;
-    static wl_event_queue* queue = nullptr;
-    static wl_registry* registry = nullptr;
-    static wl_seat* seat = nullptr;
-    static bool commonInitialized = false;
-
-    // Input-capture surface: a transparent wl_subsurface of the game's surface
-    // whose input region is the overlay hitbox.
-    static wl_compositor* compositor = nullptr;
-    static wl_subcompositor* subcompositor = nullptr;
-    static wl_shm* shm = nullptr;
-    // optional: scales a 1x1 buffer to the hitbox, so no per-size pixel buffer is needed
-    static wp_viewporter* viewporter = nullptr;
-    static wp_viewport* inputViewport = nullptr;
-    static wl_surface* inputSurface = nullptr;
-    static wl_subsurface* inputSubsurface = nullptr;
-    static wl_region* inputRegion = nullptr;
-    static wl_buffer* inputBuffer = nullptr;
-    static wl_shm_pool* inputPool = nullptr;
-    static void* inputBufferData = nullptr;
-    static size_t inputBufferSize = 0;
-    static int inputShmFd = -1;
-    static int inputBufferWidth = 0;
-    static int inputBufferHeight = 0;
-    static float inputSurfaceX = 0.0f;
-    static float inputSurfaceY = 0.0f;
-    // last published rect set, so an unchanged overlay doesn't churn the
-    // compositor every frame
-    static std::vector<InputRect> inputSurfaceRects;
-
-    // Frame-level dispatch deduplication — tracks a monotonic counter so
-    // multiple callers (getMouseState, getKeyboardState, isKeyPressed×N)
-    // within the same frame only do one real dispatch.
-    static std::atomic<uint64_t> dispatchFrameId{0};
-    static std::atomic<uint64_t> lastDispatchedFrame{0};
-
-    // Device bind callbacks — set by keyboard/mouse modules before init
-    static KeyboardBindCallback keyboardBind = nullptr;
-    static PointerBindCallback pointerBind = nullptr;
-
-    void setKeyboardBindCallback(KeyboardBindCallback cb)
+    struct WaylandSeatListeners
     {
-        keyboardBind = cb;
-        // If seat already bound, invoke callback immediately for late registration
-        if (seat && cb)
-            cb(seat);
-    }
+        static void capabilities(void* data, wl_seat* /*seat*/, uint32_t caps)
+        {
+            static_cast<WaylandInput*>(data)->onSeatCapabilities(caps);
+        }
 
-    void setPointerBindCallback(PointerBindCallback cb)
-    {
-        pointerBind = cb;
-        // If seat already bound, invoke callback immediately for late registration
-        if (seat && cb)
-            cb(seat);
-    }
+        static void name(void* /*data*/, wl_seat* /*seat*/, const char* /*name*/)
+        {
+        }
 
-    // Single seat listener that handles both keyboard and pointer capabilities
-    static void seatCapabilities(void* /*data*/, wl_seat* s, uint32_t caps)
-    {
-        if ((caps & WL_SEAT_CAPABILITY_KEYBOARD) && keyboardBind)
-            keyboardBind(s);
-        if ((caps & WL_SEAT_CAPABILITY_POINTER) && pointerBind)
-            pointerBind(s);
-    }
+        static void global(void* data, wl_registry* registry, uint32_t name, const char* interface, uint32_t version)
+        {
+            static_cast<WaylandInput*>(data)->onRegistryGlobal(registry, name, interface, version);
+        }
 
-    static void seatName(void* /*data*/, wl_seat* /*seat*/, const char* /*name*/)
-    {
-    }
+        static void globalRemove(void* /*data*/, wl_registry* /*registry*/, uint32_t /*name*/)
+        {
+        }
 
-    static const wl_seat_listener sharedSeatListener = {
-        .capabilities = seatCapabilities,
-        .name = seatName,
+        static constexpr wl_seat_listener seat = {
+            .capabilities = capabilities,
+            .name = name,
+        };
+
+        static constexpr wl_registry_listener registry = {
+            .global = global,
+            .global_remove = globalRemove,
+        };
     };
 
-    static void registryGlobal(void* /*data*/, wl_registry* reg,
-                               uint32_t name, const char* interface, uint32_t version)
+    WaylandInput::WaylandInput(wl_display* display, uintptr_t parentSurface)
+        : m_display(display)
+        , m_parentAtomic(parentSurface)
     {
-        if (strcmp(interface, wl_seat_interface.name) == 0)
+        m_attachment.setParent(parentSurface);
+    }
+
+    WaylandInput::~WaylandInput()
+    {
+        shutdown();
+    }
+
+    void WaylandInput::onSeatCapabilities(uint32_t capabilities)
+    {
+        m_seatCapabilities = capabilities;
+        bindDevices();
+    }
+
+    // Binds the devices a poll asked for and the seat offers. The seat reports
+    // capabilities once, during the second roundtrip of ensureCommon, and again
+    // if a device appears later; a device wanted after the first report binds
+    // from the stored set.
+    void WaylandInput::bindDevices()
+    {
+        if (m_wantKeyboard && (m_seatCapabilities & WL_SEAT_CAPABILITY_KEYBOARD))
+            bindKeyboard();
+        if (m_wantPointer && (m_seatCapabilities & WL_SEAT_CAPABILITY_POINTER))
+            bindPointer();
+    }
+
+    void WaylandInput::onRegistryGlobal(wl_registry* registry, uint32_t name, const char* interface, uint32_t version)
+    {
+        // Each bound global is pushed on the release stack as it is created, so
+        // teardown unwinds them newest first, all before the registry and queue.
+        if (std::strcmp(interface, wl_seat_interface.name) == 0)
         {
-            if (seat)
+            if (m_seat)
                 return;
-            seat = (wl_seat*)wl_registry_bind(reg, name, &wl_seat_interface,
-                                                version < 5 ? version : 5);
-            wl_seat_add_listener(seat, &sharedSeatListener, nullptr);
+            m_seat = static_cast<wl_seat*>(wl_registry_bind(registry, name, &wl_seat_interface,
+                                                            version < 5 ? version : 5));
+            m_releases.push([this] {
+                wl_seat_destroy(m_seat);
+                m_seat = nullptr;
+            });
+            wl_seat_add_listener(m_seat, &WaylandSeatListeners::seat, this);
             Logger::debug("Wayland: shared seat bound");
         }
-        else if (strcmp(interface, wl_compositor_interface.name) == 0)
+        else if (std::strcmp(interface, wl_compositor_interface.name) == 0)
         {
-            if (!compositor)
-                compositor = (wl_compositor*)wl_registry_bind(reg, name, &wl_compositor_interface,
-                                                              version < 4 ? version : 4);
+            if (m_compositor)
+                return;
+            m_compositor = static_cast<wl_compositor*>(wl_registry_bind(registry, name, &wl_compositor_interface,
+                                                                        version < 4 ? version : 4));
+            m_releases.push([this] {
+                wl_compositor_destroy(m_compositor);
+                m_compositor = nullptr;
+            });
         }
-        else if (strcmp(interface, wl_subcompositor_interface.name) == 0)
+        else if (std::strcmp(interface, wl_subcompositor_interface.name) == 0)
         {
-            if (!subcompositor)
-                subcompositor = (wl_subcompositor*)wl_registry_bind(reg, name, &wl_subcompositor_interface, 1);
+            if (m_subcompositor)
+                return;
+            m_subcompositor = static_cast<wl_subcompositor*>(
+                wl_registry_bind(registry, name, &wl_subcompositor_interface, 1));
+            m_releases.push([this] {
+                wl_subcompositor_destroy(m_subcompositor);
+                m_subcompositor = nullptr;
+            });
         }
-        else if (strcmp(interface, wl_shm_interface.name) == 0)
+        else if (std::strcmp(interface, wl_shm_interface.name) == 0)
         {
-            if (!shm)
-                shm = (wl_shm*)wl_registry_bind(reg, name, &wl_shm_interface, 1);
+            if (m_shm)
+                return;
+            m_shm = static_cast<wl_shm*>(wl_registry_bind(registry, name, &wl_shm_interface, 1));
+            m_releases.push([this] {
+                wl_shm_destroy(m_shm);
+                m_shm = nullptr;
+            });
         }
-        else if (strcmp(interface, wp_viewporter_interface.name) == 0)
+        else if (std::strcmp(interface, wp_viewporter_interface.name) == 0)
         {
-            if (!viewporter)
-                viewporter = (wp_viewporter*)wl_registry_bind(reg, name, &wp_viewporter_interface, 1);
+            if (m_viewporter)
+                return;
+            m_viewporter = static_cast<wp_viewporter*>(wl_registry_bind(registry, name, &wp_viewporter_interface, 1));
+            m_releases.push([this] {
+                wp_viewporter_destroy(m_viewporter);
+                m_viewporter = nullptr;
+            });
         }
     }
-
-    static void registryGlobalRemove(void* /*data*/, wl_registry* /*registry*/, uint32_t /*name*/)
-    {
-    }
-
-    static const wl_registry_listener registryListener = {
-        .global = registryGlobal,
-        .global_remove = registryGlobalRemove,
-    };
 
     // ── Input-capture surface ────────────────────────────────────────────────
 
-    static void destroyInputBuffer()
+    void WaylandInput::destroyInputBuffer()
     {
-        if (inputBuffer)
+        if (m_inputBuffer)
         {
-            wl_buffer_destroy(inputBuffer);
-            inputBuffer = nullptr;
+            wl_buffer_destroy(m_inputBuffer);
+            m_inputBuffer = nullptr;
         }
-        if (inputPool)
+        if (m_inputPool)
         {
-            wl_shm_pool_destroy(inputPool);
-            inputPool = nullptr;
+            wl_shm_pool_destroy(m_inputPool);
+            m_inputPool = nullptr;
         }
-        if (inputBufferData)
+        if (m_inputBufferData)
         {
-            munmap(inputBufferData, inputBufferSize);
-            inputBufferData = nullptr;
+            munmap(m_inputBufferData, m_inputBufferSize);
+            m_inputBufferData = nullptr;
         }
-        if (inputShmFd >= 0)
+        if (m_inputShmFd >= 0)
         {
-            close(inputShmFd);
-            inputShmFd = -1;
+            ::close(m_inputShmFd);
+            m_inputShmFd = -1;
         }
-        inputBufferSize = 0;
-        inputBufferWidth = 0;
-        inputBufferHeight = 0;
+        m_inputBufferSize = 0;
+        m_inputBufferWidth = 0;
+        m_inputBufferHeight = 0;
     }
 
     // A fully transparent ARGB buffer. It exists only so the surface is mapped
     // (an unmapped surface receives no input); nothing is ever drawn into it.
     // With wp_viewporter it is a single pixel scaled up to the hitbox; without
     // it the buffer is allocated at the hitbox size.
-    static bool ensureInputBuffer(int hitboxWidth, int hitboxHeight)
+    bool WaylandInput::ensureInputBuffer(int hitboxWidth, int hitboxHeight)
     {
-        const int width = inputViewport ? 1 : hitboxWidth;
-        const int height = inputViewport ? 1 : hitboxHeight;
-        if (inputBuffer && inputBufferWidth == width && inputBufferHeight == height)
+        const int width = m_inputViewport ? 1 : hitboxWidth;
+        const int height = m_inputViewport ? 1 : hitboxHeight;
+        if (m_inputBuffer && m_inputBufferWidth == width && m_inputBufferHeight == height)
             return true;
 
         const size_t size = static_cast<size_t>(width) * static_cast<size_t>(height) * 4u;
@@ -190,19 +192,19 @@ namespace VkHook
 
         if (ftruncate(fd, static_cast<off_t>(size)) != 0)
         {
-            close(fd);
+            ::close(fd);
             return false;
         }
 
         void* data = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
         if (data == MAP_FAILED)
         {
-            close(fd);
+            ::close(fd);
             return false;
         }
-        memset(data, 0, size);
+        std::memset(data, 0, size);
 
-        wl_shm_pool* pool = wl_shm_create_pool(shm, fd, static_cast<int32_t>(size));
+        wl_shm_pool* pool = wl_shm_create_pool(m_shm, fd, static_cast<int32_t>(size));
         wl_buffer* buffer = pool
             ? wl_shm_pool_create_buffer(pool, 0, width, height, width * 4, WL_SHM_FORMAT_ARGB8888)
             : nullptr;
@@ -211,7 +213,7 @@ namespace VkHook
             if (pool)
                 wl_shm_pool_destroy(pool);
             munmap(data, size);
-            close(fd);
+            ::close(fd);
             return false;
         }
 
@@ -221,70 +223,131 @@ namespace VkHook
         // cursor until the user moves again.
         destroyInputBuffer();
 
-        inputBuffer = buffer;
-        inputPool = pool;
-        inputBufferData = data;
-        inputBufferSize = size;
-        inputShmFd = fd;
-        inputBufferWidth = width;
-        inputBufferHeight = height;
+        m_inputBuffer = buffer;
+        m_inputPool = pool;
+        m_inputBufferData = data;
+        m_inputBufferSize = size;
+        m_inputShmFd = fd;
+        m_inputBufferWidth = width;
+        m_inputBufferHeight = height;
         return true;
     }
 
-    static void createInputSurface()
+    void WaylandInput::flush()
     {
-        if (inputSurface || !compositor || !subcompositor || !shm)
-            return;
+        wl_display_flush(m_display);
+    }
 
-        wl_surface* parent = getWaylandSurface();
-        if (!parent)
-            return;
+    // Children before parents: the buffer and viewport hang off the surface, and
+    // the surface must outlive its subsurface role object's destruction request.
+    void WaylandInput::destroyCapture()
+    {
+        destroyInputBuffer();
+        if (m_inputViewport)
+        {
+            wp_viewport_destroy(m_inputViewport);
+            m_inputViewport = nullptr;
+        }
+        if (m_inputRegion)
+        {
+            wl_region_destroy(m_inputRegion);
+            m_inputRegion = nullptr;
+        }
+        if (m_inputSubsurface)
+        {
+            wl_subsurface_destroy(m_inputSubsurface);
+            m_inputSubsurface = nullptr;
+        }
+        if (m_inputSurface)
+        {
+            wl_surface_destroy(m_inputSurface);
+            m_inputSurface = nullptr;
+        }
+        m_inputSurfaceX = 0.0f;
+        m_inputSurfaceY = 0.0f;
+        m_publishedRects.clear();
+    }
 
-        inputSurface = wl_compositor_create_surface(compositor);
-        if (!inputSurface)
-            return;
+    bool WaylandInput::createCapture(uintptr_t parent)
+    {
+        if (m_inputSurface || !m_compositor || !m_subcompositor || !m_shm || parent == 0)
+            return false;
 
-        inputSubsurface = wl_subcompositor_get_subsurface(subcompositor, inputSurface, parent);
-        if (!inputSubsurface)
-            return;
+        m_inputSurface = wl_compositor_create_surface(m_compositor);
+        if (!m_inputSurface)
+            return false;
+
+        m_inputSubsurface = wl_subcompositor_get_subsurface(m_subcompositor, m_inputSurface,
+                                                            reinterpret_cast<wl_surface*>(parent));
+        if (!m_inputSubsurface)
+        {
+            destroyCapture();
+            return false;
+        }
 
         // apply our commits on their own rather than waiting on the parent's
-        wl_subsurface_set_desync(inputSubsurface);
+        wl_subsurface_set_desync(m_inputSubsurface);
 
-        if (viewporter)
-            inputViewport = wp_viewporter_get_viewport(viewporter, inputSurface);
+        if (m_viewporter)
+            m_inputViewport = wp_viewporter_get_viewport(m_viewporter, m_inputSurface);
 
         // start with an empty region: everything passes through until the
         // overlay publishes a hitbox.
-        inputRegion = wl_compositor_create_region(compositor);
-        wl_surface_set_input_region(inputSurface, inputRegion);
-        wl_surface_commit(inputSurface);
-        if (wl_display* display = getWaylandDisplay())
-            wl_display_flush(display);
+        m_inputRegion = wl_compositor_create_region(m_compositor);
+        wl_surface_set_input_region(m_inputSurface, m_inputRegion);
+        wl_surface_commit(m_inputSurface);
+        flush();
 
         Logger::info("Wayland: input capture surface created");
+        return true;
     }
 
-    wl_surface* getWaylandInputSurface()
+    // Brings the capture subsurface in line with the game's current surface. A
+    // subsurface is bound to its parent for life, so a recreated game window
+    // needs a fresh one; the hitboxes are republished by publishCaptureRects().
+    void WaylandInput::reconcileCapture()
     {
-        return inputSurface;
-    }
-
-    float getWaylandInputSurfaceX()
-    {
-        return inputSurfaceX;
-    }
-
-    float getWaylandInputSurfaceY()
-    {
-        return inputSurfaceY;
-    }
-
-    void setWaylandInputSurfaceRects(const InputRect* rects, int count)
-    {
-        if (!inputSurface)
+        const CaptureAttachment::Step step = m_attachment.next();
+        if (step == CaptureAttachment::Step::None)
             return;
 
+        if (step == CaptureAttachment::Step::Detach || step == CaptureAttachment::Step::Reattach)
+            destroyCapture();
+
+        bool ok = true;
+        if (step == CaptureAttachment::Step::Attach || step == CaptureAttachment::Step::Reattach)
+            ok = createCapture(m_attachment.parent());
+
+        m_attachment.completed(step, ok);
+        if (m_attachment.takeRepublish())
+            m_publishedRects.clear();
+    }
+
+    void WaylandInput::setParentSurface(uintptr_t parent)
+    {
+        std::lock_guard<std::mutex> lock(m_lifecycle);
+        m_parentAtomic.store(parent, std::memory_order_release);
+        m_attachment.setParent(parent);
+        if (m_commonReady)
+        {
+            reconcileCapture();
+            publishCaptureRects();
+        }
+    }
+
+    uint32_t WaylandInput::parentSurfaceId() const
+    {
+        const uintptr_t parent = m_parentAtomic.load(std::memory_order_acquire);
+        return parent ? wl_proxy_get_id(reinterpret_cast<wl_proxy*>(parent)) : 0;
+    }
+
+    bool WaylandInput::hasFocus() const
+    {
+        return m_keyboardFocus.load(std::memory_order_acquire) || m_pointerFocus.load(std::memory_order_acquire);
+    }
+
+    void WaylandInput::setCaptureRects(const InputRect* rects, int count)
+    {
         std::vector<InputRect> valid;
         valid.reserve(count > 0 ? static_cast<size_t>(count) : 0);
         for (int i = 0; i < count; ++i)
@@ -293,30 +356,43 @@ namespace VkHook
                 valid.push_back(rects[i]);
         }
 
+        std::lock_guard<std::mutex> lock(m_lifecycle);
+        m_desiredRects = std::move(valid);
+        if (!m_commonReady)
+            return;
+        reconcileCapture();
+        publishCaptureRects();
+    }
+
+    void WaylandInput::publishCaptureRects()
+    {
+        if (!m_inputSurface)
+            return;
+
         // the overlay calls this every frame; only churn the compositor when the
         // hitbox set actually changes.
-        if (valid == inputSurfaceRects)
+        const std::vector<InputRect>& valid = m_desiredRects;
+        if (valid == m_publishedRects)
             return;
-        inputSurfaceRects = valid;
+        m_publishedRects = valid;
 
         // a region is immutable once handed to set_input_region, so rebuild it.
-        if (inputRegion)
-            wl_region_destroy(inputRegion);
-        inputRegion = wl_compositor_create_region(compositor);
-        if (!inputRegion)
+        if (m_inputRegion)
+            wl_region_destroy(m_inputRegion);
+        m_inputRegion = wl_compositor_create_region(m_compositor);
+        if (!m_inputRegion)
             return;
 
         if (valid.empty())
         {
-            inputSurfaceX = 0.0f;
-            inputSurfaceY = 0.0f;
+            m_inputSurfaceX = 0.0f;
+            m_inputSurfaceY = 0.0f;
             // nothing to capture: unmap the surface outright (and keep the
             // region empty) so the pointer passes straight through to the game
-            wl_surface_attach(inputSurface, nullptr, 0, 0);
-            wl_surface_set_input_region(inputSurface, inputRegion);
-            wl_surface_commit(inputSurface);
-            if (wl_display* display = getWaylandDisplay())
-                wl_display_flush(display);
+            wl_surface_attach(m_inputSurface, nullptr, 0, 0);
+            wl_surface_set_input_region(m_inputSurface, m_inputRegion);
+            wl_surface_commit(m_inputSurface);
+            flush();
             return;
         }
 
@@ -338,189 +414,151 @@ namespace VkHook
         if (w <= 0 || h <= 0 || !ensureInputBuffer(w, h))
             return;
 
-        inputSurfaceX = minX;
-        inputSurfaceY = minY;
+        m_inputSurfaceX = minX;
+        m_inputSurfaceY = minY;
 
         for (const InputRect& r : valid)
         {
-            wl_region_add(inputRegion,
+            wl_region_add(m_inputRegion,
                           static_cast<int>(r.x - minX), static_cast<int>(r.y - minY),
                           static_cast<int>(r.width), static_cast<int>(r.height));
         }
-        wl_subsurface_set_position(inputSubsurface, static_cast<int>(minX), static_cast<int>(minY));
-        if (inputViewport)
-            wp_viewport_set_destination(inputViewport, w, h);
-        wl_surface_set_input_region(inputSurface, inputRegion);
-        wl_surface_attach(inputSurface, inputBuffer, 0, 0);
-        wl_surface_commit(inputSurface);
-        if (wl_display* display = getWaylandDisplay())
-            wl_display_flush(display);
+        wl_subsurface_set_position(m_inputSubsurface, static_cast<int>(minX), static_cast<int>(minY));
+        if (m_inputViewport)
+            wp_viewport_set_destination(m_inputViewport, w, h);
+        wl_surface_set_input_region(m_inputSurface, m_inputRegion);
+        wl_surface_attach(m_inputSurface, m_inputBuffer, 0, 0);
+        wl_surface_commit(m_inputSurface);
+        flush();
     }
 
-    wl_event_queue* getWaylandInputQueue()
+    void WaylandInput::close()
     {
-        return queue;
+        std::lock_guard<std::mutex> lock(m_lifecycle);
+        m_closed = true;
+        shutdownLocked();
     }
 
-    wl_seat* getWaylandSeat()
+    // Creates the private queue, the registry and the globals, in that order.
+    // Every created object is pushed on m_releases, so shutdown destroys them in
+    // reverse: devices and globals first, then the registry, then the display
+    // wrapper, and the event queue last, when no proxy is attached to it any more.
+    bool WaylandInput::ensureCommon(bool wantKeyboard, bool wantPointer)
     {
-        return seat;
-    }
+        m_wantKeyboard = m_wantKeyboard || wantKeyboard;
+        m_wantPointer = m_wantPointer || wantPointer;
 
-    bool initWaylandInputCommon()
-    {
-        if (commonInitialized)
-            return seat != nullptr;
-
-        wl_display* display = getWaylandDisplay();
-        if (!display)
-            return false;
-
-        displayWrapper = (wl_display*)wl_proxy_create_wrapper(display);
-        if (!displayWrapper)
-            return false;
-
-        queue = wl_display_create_queue(display);
-        if (!queue)
+        if (m_commonReady)
         {
-            wl_proxy_wrapper_destroy(displayWrapper);
-            displayWrapper = nullptr;
-            return false;
+            bindDevices();
+            return m_seat != nullptr;
         }
 
-        wl_proxy_set_queue((wl_proxy*)displayWrapper, queue);
+        if (m_closed || !m_display)
+            return false;
 
-        registry = wl_display_get_registry(displayWrapper);
-        wl_registry_add_listener(registry, &registryListener, nullptr);
+        m_queue = wl_display_create_queue(m_display);
+        if (!m_queue)
+            return false;
+        m_releases.push([this] {
+            wl_event_queue_destroy(m_queue);
+            m_queue = nullptr;
+        });
+
+        m_wrapper = static_cast<wl_display*>(wl_proxy_create_wrapper(m_display));
+        if (!m_wrapper)
+        {
+            m_releases.releaseAll();
+            return false;
+        }
+        m_releases.push([this] {
+            wl_proxy_wrapper_destroy(m_wrapper);
+            m_wrapper = nullptr;
+        });
+        wl_proxy_set_queue(reinterpret_cast<wl_proxy*>(m_wrapper), m_queue);
+
+        m_registry = wl_display_get_registry(m_wrapper);
+        m_releases.push([this] {
+            wl_registry_destroy(m_registry);
+            m_registry = nullptr;
+        });
+        wl_registry_add_listener(m_registry, &WaylandSeatListeners::registry, this);
 
         // Roundtrip to discover globals (seat)
-        wl_display_roundtrip_queue(display, queue);
+        wl_display_roundtrip_queue(m_display, m_queue);
         // Second roundtrip to get seat capabilities (keyboard + pointer)
-        wl_display_roundtrip_queue(display, queue);
+        wl_display_roundtrip_queue(m_display, m_queue);
 
-        createInputSurface();
+        m_releases.push([this] {
+            destroyCapture();
+            m_attachment.completed(CaptureAttachment::Step::Detach, true);
+        });
+        reconcileCapture();
+        publishCaptureRects();
 
-        if (seat)
+        if (m_seat)
         {
-            commonInitialized = true;
+            m_commonReady = true;
             Logger::info("Wayland: shared input resources initialized");
-        }
-        else
-        {
-            Logger::warn("Wayland: no seat found");
-            if (registry)
-            {
-                wl_registry_destroy(registry);
-                registry = nullptr;
-            }
-            if (queue)
-            {
-                wl_event_queue_destroy(queue);
-                queue = nullptr;
-            }
-            if (displayWrapper)
-            {
-                wl_proxy_wrapper_destroy(displayWrapper);
-                displayWrapper = nullptr;
-            }
+            return true;
         }
 
-        return seat != nullptr;
+        Logger::warn("Wayland: no seat found");
+        shutdownLocked();
+        return false;
     }
 
-    void beginWaylandInputFrame()
-    {
-        dispatchFrameId.fetch_add(1, std::memory_order_release);
-    }
-
-    void dispatchWaylandInputEvents()
+    void WaylandInput::dispatchPending()
     {
         // Skip if already dispatched this frame
-        uint64_t currentFrame = dispatchFrameId.load(std::memory_order_acquire);
-        if (lastDispatchedFrame.load(std::memory_order_acquire) == currentFrame)
+        const uint64_t currentFrame = m_frameId.load(std::memory_order_acquire);
+        if (m_lastDispatchedFrame == currentFrame)
             return;
-        lastDispatchedFrame.store(currentFrame, std::memory_order_release);
+        m_lastDispatchedFrame = currentFrame;
 
-        if (!queue)
-            return;
-
-        wl_display* display = getWaylandDisplay();
-        if (!display)
+        if (!m_queue)
             return;
 
         // drain our queue only; the socket is read by the game's event loop,
         // and taking the display read lock from here spun its runloop into a
         // freeze during compositor resizes
-        wl_display_dispatch_queue_pending(display, queue);
+        wl_display_dispatch_queue_pending(m_display, m_queue);
     }
 
-    void cleanupWaylandInputCommon()
+    void WaylandInput::beginFrame()
     {
-        destroyInputBuffer();
-        if (inputViewport)
-        {
-            wp_viewport_destroy(inputViewport);
-            inputViewport = nullptr;
-        }
-        if (viewporter)
-        {
-            wp_viewporter_destroy(viewporter);
-            viewporter = nullptr;
-        }
-        if (inputRegion)
-        {
-            wl_region_destroy(inputRegion);
-            inputRegion = nullptr;
-        }
-        if (inputSubsurface)
-        {
-            wl_subsurface_destroy(inputSubsurface);
-            inputSubsurface = nullptr;
-        }
-        if (inputSurface)
-        {
-            wl_surface_destroy(inputSurface);
-            inputSurface = nullptr;
-        }
-        if (shm)
-        {
-            wl_shm_destroy(shm);
-            shm = nullptr;
-        }
-        if (subcompositor)
-        {
-            wl_subcompositor_destroy(subcompositor);
-            subcompositor = nullptr;
-        }
-        if (compositor)
-        {
-            wl_compositor_destroy(compositor);
-            compositor = nullptr;
-        }
-        if (seat)
-        {
-            wl_seat_destroy(seat);
-            seat = nullptr;
-        }
-        if (registry)
-        {
-            wl_registry_destroy(registry);
-            registry = nullptr;
-        }
-        if (queue)
-        {
-            wl_event_queue_destroy(queue);
-            queue = nullptr;
-        }
-        if (displayWrapper)
-        {
-            wl_proxy_wrapper_destroy(displayWrapper);
-            displayWrapper = nullptr;
-        }
-
-        keyboardBind = nullptr;
-        pointerBind = nullptr;
-        commonInitialized = false;
+        m_frameId.fetch_add(1, std::memory_order_release);
     }
 
+    void WaylandInput::shutdown()
+    {
+        std::lock_guard<std::mutex> lock(m_lifecycle);
+        shutdownLocked();
+    }
+
+    void WaylandInput::shutdownLocked()
+    {
+        // Keyboard and pointer are on the stack above the seat they came from,
+        // so they are released before it, and the queue goes last.
+        const bool hadObjects = !m_releases.empty();
+        m_releases.releaseAll();
+        // send the destroy requests now rather than whenever the game next flushes
+        if (hadObjects)
+            wl_display_flush(m_display);
+        releaseKeyboard();
+        {
+            std::lock_guard<std::mutex> lock(m_mouseMutex);
+            m_pointerFocusSurface = nullptr;
+            m_leftButton = m_rightButton = m_middleButton = false;
+            m_scroll = m_continuousScroll = m_discreteScroll = m_highResolutionScroll = 0.0f;
+            m_hasDiscreteScroll = m_hasHighResolutionScroll = false;
+        }
+
+        m_commonReady = false;
+        m_wantKeyboard = false;
+        m_wantPointer = false;
+        m_seatCapabilities = 0;
+        m_keyboardFocus.store(false, std::memory_order_release);
+        m_pointerFocus.store(false, std::memory_order_release);
+    }
 } // namespace VkHook

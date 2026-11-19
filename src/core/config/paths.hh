@@ -38,6 +38,16 @@ namespace VkHook::Paths
         return "";
     }
 
+    // Regenerable data: the shader and pipeline caches live under it
+    inline std::string cacheHome()
+    {
+        if (std::string xdg = env("XDG_CACHE_HOME"); !xdg.empty())
+            return xdg;
+        if (std::string home = env("HOME"); !home.empty())
+            return home + "/.cache";
+        return "";
+    }
+
     // ~/.config/VkHook, where every user-owned file lives
     inline std::string baseConfigDir()
     {

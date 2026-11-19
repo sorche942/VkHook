@@ -657,6 +657,32 @@ X11/Xwayland window, uses temporary configuration, and checks real color and
 captured-depth pixels before allowing the risky clear. Add `--legacy` to exercise
 legacy render passes instead of dynamic rendering.
 
+### Overlay and settings architecture
+
+The overlay views never touch layer state. Each frame they read an immutable
+`CoreSnapshot` (effect chain with parameter copies, profiles, depth buffers,
+device info, settings) and answer with `Command`s (`src/overlay/commands.hh`):
+parameter edits, chain edits, profile and config operations, depth pins, and
+setting changes. The layer drains the queue once per present and applies them.
+Parameter widgets edit a per-effect buffer inside the overlay, so a slider drag
+never races the render thread. `OverlayUi` is one per device (ImGui context,
+views, input state); `OverlayRenderer` is one per swapchain (render pass,
+command buffers, fences, framebuffers).
+
+`VkHook.conf` is described by one schema table (`src/core/config/settings_schema.cc`):
+the same row drives loading, saving, clamping and the Settings tab's controls,
+so a value is clamped once, on write (`autoApplyDelay` is 0-1000 ms,
+`maxEffects` 1-200). Hot threads read `settingsManager.snapshot()`. Saving
+rewrites only the keys the schema owns and keeps unknown keys and comments.
+The Settings tab has a **Reload config from disk** button. Config files carry a
+`schemaVersion`; on first start after an upgrade the migrations run once, in
+order: legacy `reshade/packages` merge, `<game>@default.conf` renamed to
+`<game>.conf`, comma-separated shader/texture paths split.
+
+Shader presets are read and written by the pure model in
+`src/control/preset_model.cc`. A saved preset now lists keys in ReShade order
+with `,`-joined vector values; older files still load.
+
 ### Overlay input, readability, and scrolling
 
 A Proton game's log showed pointer grabs failing with `AlreadyGrabbed` while VkHook
@@ -813,19 +839,25 @@ Each test is a small `main()` that prints `N checks, M failures` and exits non-z
 
 ## what the tests cover
 
-**config serializer** (`src/tests/config_serializer_test.cc`). Exercises `ConfigSerializer`: profile save/load round-trips, the legacy `.conf` to per-game migration, settings persistence, imported ReShade presets, disabled-effect sidecars, and the rejection of path separators in config/profile names. Tells you that writing a profile and reading it back gives the same effects, params and macros — the file format the whole UI depends on.
+**config serializer** (`src/tests/config_serializer_test.cc`). Exercises `ConfigSerializer`: per-game `.conf` save/load round-trips, imported ReShade presets, preset file I/O, disabled-effect sidecars, the tokenizer shared with `Config`, and the rejection of path separators in config/profile names. Tells you that writing a profile and reading it back gives the same effects, params and macros — the file format the whole UI depends on.
+
+**config store** (`src/tests/config_store_test.cc`). Exercises `ConfigStore`, the one owner of `VkHook.conf`: defaults come from the settings schema, every write clamps through the schema, a save is a read-modify-write that keeps unknown keys, comments and CRLF, immutable snapshots, and the `schemaVersion` migrations (legacy layouts merged once, in order, stopping at a failed step, stamped only after they ran). Tells you the settings file, the overlay's settings controls and the hot-path reads cannot drift apart.
+
+**preset model** (`src/tests/preset_model_test.cc`, fixtures in `src/tests/fixtures/presets/`). Exercises the pure `parse` / `serialize` over an `EffectStack`: golden `.ini` and sidecar files, round trips, foreign ReShade presets, legacy `VkHookEffects` keys, dropped unknown techniques. `VKHOOK_UPDATE_GOLDEN=1` regenerates the goldens. Tells you the preset format is stable without touching Config or the registry.
+
+**overlay commands** (`src/tests/overlay_commands_test.cc`). Exercises the overlay's `CommandQueue` (push order, draining, concurrent producers) and the value copy `SetParam` relies on. Tells you what the UI emits reaches the layer whole and in order.
+
+**input session** (`src/tests/input_session_test.cc`), **wayland capture attachment and teardown order** (`src/tests/wayland_capture_test.cc`) and **wayland input teardown** (`src/tests/wayland_input_teardown_test.cc`). Exercise the per-surface `InputSession`: focus policy, the capture subsurface re-attaching when the game recreates its surface, and protocol objects released newest-first so the event queue goes last (the last one runs against an in-process fake Wayland server).
 
 **vk handle ordering** (`src/render/vk_handle_test.cc`). Exercises `DeferredDestroyQueue`: releases run in ascending phase order, within a phase in reverse registration order, `flush` drains exactly once, and `discard` drops without running. Tells you that a view is destroyed before the image it was made from and device memory is freed last — the order that keeps a driver from faulting during teardown, which a headless test cannot observe through a real GPU.
 
-**persistence queue** (`src/tests/persist_test.cc`). Exercises `PersistenceQueue`, the one writer for every user-file mutation: jobs run FIFO, repeated writes to one key coalesce to the newest, a throwing job does not poison the queue, shutdown drains and later submits resolve `false`, and a queued autosave can never resurrect a deleted preset. Also checks the `SettingsManager` snapshot and queued save. Tells you that profile and settings writes leave the present thread without being dropped, reordered or undone.
+**persistence queue** (`src/tests/persist_test.cc`). Exercises `PersistenceQueue`, the one writer for every user-file mutation: jobs run FIFO, repeated writes to one key coalesce to the newest, a throwing job does not poison the queue, shutdown drains and later submits resolve `false`, and a queued autosave can never resurrect a deleted preset. Tells you that profile and settings writes leave the present thread without being dropped, reordered or undone.
 
 **field parse** (`src/tests/field_parse_test.cc`). Pins the `std::from_chars` grammar of the overlay numeric field editors: exact component count, no partial application, no negatives for unsigned, no trailing junk.
 
 **compile cache** (`src/effects/compile_cache_test.cc`). Exercises `CompileCache`: store/lookup round-trip, source and flag partitioning, re-store is a no-op, FIFO eviction at capacity, `clear`, hash determinism, and a threaded store/lookup. Tells you the cache that keeps a chain reload from re-parsing every ReShade effect is keyed correctly and bounded.
 
 **depth copy state** (`src/render/depth_copy_state_test.cc`). Exercises `DepthCopyState`: publish/consume returns each copy once, the ring hands out slots in order, `detach` clears, and a threaded publish/consume never observes a torn `DepthState`. Tells you the mutex guarding the `CmdEndRenderPass` → `QueueSubmit` handoff and the copy ring actually holds — the race it covers only shows as an intermittent device loss under load.
-
-**m3 theme** (`src/tests/m3_theme_test.cc`). Links the M3 theme and ImGui core with no renderer and exercises colour maths, token parsing, the exporter round-trip, the motion springs, and the connected button-group geometry. Tells you a colour, theme-file or motion regression is caught without a GPU, since none of it can be eyeballed in CI.
 
 ## reshade shader check
 

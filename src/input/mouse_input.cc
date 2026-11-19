@@ -1,31 +1,16 @@
 #include "mouse_input.hh"
 
-#include "logger.hh"
-#include "wayland_display.hh"
+#include "input_session.hh"
 
-#include "mouse_input_wayland.hh"
-#include "mouse_input_x11.hh"
+// Free-function facade over the current InputSession.
 
 namespace VkHook
 {
-    static void warnUnsupportedMouseOnce(const char* message)
-    {
-        static bool warned = false;
-        if (!warned && !isWayland() && !isX11())
-        {
-            Logger::warn(message);
-            warned = true;
-        }
-    }
-
     MouseState getMouseState()
     {
-        if (isWayland())
-            return getMouseStateWayland();
-        if (isX11())
-            return getMouseStateX11();
-
-        warnUnsupportedMouseOnce("unsupported Vulkan surface: mouse polling disabled; returning default state");
+        if (auto session = InputSession::current())
+            return session->mouseState();
+        InputSession::warnNoSession("unsupported Vulkan surface: input polling disabled; returning no input");
         return MouseState();
     }
 } // namespace VkHook

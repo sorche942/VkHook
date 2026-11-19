@@ -17,6 +17,10 @@ namespace VkHook
     // process-wide, so two devices do not share one-shot flags).
     struct DiagState
     {
+        DiagState();
+
+        // VKHOOK_SMOKE_DEPTH_REFRESH, read once when the device is created
+        int                                   smokeRefreshIntervalMs = 0;
         std::chrono::steady_clock::time_point lastSmokeRefresh{};
         bool                                  depthDumped = false;
     };
@@ -42,7 +46,7 @@ namespace VkHook
     // Logs the journal, oldest first, with each batch's fence state.
     void logSubmitJournal(LogicalDevice* logicalDevice, const char* reason);
 
-    // Smoke-test hook (VKHOOK_SMOKE_DEPTH_REFRESH=<ms>). Takes the device's stateLock.
+    // Smoke-test hook (VKHOOK_SMOKE_DEPTH_REFRESH=<ms>): the Advanced tab's refresh on a timer.
     void maybeForceSmokeDepthRefresh(LogicalDevice* logicalDevice, DiagState& state);
 
     // Developer-only depth-resolve dump (VKHOOK_DEBUG builds); no-op otherwise.

@@ -13,17 +13,19 @@
 //
 // Overlay-owned proxies are registered via registerOverlayProxy() and are
 // always passed through unwrapped.
+//
+// State kept here is process-wide on purpose, because the interposed entry
+// points are: the overlay-proxy set, the game's listener/dispatcher tables and
+// held keys (keyed by the game's own proxies), and the pending key-withhold
+// request. Everything about a surface's input (pointer position, blocking,
+// hitboxes) is read from the current InputSession instead.
 
 #include "wayland_interpose.hh"
 #include "input_blocker.hh"
-#include "wayland_display.hh"
+#include "input_session.hh"
 #include "wayland_syncobj_gate.hh"
 #include "wayland_interpose_patch.hh"
 #include "logger.hh"
-
-// Forward-declare to avoid pulling in mouse_input_wayland.hh (which
-// transitively includes mouse_input.hh → X11 headers in some targets).
-namespace VkHook { void mirrorButtonState(uint32_t button, bool pressed); }
 
 #include <wayland-client.h>
 #include <dlfcn.h>
@@ -84,15 +86,28 @@ namespace VkHook
     }
 } // namespace VkHook
 
-// Last pointer position seen on a game pointer, in wl_surface-local coords.
-// Events without coordinates (button, axis, key) are tested against this.
-static std::atomic<double> g_lastPointerX{-1.0};
-static std::atomic<double> g_lastPointerY{-1.0};
+// Pointer position and overlay hit tests live in the current InputSession: the
+// game's pointer position is per surface, and events without coordinates
+// (button, axis, key) are tested against the last one seen.
+static void notePointer(double x, double y)
+{
+    if (auto session = VkHook::InputSession::current())
+        session->noteGamePointer(x, y);
+}
 
 static bool pointerBlocked()
 {
-    return VkHook::isInputBlockedAt((float)g_lastPointerX.load(std::memory_order_acquire),
-                                     (float)g_lastPointerY.load(std::memory_order_acquire));
+    const auto session = VkHook::InputSession::current();
+    return session && session->gamePointerBlocked();
+}
+
+// The game's pointer receives releases through Wayland's implicit grab that
+// our own pointer never sees, so every button is mirrored into the overlay.
+static void mirrorGameButton(uint32_t button, bool pressed)
+{
+    const auto session = VkHook::InputSession::current();
+    if (session && session->kind() == VkHook::SurfaceKind::Wayland)
+        session->mirrorGameButton(button, pressed);
 }
 
 // ── Game listener storage ────────────────────────────────────────────────────
@@ -229,8 +244,7 @@ static void forgetKeys(wl_proxy* kb)
 static void wp_enter(void* data, wl_pointer* p, uint32_t serial, wl_surface* s, wl_fixed_t x, wl_fixed_t y)
 {
     applyPendingWithhold();
-    g_lastPointerX.store(wl_fixed_to_double(x), std::memory_order_release);
-    g_lastPointerY.store(wl_fixed_to_double(y), std::memory_order_release);
+    notePointer(wl_fixed_to_double(x), wl_fixed_to_double(y));
     auto game = lookupEntry(gamePointers, (wl_proxy*)p);
     if (game && game->listener.enter)
         game->listener.enter(data, p, serial, s, x, y);
@@ -250,8 +264,7 @@ static void wp_motion(void* data, wl_pointer* p, uint32_t time, wl_fixed_t x, wl
     applyPendingWithhold();
     const double fx = wl_fixed_to_double(x);
     const double fy = wl_fixed_to_double(y);
-    g_lastPointerX.store(fx, std::memory_order_release);
-    g_lastPointerY.store(fy, std::memory_order_release);
+    notePointer(fx, fy);
     if (VkHook::isInputBlockedAt((float)fx, (float)fy))
         return;
     auto game = lookupEntry(gamePointers, (wl_proxy*)p);
@@ -262,10 +275,8 @@ static void wp_motion(void* data, wl_pointer* p, uint32_t time, wl_fixed_t x, wl
 static void wp_button(void* data, wl_pointer* p, uint32_t serial, uint32_t time, uint32_t button, uint32_t state)
 {
     applyPendingWithhold();
-    // Always mirror button state to overlay — the game's pointer receives
-    // releases via Wayland's implicit grab that our overlay pointer never sees.
-    if (VkHook::isWayland())
-        VkHook::mirrorButtonState(button, state == WL_POINTER_BUTTON_STATE_PRESSED);
+    // Always mirror button state to the overlay (see mirrorGameButton).
+    mirrorGameButton(button, state == WL_POINTER_BUTTON_STATE_PRESSED);
 
     if (pointerBlocked())
         return;
@@ -349,8 +360,7 @@ static void wp_axis_relative_direction(void* data, wl_pointer* p, uint32_t axis,
 static void wp_warp(void* data, wl_pointer* p, wl_fixed_t x, wl_fixed_t y)
 {
     applyPendingWithhold();
-    g_lastPointerX.store(wl_fixed_to_double(x), std::memory_order_release);
-    g_lastPointerY.store(wl_fixed_to_double(y), std::memory_order_release);
+    notePointer(wl_fixed_to_double(x), wl_fixed_to_double(y));
     if (VkHook::isInputBlockedAt((float)wl_fixed_to_double(x), (float)wl_fixed_to_double(y)))
         return;
     auto game = lookupEntry(gamePointers, (wl_proxy*)p);
@@ -462,22 +472,19 @@ static int wd_pointer(const void* data, void* target, uint32_t opcode, const str
     // events that do not (button, axis, frame).
     if (opcode == 0) // enter: serial, surface, x, y
     {
-        g_lastPointerX.store(wl_fixed_to_double(args[2].f), std::memory_order_release);
-        g_lastPointerY.store(wl_fixed_to_double(args[3].f), std::memory_order_release);
+        notePointer(wl_fixed_to_double(args[2].f), wl_fixed_to_double(args[3].f));
     }
     else if (opcode == 2) // motion: time, x, y
     {
-        g_lastPointerX.store(wl_fixed_to_double(args[1].f), std::memory_order_release);
-        g_lastPointerY.store(wl_fixed_to_double(args[2].f), std::memory_order_release);
+        notePointer(wl_fixed_to_double(args[1].f), wl_fixed_to_double(args[2].f));
     }
     else if (opcode == 11) // warp: x, y
     {
-        g_lastPointerX.store(wl_fixed_to_double(args[0].f), std::memory_order_release);
-        g_lastPointerY.store(wl_fixed_to_double(args[1].f), std::memory_order_release);
+        notePointer(wl_fixed_to_double(args[0].f), wl_fixed_to_double(args[1].f));
     }
 
-    if (opcode == 3 && VkHook::isWayland())
-        VkHook::mirrorButtonState(args[2].u, args[3].u == WL_POINTER_BUTTON_STATE_PRESSED);
+    if (opcode == 3)
+        mirrorGameButton(args[2].u, args[3].u == WL_POINTER_BUTTON_STATE_PRESSED);
 
     // forward enter/leave so the game tracks the pointer, withhold everything
     // positional while it sits over the overlay (motion .. warp).
@@ -822,11 +829,8 @@ namespace VkHook::WaylandSyncobjGate
 {
     uint32_t waylandSurfaceId()
     {
-        if (!VkHook::isWayland())
-            return 0;
-
-        wl_surface* surface = VkHook::getWaylandSurface();
-        return surface ? wl_proxy_get_id(reinterpret_cast<struct wl_proxy*>(surface)) : 0;
+        const auto session = VkHook::InputSession::current();
+        return session ? session->waylandSurfaceId() : 0;
     }
 } // namespace VkHook::WaylandSyncobjGate
 

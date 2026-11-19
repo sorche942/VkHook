@@ -19,13 +19,6 @@
 #include <type_traits>
 #include <vector>
 
-namespace VkHook
-{
-    // LogicalDevice owns these; headless tests never construct them.
-    struct OverlayPersistentState {};
-    class ImGuiOverlay {};
-} // namespace VkHook
-
 using namespace VkHook;
 
 namespace

@@ -22,7 +22,7 @@
 #include "image.hh"
 #include "format.hh"
 #include "config_serializer.hh"
-#include "settings_manager.hh"
+#include "store.hh"
 #include "reshade_compile.hh"
 #include "texture_convert.hh"
 #include "descriptor_budget.hh"

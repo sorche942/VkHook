@@ -1,7 +1,4 @@
-#include "imgui_overlay.hh"
-#include "persist.hh"
-#include "effects/effect_registry.hh"
-#include "settings_manager.hh"
+#include "overlay_ui.hh"
 #include "config_serializer.hh"
 #include "params/field_editor.hh"
 #include "logger.hh"
@@ -9,11 +6,11 @@
 #include "util.hh"
 
 #include <algorithm>
-#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -26,10 +23,11 @@ namespace VkHook
     {
         constexpr const char* kEffectReorderPayload = "VKHOOK_EFFECT_REORDER";
 
-        // Render a single preprocessor definition input, returns true if value changed
-        bool renderPreprocessorDef(PreprocessorDefinition& def, EffectRegistry* registry, const std::string& effectName)
+        // One preprocessor definition row. Returns the new value when the user
+        // edited or reset it; the caller turns that into a SetMacro command.
+        std::optional<std::string> renderPreprocessorDef(const PreprocessorDefinition& def)
         {
-            bool changed = false;
+            std::optional<std::string> changed;
             char valueBuf[64];
             strncpy(valueBuf, def.value.c_str(), sizeof(valueBuf) - 1);
             valueBuf[sizeof(valueBuf) - 1] = '\0';
@@ -44,20 +42,14 @@ namespace VkHook
             ImGui::TableNextColumn();
             ImGui::SetNextItemWidth(-1);
             if (ImGui::InputText("##value", valueBuf, sizeof(valueBuf)))
-            {
-                registry->setPreprocessorDefValue(effectName, def.name, valueBuf);
-                changed = true;
-            }
+                changed = std::string(valueBuf);
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("Default: %s", def.defaultValue.c_str());
 
             ImGui::TableNextColumn();
             ImGui::BeginDisabled(!modified);
             if (ImGui::Button("Reset"))
-            {
-                registry->setPreprocessorDefValue(effectName, def.name, def.defaultValue);
-                changed = true;
-            }
+                changed = def.defaultValue;
             ImGui::EndDisabled();
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
                 ImGui::SetTooltip(modified ? "Reset to default (%s)" : "Using default (%s)", def.defaultValue.c_str());
@@ -73,10 +65,7 @@ namespace VkHook
             if (ImGui::BeginPopupContextItem("##preproc_reset"))
             {
                 if (ImGui::MenuItem("Reset to default"))
-                {
-                    registry->setPreprocessorDefValue(effectName, def.name, def.defaultValue);
-                    changed = true;
-                }
+                    changed = def.defaultValue;
                 ImGui::EndPopup();
             }
 
@@ -86,9 +75,7 @@ namespace VkHook
 
     } // anonymous namespace
 
-    // keyboard is part of the shared view signature; this particular view reads no
-    // key state directly, so the name is omitted here.
-    void ImGuiOverlay::renderMainView(const KeyboardState& /* keyboard */)
+    void OverlayUi::renderMainView()
     {
         // Fallback picker when the xdg portal is unavailable; mirrors the
         // Shaders tab. only displayed while the main view is the active tab.
@@ -96,8 +83,8 @@ namespace VkHook
             presetBrowser = std::make_shared<ImGui::FileBrowser>(ImGuiFileBrowserFlags_CloseOnEsc);
         ImGui::FileBrowser& browser = *presetBrowser;
 
-        if (!effectRegistry)
-            return;
+        const std::vector<EffectView>& chain = snapshot->effects.chain;
+        const ProfileInfo& profiles = snapshot->profiles;
 
         auto openPresetBrowser = [&]() {
             browser.SetTitle("Import ReShade preset");
@@ -115,30 +102,30 @@ namespace VkHook
             if (pollFileDialog(FileDialogKind::OpenFile, result, picked))
             {
                 if (result == FileDialogResult::Success && !picked.empty())
-                    importShaderPreset(picked);
+                {
+                    dropPendingEdits();
+                    emit(ImportPreset{picked});
+                }
                 else if (result == FileDialogResult::Unavailable)
                     openPresetBrowser();
             }
         }
 
-        std::vector<std::string> selectedEffects = effectRegistry->getSelectedEffects();
-        const bool splitParams = settingsManager.getSeparateEffectParams();
+        const bool splitParams = settings().separateEffectParams;
 
         // Renders one effect's preprocessor definitions and parameters, shared by
-        // the inline list and the separate parameters card. Returns changed.
-        auto renderEffectParams = [&](const std::string& effectName) -> bool {
-            bool changed = false;
-            if (effectRegistry->hasEffectFailed(effectName))
+        // the inline list and the separate parameters card. Every edit leaves as
+        // a command; the widgets work on edit buffers, never on the layer's state.
+        auto renderEffectParams = [&](const EffectView& effect) {
+            if (effect.failed)
             {
                 ImGui::PushStyleColor(ImGuiCol_Text, UI::Error());
-                ImGui::TextWrapped("Failed to compile: %s",
-                                   effectRegistry->getEffectError(effectName).c_str());
+                ImGui::TextWrapped("Failed to compile: %s", effect.error.c_str());
                 ImGui::PopStyleColor();
                 ImGui::Spacing();
             }
 
-            auto& defs = effectRegistry->getPreprocessorDefs(effectName);
-            if (!defs.empty())
+            if (!effect.macros.empty())
             {
                 if (ImGui::TreeNode("Preprocessor"))
                 {
@@ -147,12 +134,12 @@ namespace VkHook
                         ImGui::TableSetupColumn("Name");
                         ImGui::TableSetupColumn("Value");
                         ImGui::TableSetupColumn("Reset", ImGuiTableColumnFlags_WidthFixed);
-                        for (auto& def : defs)
+                        for (const PreprocessorDefinition& def : effect.macros)
                         {
-                            if (renderPreprocessorDef(def, effectRegistry, effectName))
+                            if (const auto value = renderPreprocessorDef(def))
                             {
-                                changed = true;
-                                reloadNeeded = true;
+                                emit(SetMacro{effect.name, def.name, *value});
+                                noteEdit(true);
                             }
                         }
                         ImGui::EndTable();
@@ -163,51 +150,52 @@ namespace VkHook
                 ImGui::Spacing();
             }
 
-            // ReShade uniforms are pushed every frame by updateEffect, so a value
+            // ReShade uniforms are pushed every frame by updateFrame, so a value
             // edit needs no rebuild.
-            auto effectParams = effectRegistry->getParametersForEffect(effectName);
-            if (effectParams.empty() && defs.empty())
+            if (effect.params.empty() && effect.macros.empty())
                 UI::TextSupport("This effect has no adjustable parameters.");
-            for (size_t paramIdx = 0; paramIdx < effectParams.size(); paramIdx++)
+            for (size_t paramIdx = 0; paramIdx < effect.params.size(); paramIdx++)
             {
                 ImGui::PushID(static_cast<int>(paramIdx));
-                if (renderFieldEditor(*effectParams[paramIdx]))
-                    changed = true;
+                EffectParam& edit = editableParam(effect.name, *effect.params[paramIdx]);
+                if (renderFieldEditor(edit))
+                {
+                    emit(SetParam{effect.name, std::shared_ptr<const EffectParam>(edit.clone())});
+                    noteEdit(false);
+                }
                 ImGui::PopID();
             }
-            return changed;
         };
 
         // Normal mode - show profile and effect controls
 
-        // Shader profile operations retain their existing persistence behavior.
-        if (!activeGameName.empty())
+        if (!profiles.gameName.empty())
         {
             ImGui::SetNextItemWidth(ImGui::GetFontSize() * 16.0f);
-            const char* shaderLabel = activeShaderProfileName.empty() ? "None" : activeShaderProfileName.c_str();
+            const char* shaderLabel = profiles.activeName.empty() ? "None" : profiles.activeName.c_str();
             if (ImGui::BeginCombo("Shader preset", shaderLabel))
             {
-                for (const auto& profile : shaderProfiles)
+                for (const auto& profile : profiles.names)
                 {
-                    const bool selected = profile == activeShaderProfileName;
+                    const bool selected = profile == profiles.activeName;
                     if (ImGui::Selectable(profile.c_str(), selected) && !selected)
                     {
-                        if (!switchShaderProfile(profile))
-                            pushToast(LogLevel::Error, "Could not save the active shader profile.");
+                        dropPendingEdits();
+                        emit(SwitchProfile{profile});
                     }
                 }
                 ImGui::EndCombo();
             }
             if (ImGui::Button("New preset"))
                 ImGui::OpenPopup("New shader preset");
-            if (!activeShaderProfileName.empty())
+            if (!profiles.activeName.empty())
             {
                 ImGui::SameLine();
                 if (ImGui::Button("Rename"))
                 {
-                    renameProfileTarget = activeShaderProfileName;
+                    renameProfileTarget = profiles.activeName;
                     std::snprintf(renameShaderProfileName, sizeof(renameShaderProfileName), "%s",
-                                  activeShaderProfileName.c_str());
+                                  profiles.activeName.c_str());
                     ImGui::OpenPopup("Rename shader preset");
                 }
 
@@ -230,42 +218,18 @@ namespace VkHook
                     if (action == 1)
                     {
                         const std::string newName = renameShaderProfileName;
-                        const std::string oldName = renameProfileTarget;
-                        if (newName == oldName)
+                        if (newName == renameProfileTarget)
                         {
                             // name unchanged: nothing to rename
                         }
                         else if (!ConfigSerializer::isValidShaderProfileName(newName))
                             pushToast(LogLevel::Error, "Preset names can't contain /, \\ or @.");
-                        else if (std::find(shaderProfiles.begin(), shaderProfiles.end(), newName) != shaderProfiles.end())
+                        else if (std::find(profiles.names.begin(), profiles.names.end(), newName) != profiles.names.end())
                             pushToast(LogLevel::Error, "A shader preset named \"" + newName + "\" already exists.");
-                        else if (!autoSaveProfile(true))
-                            pushToast(LogLevel::Error, "Could not save the active shader profile.");
                         else
                         {
-                            // run the rename on the writer thread so a queued
-                            // save can't race the files, then update the UI's
-                            // name/path only after it has landed
-                            const bool renamed = PersistenceQueue::instance().rename(
-                                ConfigSerializer::getShaderProfilePath(activeGameName, oldName),
-                                ConfigSerializer::getRenamedShaderProfilePath(activeGameName, oldName, newName),
-                                [game = activeGameName, oldName, newName]() {
-                                    return ConfigSerializer::renameShaderProfile(game, oldName, newName);
-                                }).get();
-                            if (renamed)
-                            {
-                                if (activeShaderProfileName == oldName)
-                                    setActiveShaderProfile(newName);
-                                refreshShaderProfiles();
-                                pendingShaderProfilePath = activeShaderProfilePath;
-                                pendingShaderProfile = true;
-                                applyRequested = true;
-                                paramsDirty = false;
-                                profileDirty = false;
-                                pushToast(LogLevel::Info, "Renamed shader preset to \"" + newName + "\".");
-                            }
-                            else
-                                pushToast(LogLevel::Error, "Could not rename the shader profile.");
+                            dropPendingEdits();
+                            emit(RenameProfile{renameProfileTarget, newName});
                         }
                     }
                     if (action >= 0)
@@ -276,7 +240,7 @@ namespace VkHook
                 ImGui::SameLine();
                 if (ImGui::Button("Delete"))
                 {
-                    deleteProfileTarget = activeShaderProfileName;
+                    deleteProfileTarget = profiles.activeName;
                     ImGui::OpenPopup("Delete shader preset");
                 }
 
@@ -295,38 +259,8 @@ namespace VkHook
                         action = 1;
                     if (action == 1)
                     {
-                        // queued behind any pending autosave of this preset, which the
-                        // queue cancels, so the file cannot come back after the delete
-                        if (!PersistenceQueue::instance().remove(
-                                ConfigSerializer::getShaderProfilePath(activeGameName, deleteProfileTarget),
-                                [game = activeGameName, target = deleteProfileTarget]() {
-                                    return ConfigSerializer::deleteShaderProfile(game, target);
-                                }).get())
-                            pushToast(LogLevel::Error, "Could not delete the shader profile.");
-                        else
-                        {
-                            if (deleteProfileTarget == activeShaderProfileName)
-                            {
-                                profileDirty = false;
-                                paramsDirty = false;
-                                activeShaderProfileName.clear();
-                            }
-                            refreshShaderProfiles();
-                            if (!shaderProfiles.empty())
-                            {
-                                pendingShaderProfilePath = activeShaderProfilePath;
-                                pendingShaderProfile = true;
-                                applyRequested = true;
-                            }
-                            else
-                            {
-                                activeShaderProfileName.clear();
-                                activeShaderProfilePath.clear();
-                                pendingShaderProfilePath.clear();
-                                pendingShaderProfile = true;
-                                applyRequested = true;
-                            }
-                        }
+                        dropPendingEdits();
+                        emit(DeleteProfile{deleteProfileTarget});
                     }
                     if (action >= 0)
                         ImGui::CloseCurrentPopup();
@@ -337,7 +271,7 @@ namespace VkHook
             ImGui::BeginDisabled(fileDialogPending() || browser.IsOpened());
             if (ImGui::Button("Import preset"))
             {
-                if (!settingsManager.getUsePortalIntegration()
+                if (!settings().usePortalIntegration
                     || !startOpenFileDialog("Import ReShade preset", {"*.ini"}))
                     openPresetBrowser();
             }
@@ -359,21 +293,9 @@ namespace VkHook
                 ImGui::EndDisabled();
                 if (action == 1)
                 {
-                    if (!autoSaveProfile(true))
-                        pushToast(LogLevel::Error, "Could not save the active shader profile.");
-                    else if (PersistenceQueue::instance().create(
-                                 ConfigSerializer::getGameShaderProfilePath(activeGameName, newShaderProfileName),
-                                 [game = activeGameName, name = std::string(newShaderProfileName),
-                                  from = activeShaderProfileName]() {
-                                     return ConfigSerializer::createShaderProfile(game, name, from);
-                                 }).get())
-                    {
-                        switchShaderProfile(newShaderProfileName);
-                        refreshShaderProfiles();
-                        newShaderProfileName[0] = '\0';
-                    }
-                    else
-                        pushToast(LogLevel::Error, "Could not create the shader profile.");
+                    dropPendingEdits();
+                    emit(CreateProfile{newShaderProfileName});
+                    newShaderProfileName[0] = '\0';
                 }
                 if (action >= 0)
                     ImGui::CloseCurrentPopup();
@@ -391,7 +313,10 @@ namespace VkHook
             ImGui::SameLine();
             ImGui::BeginDisabled(saveConfigName[0] == '\0');
             if (ImGui::Button("Save"))
-                saveCurrentConfig();
+            {
+                emit(SaveConfig{saveConfigName});
+                configListRefreshPending = true;
+            }
             ImGui::EndDisabled();
             ImGui::SameLine();
             if (ImGui::Button("Manage configs"))
@@ -401,10 +326,10 @@ namespace VkHook
             }
         }
 
-        UI::TextSupport(("Toggle keybind bound to " + settingsManager.getToggleKey()).c_str());
-        bool effectsOn = state.effectsEnabled;
+        UI::TextSupport(("Toggle keybind bound to " + settings().toggleKey).c_str());
+        bool effectsOn = snapshot->effects.effectsEnabled;
         if (ImGui::Checkbox("Enable effects", &effectsOn))
-            toggleEffectsRequested = true;
+            emit(ToggleEffects{});
         if (ImGui::Button("Add effects"))
         {
             inSelectionMode = true;
@@ -415,7 +340,7 @@ namespace VkHook
             addEffectsRemoved.clear();
         }
         ImGui::SameLine();
-        ImGui::BeginDisabled(selectedEffects.empty());
+        ImGui::BeginDisabled(chain.empty());
         if (ImGui::Button("Clear all"))
             ImGui::OpenPopup("Clear all effects");
         ImGui::EndDisabled();
@@ -427,27 +352,24 @@ namespace VkHook
             ImGui::SameLine();
             if (ImGui::Button("Clear all"))
             {
-                selectedEffects.clear();
-                effectRegistry->clearSelectedEffects();
-                paramsDirty = true;
-                lastChangeTime = std::chrono::steady_clock::now();
-                applyRequested = true;
-                profileDirty = true;
+                emit(ClearEffects{});
+                chainEdited();
                 ImGui::CloseCurrentPopup();
             }
             ImGui::EndPopup();
         }
 
         bool selectParamsTab = false;
-        bool chainChanged = false;
         std::string removeEffect;
         std::string movingEffect;
         std::string targetEffect;
         ImGui::SeparatorText("Effects");
-        if (selectedEffects.empty())
+        if (chain.empty())
             UI::TextSupport("No effects in this preset.");
-        for (const auto& effectName : selectedEffects)
+        for (size_t effectIndex = 0; effectIndex < chain.size(); ++effectIndex)
         {
+            const EffectView& effect = chain[effectIndex];
+            const std::string& effectName = effect.name;
             ImGui::PushID(effectName.c_str());
             ImGui::Button("Drag");
             if (ImGui::BeginDragDropSource())
@@ -457,16 +379,12 @@ namespace VkHook
                 ImGui::EndDragDropSource();
             }
             ImGui::SameLine();
-            const bool failed = effectRegistry->hasEffectFailed(effectName);
-            bool enabled = effectRegistry->isEffectEnabled(effectName);
-            ImGui::BeginDisabled(failed);
+            bool enabled = effect.enabled;
+            ImGui::BeginDisabled(effect.failed);
             if (ImGui::Checkbox("##enabled", &enabled))
             {
-                effectRegistry->setEffectEnabled(effectName, enabled);
-                paramsDirty = true;
-                profileDirty = true;
-                reloadNeeded = true;
-                lastChangeTime = std::chrono::steady_clock::now();
+                emit(SetEffectEnabled{effectName, enabled});
+                noteEdit(true);
             }
             ImGui::EndDisabled();
             ImGui::SameLine();
@@ -481,8 +399,8 @@ namespace VkHook
             }
             else
                 open = ImGui::CollapsingHeader(effectName.c_str());
-            if (failed && ImGui::IsItemHovered())
-                ImGui::SetTooltip("%s", effectRegistry->getEffectError(effectName).c_str());
+            if (effect.failed && ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", effect.error.c_str());
             if (ImGui::BeginDragDropTarget())
             {
                 if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kEffectReorderPayload))
@@ -494,25 +412,19 @@ namespace VkHook
             }
             if (ImGui::BeginPopupContextItem("effect_context"))
             {
-                if (ImGui::MenuItem(enabled ? "Disable" : "Enable", nullptr, false, !failed))
+                if (ImGui::MenuItem(enabled ? "Disable" : "Enable", nullptr, false, !effect.failed))
                 {
-                    effectRegistry->setEffectEnabled(effectName, !enabled);
-                    paramsDirty = true;
-                    profileDirty = true;
-                    reloadNeeded = true;
-                    lastChangeTime = std::chrono::steady_clock::now();
+                    emit(SetEffectEnabled{effectName, !enabled});
+                    noteEdit(true);
                 }
                 if (ImGui::MenuItem("Reset to defaults"))
                 {
-                    for (auto* param : effectRegistry->getParametersForEffect(effectName))
-                        param->resetToDefault();
-                    paramsDirty = true;
-                    profileDirty = true;
-                    lastChangeTime = std::chrono::steady_clock::now();
+                    emit(ResetParams{effectName});
+                    noteEdit(false);
                 }
                 if (ImGui::MenuItem("Insert effects here"))
                 {
-                    insertPosition = static_cast<int>(&effectName - selectedEffects.data());
+                    insertPosition = static_cast<int>(effectIndex);
                     inSelectionMode = true;
                     addEffectsFocusSearch = true;
                     pendingAddEffects.clear();
@@ -523,39 +435,31 @@ namespace VkHook
                     removeEffect = effectName;
                 ImGui::EndPopup();
             }
-            if (open && renderEffectParams(effectName))
-            {
-                paramsDirty = true;
-                profileDirty = true;
-                lastChangeTime = std::chrono::steady_clock::now();
-            }
+            if (open)
+                renderEffectParams(effect);
             ImGui::PopID();
         }
         if (!removeEffect.empty())
         {
-            selectedEffects.erase(std::remove(selectedEffects.begin(), selectedEffects.end(), removeEffect),
-                                  selectedEffects.end());
-            effectRegistry->setSelectedEffects(selectedEffects);
-            effectRegistry->removeEffect(removeEffect);
-            chainChanged = true;
+            EditChain edit;
+            edit.remove.push_back(removeEffect);
+            emit(std::move(edit));
+            chainEdited();
         }
         if (!movingEffect.empty() && movingEffect != targetEffect)
         {
-            auto source = std::find(selectedEffects.begin(), selectedEffects.end(), movingEffect);
-            auto target = std::find(selectedEffects.begin(), selectedEffects.end(), targetEffect);
-            if (source != selectedEffects.end() && target != selectedEffects.end())
+            std::vector<std::string> order;
+            order.reserve(chain.size());
+            for (const EffectView& effect : chain)
+                order.push_back(effect.name);
+            auto source = std::find(order.begin(), order.end(), movingEffect);
+            auto target = std::find(order.begin(), order.end(), targetEffect);
+            if (source != order.end() && target != order.end())
             {
                 std::iter_swap(source, target);
-                effectRegistry->setSelectedEffects(selectedEffects);
-                chainChanged = true;
+                emit(ReorderEffects{std::move(order)});
+                chainEdited();
             }
-        }
-        if (chainChanged)
-        {
-            paramsDirty = true;
-            profileDirty = true;
-            applyRequested = true;
-            lastChangeTime = std::chrono::steady_clock::now();
         }
         if (splitParams)
         {
@@ -563,24 +467,19 @@ namespace VkHook
                 ImGui::SetNextItemOpen(true);
             if (ImGui::CollapsingHeader("Effect parameters"))
             {
-                if (selectedEffects.empty())
+                if (chain.empty())
                     UI::TextSupport("Add effects to edit their parameters.");
                 if (ImGui::BeginTabBar("##effect_params", ImGuiTabBarFlags_FittingPolicyScroll))
                 {
-                    for (const auto& effectName : selectedEffects)
+                    for (const EffectView& effect : chain)
                     {
-                        const ImGuiTabItemFlags flags = selectParamsTab && paramsActiveEffect == effectName
+                        const ImGuiTabItemFlags flags = selectParamsTab && paramsActiveEffect == effect.name
                             ? ImGuiTabItemFlags_SetSelected : ImGuiTabItemFlags_None;
-                        if (ImGui::BeginTabItem(effectName.c_str(), nullptr, flags))
+                        if (ImGui::BeginTabItem(effect.name.c_str(), nullptr, flags))
                         {
-                            paramsActiveEffect = effectName;
-                            ImGui::PushID(effectName.c_str());
-                            if (renderEffectParams(effectName))
-                            {
-                                paramsDirty = true;
-                                profileDirty = true;
-                                lastChangeTime = std::chrono::steady_clock::now();
-                            }
+                            paramsActiveEffect = effect.name;
+                            ImGui::PushID(effect.name.c_str());
+                            renderEffectParams(effect);
                             ImGui::PopID();
                             ImGui::EndTabItem();
                         }
@@ -592,57 +491,21 @@ namespace VkHook
         ImGui::Separator();
         if (ImGui::Button("Apply"))
         {
-            applyRequested = true;
+            emit(RebuildChain{});
             paramsDirty = false;
-            profileDirty = true;  // Mark for auto-save to profile
+            rebuildNeeded = false;
+            saveDue = true;
         }
-        // Note: Auto-apply is handled globally in imgui_overlay.cpp
+        // Auto-apply is OverlayUi::runAutoApply, after the frame's views.
 
         // The fallback picker is modal and must be displayed every frame.
         browser.Display();
         if (browser.HasSelected())
         {
-            importShaderPreset(browser.GetSelected().string());
+            dropPendingEdits();
+            emit(ImportPreset{browser.GetSelected().string()});
             browser.ClearSelected();
         }
-    }
-
-    void ImGuiOverlay::importShaderPreset(const std::string& sourcePath)
-    {
-        // the import picks a free name inside the job, so the queue is told
-        // about the created file from there
-        const std::string imported = [&] {
-            std::string name;
-            PersistenceQueue::instance().submit({PersistenceQueue::Kind::Other, "import:" + sourcePath, {},
-                [&name, sourcePath]() {
-                    name = ConfigSerializer::importShaderProfile(sourcePath);
-                    if (name.empty())
-                        return false;
-                    PersistenceQueue::instance().noteCreated(ConfigSerializer::getImportedShaderProfilePath(name));
-                    return true;
-                }}).get();
-            return name;
-        }();
-        if (imported.empty())
-        {
-            pushToast(LogLevel::Error, "Could not import the shader preset.");
-            return;
-        }
-
-        // save the outgoing profile, then activate the import. refresh can
-        // already select the new name, so the reload is queued here directly.
-        const bool saved = autoSaveProfile(true);
-        refreshShaderProfiles();
-        setActiveShaderProfile(imported);
-        pendingShaderProfilePath = activeShaderProfilePath;
-        pendingShaderProfile = true;
-        applyRequested = true;
-        paramsDirty = false;
-        profileDirty = false;
-        if (!saved)
-            pushToast(LogLevel::Error, "Imported \"" + imported + "\", but the previous profile could not be saved.");
-        else
-            pushToast(LogLevel::Info, "Imported shader preset \"" + imported + "\".");
     }
 
 } // namespace VkHook

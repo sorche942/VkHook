@@ -17,6 +17,8 @@
 namespace VkHook
 {
     class Config;
+    class InputSession;
+    class OverlayRenderer;
 
     // for each swapchain, we have the Images and the other stuff we need to execute the compute shader
     // Per-image depth resolve resources — kept together so they
@@ -49,6 +51,17 @@ namespace VkHook
         std::vector<uint8_t>       effectFenceUsed;
         // newest layer submission that reads or writes this swapchain's images
         std::atomic<uint64_t>      lastSerial{0};
+
+        // The input session of the surface this swapchain presents to (null for a
+        // windowing system the layer does not process). It outlives the swapchain's use of it.
+        std::shared_ptr<InputSession> input;
+
+        // This swapchain's overlay target: render pass, command buffers, fences
+        // and framebuffers for its images, drawn with the device's OverlayUi.
+        // Created with the first generation (its format and image count are fixed
+        // for the swapchain's life) and reset before anything it renders into
+        // is released.
+        std::shared_ptr<OverlayRenderer> overlay;
 
         // First-generation build (vkGetSwapchainImagesKHR). The mutex guards the
         // state variable only and is never held while building; a concurrent

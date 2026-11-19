@@ -1,234 +1,118 @@
 #include "control/preset_import.hh"
 
 #include "control/frontend.hh"
+#include "control/preset_model.hh"
 
 #include "config.hh"
 #include "config_serializer.hh"
-#include "settings_manager.hh"
 #include "effects/effect_registry.hh"
+#include "ini.hh"
 #include "logger.hh"
+#include "store.hh"
 
 #include <algorithm>
+#include <cctype>
 #include <filesystem>
 #include <map>
-#include <set>
 #include <string>
 #include <vector>
 
 namespace VkHook
 {
+    namespace
+    {
+        std::string lowerCase(std::string text)
+        {
+            std::transform(text.begin(), text.end(), text.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            return text;
+        }
+    } // namespace
+
     void applyShaderProfile(Config* config, const std::string& path)
     {
         if (!config)
             return;
         if (!path.empty())
         {
-            const auto profile = ConfigSerializer::loadShaderProfileData(path);
-            const auto sidecar = ConfigSerializer::loadShaderProfileData(
-                ConfigSerializer::getShaderProfileSidecarPath(path));
+            std::string iniText, sidecarText;
+            ConfigSerializer::readShaderProfile(path, iniText, sidecarText);
 
-            auto join = [](const std::vector<std::string>& values) {
-                std::string result;
-                for (const auto& value : values)
-                {
-                    if (!result.empty()) result += ':';
-                    result += value;
-                }
-                return result;
-            };
-
-            // an owned profile's sidecar is the complete stack: register any
-            // definitions it misses before they are collected, so the game
-            // config's stale effect list never merges in and a shader the
-            // config forgot resolves by filename via the include paths
-            if (sidecar.owned)
-                for (const auto& instance : sidecar.instances)
-                    if (!config->hasOption(instance.name))
-                        config->setOption(instance.name, instance.type);
-
-            auto definitions = config->getEffectDefinitions();
-            if (baseConfig)
-            {
-                const auto baseDefinitions = baseConfig->getEffectDefinitions();
-                for (const auto& [name, effectPath] : baseDefinitions)
-                    definitions.emplace(name, effectPath);
-            }
+            // the instances the game config and VkHook.conf already define, by
+            // shader filename, so a preset's techniques land on those names
             std::map<std::string, std::vector<std::string>> namesByFile;
-            for (const auto& [name, effectPath] : definitions)
             {
-                std::string filename = std::filesystem::path(effectPath).filename().string();
-                std::transform(filename.begin(), filename.end(), filename.begin(),
-                               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-                namesByFile[filename].push_back(name);
+                auto definitions = config->getEffectDefinitions();
+                if (baseConfig)
+                    for (const auto& [name, effectPath] : baseConfig->getEffectDefinitions())
+                        definitions.emplace(name, effectPath);
+                for (const auto& [name, effectPath] : definitions)
+                    namesByFile[lowerCase(std::filesystem::path(effectPath).filename().string())].push_back(name);
+                for (auto& [file, names] : namesByFile)
+                    std::sort(names.begin(), names.end());
             }
-            auto applyParams = [&](const std::vector<ConfigParam>& params) {
-            for (const auto& param : params)
-            {
-                std::vector<std::string> effectNames;
-                std::string section = param.effectName;
-                std::transform(section.begin(), section.end(), section.begin(),
-                               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-                auto it = namesByFile.find(section);
-                if (it == namesByFile.end())
-                    it = namesByFile.find(std::filesystem::path(section).stem().string());
-                if (it != namesByFile.end())
-                    effectNames = it->second;
-                else if (!param.effectName.empty())
-                {
-                    const std::filesystem::path sectionPath(param.effectName);
-                    effectNames.push_back(sectionPath.extension() == ".fx"
-                                              ? sectionPath.stem().string()
-                                              : param.effectName);
-                }
-                if (!param.paramName.empty() && param.paramName.front() == '@')
-                {
-                    const std::string macroName = param.paramName.substr(1);
-                    if (effectNames.empty())
-                    {
-                        for (const auto& [name, effectPath] : definitions)
-                            config->setOption(name + "@" + macroName, param.value);
-                    }
-                    else
-                    {
-                        for (const auto& effectName : effectNames)
-                            config->setOption(effectName + "@" + macroName, param.value);
-                    }
-                    continue;
-                }
-                for (const auto& effectName : effectNames)
-                    config->setOption(effectName + "." + param.paramName, param.value);
-            }
-            };
-            applyParams(profile.params);
-            if (sidecar.owned || (!profile.hasEffectList && profile.hasTechniques))
-                applyParams(sidecar.params);
 
-            if (sidecar.owned)
+            ParseOptions options;
+            options.maxEffects = static_cast<size_t>(std::max(0, ConfigStore::instance().getMaxEffects()));
+            options.configuredNames = [&namesByFile](std::string_view file) {
+                const auto it = namesByFile.find(std::string(file));
+                return it == namesByFile.end() ? std::vector<std::string>{} : it->second;
+            };
+            const PathResolver resolve = [config](std::string_view key) {
+                return EffectRegistry::resolveEffectPath(std::string(key), config);
+            };
+
+            Diagnostics diagnostics;
+            const EffectStack stack = parse(iniText, sidecarText, resolve, &diagnostics, options);
+            for (const auto& message : diagnostics.messages)
+                Logger::debug("preset " + path + ": " + message);
+
+            // every instance the preset keeps must be a definition of the
+            // config, so it resolves again on the next load
+            for (const auto& instance : stack.instances)
+                if (!config->hasOption(instance.name))
+                    config->setOption(instance.name, instance.type);
+
+            // a preset-wide macro applies to every effect the config knows
+            if (!stack.globalMacros.empty())
             {
-                const size_t maxEffects = static_cast<size_t>(settingsManager.getMaxEffects());
-                std::vector<std::string> effects, disabled;
-                for (const auto& instance : sidecar.instances)
+                std::vector<std::string> names;
+                for (const auto& [name, effectPath] : config->getEffectDefinitions())
+                    names.push_back(name);
+                if (baseConfig)
+                    for (const auto& [name, effectPath] : baseConfig->getEffectDefinitions())
+                        names.push_back(name);
+                for (const auto& name : names)
+                    for (const auto& macro : stack.globalMacros)
+                        config->setOption(name + "@" + macro.name, macro.value);
+            }
+
+            for (const auto& instance : stack.instances)
+            {
+                for (const auto& param : instance.params)
                 {
-                    if (effects.size() >= maxEffects)
-                        break;
-                    // skip the removed built-ins: they have no .fx, so a legacy
-                    // reference drops here and auto-save rewrites it away. an
-                    // installed shader of the same name still resolves.
-                    if (EffectRegistry::resolveEffectPath(instance.name, config).empty())
-                        continue;
+                    if (param.values.size() == 1)
+                        config->setOption(instance.name + "." + param.name, param.values.front());
+                    else
+                        for (size_t i = 0; i < param.values.size(); ++i)
+                            config->setOption(instance.name + "." + param.name + "[" + std::to_string(i) + "]",
+                                              param.values[i]);
+                }
+                for (const auto& macro : instance.macros)
+                    config->setOption(instance.name + "@" + macro.name, macro.value);
+            }
+
+            if (stack.authoritative)
+            {
+                std::vector<std::string> effects, disabled;
+                for (const auto& instance : stack.instances)
+                {
                     effects.push_back(instance.name);
                     if (!instance.enabled)
                         disabled.push_back(instance.name);
                 }
-                config->setOption("effects", join(effects));
-                config->setOption("disabledEffects", join(disabled));
-            }
-            else if (profile.hasEffectList)
-            {
-                std::vector<std::string> effects, disabled;
-                std::set<std::string> disabledSet(profile.disabledEffects.begin(), profile.disabledEffects.end());
-                for (const auto& name : profile.effects)
-                {
-                    if (EffectRegistry::resolveEffectPath(name, config).empty())
-                        continue;
-                    effects.push_back(name);
-                    if (disabledSet.count(name))
-                        disabled.push_back(name);
-                }
-                config->setOption("effects", join(effects));
-                config->setOption("disabledEffects", join(disabled));
-            }
-            else if (!profile.techniques.empty() || !profile.techniqueSorting.empty())
-            {
-                // TechniqueSorting is an ordering hint for all techniques in a
-                // preset. Techniques is the actual enabled list. Expanding the
-                // sorting list (or matching only by filename) imports every
-                // technique from a shader pack and can create hundreds of
-                // disabled instances that make the overlay unusable.
-                std::vector<std::string> effects, disabled;
-                const auto& sortedTechniques = profile.techniqueSorting.empty()
-                    ? profile.techniques
-                    : profile.techniqueSorting;
-                std::set<std::string> enabledTechniques;
-                for (const auto& technique : profile.techniques)
-                {
-                    enabledTechniques.insert(technique);
-                }
-                const bool hasExplicitEnabledTechniques = profile.hasTechniques;
-                std::set<std::string> addedEffects;
-                std::set<std::string> matchedConfiguredEffects;
-                const size_t maxEffects = static_cast<size_t>(settingsManager.getMaxEffects());
-                for (const auto& technique : sortedTechniques)
-                {
-                    if (effects.size() >= maxEffects)
-                        break;
-                    // TechniqueSorting lists every technique a preset knows;
-                    // Techniques is the enabled set. expanding sorting imports
-                    // hundreds of disabled instances and buries the UI.
-                    if (hasExplicitEnabledTechniques && !enabledTechniques.count(technique))
-                        continue;
-                    const size_t separator = technique.rfind('@');
-                    if (separator == std::string::npos || separator + 1 >= technique.size())
-                        continue;
-
-                    const std::string filename = technique.substr(separator + 1);
-                    const std::string techniqueName = technique.substr(0, separator);
-                    std::string normalizedFilename = filename;
-                    std::transform(normalizedFilename.begin(), normalizedFilename.end(), normalizedFilename.begin(),
-                                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-                    auto configuredNames = namesByFile.find(normalizedFilename);
-                    if (configuredNames == namesByFile.end())
-                        configuredNames = namesByFile.find(std::filesystem::path(normalizedFilename).stem().string());
-                    std::string effectName;
-
-                    // Resolve imported preset techniques to an existing
-                    // VkHook instance by exact technique name. Fall back to
-                    // the configured shader filename only when the preset
-                    // uses a name that does not correspond to a configured
-                    // instance; never expand one file to every instance.
-                    if (config->hasOption(techniqueName))
-                        effectName = techniqueName;
-                    else if (configuredNames != namesByFile.end())
-                    {
-                        const auto candidate = std::find_if(configuredNames->second.begin(), configuredNames->second.end(),
-                            [&](const std::string& name) {
-                                return !matchedConfiguredEffects.count(name) && name == techniqueName;
-                            });
-                        if (candidate != configuredNames->second.end())
-                            effectName = *candidate;
-                        else if (configuredNames->second.size() == 1 &&
-                                 !matchedConfiguredEffects.count(configuredNames->second.front()))
-                            effectName = configuredNames->second.front();
-                    }
-                    // not a configured instance: create one for the installed
-                    // shader, so importing isn't limited to effects the game
-                    // config already listed. never fall back to the bare
-                    // technique name, which resolves to nothing and ghosts.
-                    if (effectName.empty())
-                    {
-                        const std::string stem = std::filesystem::path(filename).stem().string();
-                        const std::string resolved = EffectRegistry::resolveEffectPath(stem, config);
-                        if (!resolved.empty())
-                        {
-                            effectName = stem;
-                            config->setOption(stem, resolved);
-                        }
-                    }
-                    if (effectName.empty())
-                    {
-                        Logger::debug("preset technique '" + techniqueName + "' from " + filename
-                                      + " matches no installed effect; skipping");
-                        continue;
-                    }
-
-                    if (!addedEffects.insert(effectName).second)
-                        continue;
-                    matchedConfiguredEffects.insert(effectName);
-                    effects.push_back(effectName);
-                }
-
-                config->setOption("effects", join(effects));
-                config->setOption("disabledEffects", join(disabled));
+                config->setOption("effects", Ini::joinList(effects, ':'));
+                config->setOption("disabledEffects", Ini::joinList(disabled, ':'));
             }
         }
         activeShaderProfilePath = path;

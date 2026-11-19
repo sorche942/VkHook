@@ -1,68 +1,40 @@
 #include "keyboard_input.hh"
 
-#include "input_blocker.hh"
-#include "logger.hh"
-#include "wayland_display.hh"
-
+#include "input_session.hh"
 #include "keyboard_input_wayland.hh"
 #include "keyboard_input_x11.hh"
 
+// Free-function facade over the current InputSession.
+
 namespace VkHook
 {
-    static void warnUnsupportedKeyboardOnce(const char* message)
-    {
-        static bool warned = false;
-        if (!warned && !isWayland() && !isX11())
-        {
-            Logger::warn(message);
-            warned = true;
-        }
-    }
-
     uint32_t convertToKeySym(std::string key)
     {
-        if (isWayland())
-            return convertToKeySymWayland(key);
-        if (isX11())
-            return convertToKeySymX11(key);
-        return 0u;
+        const auto session = InputSession::current();
+        if (!session)
+            return 0u;
+        return session->kind() == SurfaceKind::Wayland ? convertToKeySymWayland(key) : convertToKeySymX11(key);
     }
 
     void beginKeyboardInputFrame()
     {
-        // Wayland resets its own frame in beginWaylandInputFrame(); the x11
-        // backend needs the keymap cache invalidated once per present.
-        if (isX11())
-            beginKeyboardInputFrameX11();
+        if (auto session = InputSession::current())
+            session->beginFrame();
     }
 
     bool isKeyPressed(uint32_t ks)
     {
-        if (isOverlayConsumingKeys())
-        {
-            // the keystrokes belong to the text field; forget them so they do
-            // not fire the hotkey the moment the field closes
-            if (isWayland())
-                discardWaylandKeyPresses();
-            return false;
-        }
-        if (isWayland())
-            return isKeyPressedWayland(ks);
-        if (isX11())
-            return isKeyPressedX11(ks);
-
-        warnUnsupportedKeyboardOnce("unsupported Vulkan surface: keyboard polling disabled; returning no input");
+        if (auto session = InputSession::current())
+            return session->isKeyPressed(ks);
+        InputSession::warnNoSession("unsupported Vulkan surface: input polling disabled; returning no input");
         return false;
     }
 
     KeyboardState getKeyboardState()
     {
-        if (isWayland())
-            return getKeyboardStateWayland();
-        if (isX11())
-            return getKeyboardStateX11();
-
-        warnUnsupportedKeyboardOnce("unsupported Vulkan surface: keyboard polling disabled; returning default state");
+        if (auto session = InputSession::current())
+            return session->keyboardState();
+        InputSession::warnNoSession("unsupported Vulkan surface: input polling disabled; returning no input");
         return KeyboardState();
     }
 } // namespace VkHook

@@ -51,7 +51,7 @@ namespace VkHook
         bool requiresOutputForward() const { return outputForwardRequired; }
         virtual ~ReshadeEffect();
 
-        // Hands every GPU object this effect owns to the deferred destroy queue
+        // Hands every GPU object this effect owns to the device's RetireQueue
         // instead of releasing them inline. The handles stay raw members so the
         // several hundred use sites are untouched; what changes is that nothing is
         // destroyed at scope exit any more, and the queue enforces the release

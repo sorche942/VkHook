@@ -9,7 +9,7 @@
 #include "memory.hh"
 #include "util.hh"
 #include "logger.hh"
-#include "imgui_overlay.hh"
+#include "depth/tracker.hh"
 
 #include <algorithm>
 #include <cstdio>
@@ -30,22 +30,24 @@ namespace VkHook
     // Smoke-test hook: VKHOOK_SMOKE_DEPTH_REFRESH=<ms> drops the depth
     // selection on that interval, exactly what the Advanced tab's refresh does,
     // so a run covers the rebuild path while the queue is loaded. Off unless set.
+    DiagState::DiagState()
+    {
+        const char* value = std::getenv("VKHOOK_SMOKE_DEPTH_REFRESH");
+        if (value == nullptr)
+            return;
+        try
+        {
+            smokeRefreshIntervalMs = std::max(0, std::stoi(value));
+        }
+        catch (...)
+        {
+            smokeRefreshIntervalMs = 0;
+        }
+    }
+
     void maybeForceSmokeDepthRefresh(LogicalDevice* logicalDevice, DiagState& state)
     {
-        static const int intervalMs = []
-        {
-            const char* value = std::getenv("VKHOOK_SMOKE_DEPTH_REFRESH");
-            if (value == nullptr)
-                return 0;
-            try
-            {
-                return std::max(0, std::stoi(value));
-            }
-            catch (...)
-            {
-                return 0;
-            }
-        }();
+        const int intervalMs = state.smokeRefreshIntervalMs;
         if (intervalMs <= 0 || logicalDevice == nullptr)
             return;
 
@@ -60,11 +62,7 @@ namespace VkHook
             return;
         lastFired = now;
 
-        std::lock_guard<std::mutex> l(logicalDevice->stateLock);
-        logicalDevice->activeDepthState      = DepthState{};
-        logicalDevice->bestDepthCandidate    = LogicalDevice::DepthCandidateTrackingState{};
-        logicalDevice->pinnedDepthImageView  = VK_NULL_HANDLE;
-        logicalDevice->depthReallocPending   = true;
+        refreshDepthDetection(logicalDevice);
         Logger::debug("smoke hook: forced depth re-detect");
     }
 
@@ -433,8 +431,8 @@ namespace VkHook
                 logicalDevice->deviceLost.store(true, std::memory_order_release);
 
             logicalDevice->softDisabled.store(true, std::memory_order_release);
-            if (logicalDevice->imguiOverlay)
-                logicalDevice->imguiOverlay->pushToast(
+            if (logicalDevice->control)
+                logicalDevice->control->overlay.pushToast(
                     LogLevel::Error,
                     "VkHook disabled itself to keep the game alive.\nReason: " + reason +
                     "\nEffects are off until you restart the game.");

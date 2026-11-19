@@ -5,26 +5,29 @@
 // It synthesises real input on the developer's display, so it only runs with
 // VKHOOK_X11_INPUT_TEST=1 set; otherwise it reports SKIP (exit 77).
 //
-// usage: vkhook-x11-input-handoff-tests <path to libvkhook.so>
+// usage: vkhook-x11-input-handoff-tests
 
 #include <X11/Xlib.h>
 #include <X11/keysym.h>
 #include <X11/extensions/XTest.h>
-#include <dlfcn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include "input/mouse_input.hh"
+#include "input_blocker.hh"
+#include "input_session.hh"
+#include "mouse_input.hh"
+#include "wayland_interpose.hh"
 
-typedef void (*InitFn)(bool);
-typedef void (*SetWindowFn)(unsigned long);
-typedef void (*SetRectsFn)(const void*, int);
-typedef void (*SetBoolFn)(bool);
-typedef void (*SetPosFn)(float, float);
-typedef VkHook::MouseState (*GetMouseFn)();
+using namespace VkHook;
 
-struct InputRect { float x, y, width, height; };
+// The Wayland key hold lives in the interposer, which this X11-only test does not link.
+namespace VkHook
+{
+    void registerOverlayProxy(wl_proxy*) {}
+    void unregisterOverlayProxy(wl_proxy*) {}
+    void withholdGameKeys(bool) {}
+}
 
 static void pump(Display* d, const char* tag, int* sawPress, int* sawRelease, int* sawGrabFocus)
 {
@@ -55,7 +58,7 @@ static const char* grabStatus(Display* probe, Window w, int keyboard)
     return status == AlreadyGrabbed ? "held by the layer" : (status == GrabSuccess ? "free" : "other");
 }
 
-int main(int argc, char** argv)
+int main()
 {
     if (getenv("VKHOOK_X11_INPUT_TEST") == nullptr)
     {
@@ -66,25 +69,6 @@ int main(int argc, char** argv)
     {
         printf("skipped: no X display\n");
         return 77;
-    }
-
-    const char* libPath = argc > 1 ? argv[1] : "build/src/libvkhook.so";
-    void* lib = dlopen(libPath, RTLD_NOW);
-    if (!lib) { printf("dlopen failed: %s\n", dlerror()); return 1; }
-
-    InitFn        initInputBlocker        = (InitFn) dlsym(lib, "_ZN6VkHook16initInputBlockerEb");
-    SetWindowFn   setX11Window            = (SetWindowFn) dlsym(lib, "_ZN6VkHook12setX11WindowEm");
-    SetRectsFn    setInputRects           = (SetRectsFn) dlsym(lib, "_ZN6VkHook13setInputRectsEPKNS_9InputRectEi");
-    SetBoolFn     setInputBlocked         = (SetBoolFn) dlsym(lib, "_ZN6VkHook15setInputBlockedEb");
-    SetBoolFn     setInputInteractive     = (SetBoolFn) dlsym(lib, "_ZN6VkHook19setInputInteractiveEb");
-    SetBoolFn     setOverlayWantsKeyboard = (SetBoolFn) dlsym(lib, "_ZN6VkHook23setOverlayWantsKeyboardEb");
-    SetPosFn      updatePointerPosition   = (SetPosFn) dlsym(lib, "_ZN6VkHook21updatePointerPositionEff");
-    GetMouseFn getMouseState = (GetMouseFn) dlsym(lib, "_ZN6VkHook16getMouseStateX11Ev");
-    if (!initInputBlocker || !setX11Window || !setInputRects || !setInputBlocked
-        || !setInputInteractive || !setOverlayWantsKeyboard || !updatePointerPosition || !getMouseState)
-    {
-        printf("missing symbols: %s\n", dlerror());
-        return 1;
     }
 
     Display* game = XOpenDisplay(NULL);
@@ -107,9 +91,10 @@ int main(int argc, char** argv)
 
     const KeyCode w = XKeysymToKeycode(game, XK_w);
 
-    setX11Window((unsigned long)win);
+    const auto session = InputSession::create(SurfaceKind::X11, nullptr, static_cast<uintptr_t>(win));
+    if (!session) { printf("could not create the input session\n"); return 1; }
     initInputBlocker(true);
-    struct InputRect rect = {0.0f, 0.0f, 380.0f, 260.0f};
+    InputRect rect = {0.0f, 0.0f, 380.0f, 260.0f};
     setInputRects(&rect, 1);
     setInputBlocked(true);
     updatePointerPosition(100.0f, 100.0f);   // pointer over the overlay hitbox

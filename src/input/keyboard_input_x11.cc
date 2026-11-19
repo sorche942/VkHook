@@ -1,34 +1,17 @@
 #include "keyboard_input_x11.hh"
 
 #include "logger.hh"
-#include "x11_display.hh"
+#include "x11_input.hh"
 
 #include <X11/Xlib.h>
 #include <X11/keysym.h>
 #include <X11/XKBlib.h>
 
 #include <algorithm>
-#include <limits>
 #include <string>
-#include <unordered_map>
-#include <vector>
 
 namespace VkHook
 {
-    static std::string typedCharsAccumulator;
-    static std::string lastKeyNameAccumulator;
-    static std::vector<NavKey> navAccumulator;
-    // modifier key counts (left + right), kept from the key events themselves so
-    // no server query is needed to know what is held
-    static int shiftDown = 0;
-    static int ctrlDown = 0;
-    static int altDown = 0;
-    static int superDown = 0;
-    static uint64_t keymapFrameId = 0;
-    static uint64_t lastQueriedKeymapFrame = std::numeric_limits<uint64_t>::max();
-    static char cachedKeymap[32] = {};
-    static std::unordered_map<uint32_t, KeyCode> keysymToKeycodeCache;
-
     static bool isModifierKeysym(KeySym keysym)
     {
         return keysym == XK_Shift_L || keysym == XK_Shift_R || keysym == XK_Control_L || keysym == XK_Control_R ||
@@ -36,14 +19,14 @@ namespace VkHook
                keysym == XK_Meta_L || keysym == XK_Meta_R || keysym == XK_ISO_Level3_Shift;
     }
 
-    static void trackModifier(KeySym keysym, bool pressed)
+    void X11Input::trackModifier(unsigned long keysym, bool pressed)
     {
         const int delta = pressed ? 1 : -1;
         int* counter = nullptr;
-        if (keysym == XK_Shift_L || keysym == XK_Shift_R) counter = &shiftDown;
-        else if (keysym == XK_Control_L || keysym == XK_Control_R) counter = &ctrlDown;
-        else if (keysym == XK_Alt_L || keysym == XK_Alt_R || keysym == XK_Meta_L || keysym == XK_Meta_R) counter = &altDown;
-        else if (keysym == XK_Super_L || keysym == XK_Super_R) counter = &superDown;
+        if (keysym == XK_Shift_L || keysym == XK_Shift_R) counter = &m_shiftDown;
+        else if (keysym == XK_Control_L || keysym == XK_Control_R) counter = &m_ctrlDown;
+        else if (keysym == XK_Alt_L || keysym == XK_Alt_R || keysym == XK_Meta_L || keysym == XK_Meta_R) counter = &m_altDown;
+        else if (keysym == XK_Super_L || keysym == XK_Super_R) counter = &m_superDown;
         if (counter)
             *counter = std::max(0, *counter + delta);
     }
@@ -82,12 +65,13 @@ namespace VkHook
         return 0;
     }
 
-    static void processKey(KeyCode keycode, bool pressed)
+    void X11Input::processKey(unsigned int rawKeycode, bool pressed)
     {
-        Display* display = x11Display();
+        Display* display = connection();
         if (!display)
             return;
 
+        const KeyCode keycode = static_cast<KeyCode>(rawKeycode);
         const KeySym base = XkbKeycodeToKeysym(display, keycode, 0, 0);
         trackModifier(base, pressed);
         if (!pressed)
@@ -97,46 +81,40 @@ namespace VkHook
         if (!isModifierKeysym(base))
         {
             if (const char* keyName = XKeysymToString(base))
-                lastKeyNameAccumulator = keyName;
+                m_lastKeyName = keyName;
         }
 
         NavKey nav;
         if (navKeyFor(base, nav))
         {
-            if (navAccumulator.size() < kMaxNavPresses)
-                navAccumulator.push_back(nav);
+            if (m_navPresses.size() < kMaxNavPresses)
+                m_navPresses.push_back(nav);
             return;
         }
 
         // Ctrl/Alt/Super chords are shortcuts, not text
-        if (ctrlDown || altDown || superDown)
+        if (m_ctrlDown || m_altDown || m_superDown)
             return;
 
-        const KeySym actual = XkbKeycodeToKeysym(display, keycode, 0, shiftDown ? 1 : 0);
+        const KeySym actual = XkbKeycodeToKeysym(display, keycode, 0, m_shiftDown ? 1 : 0);
         if (const uint32_t cp = codepointFor(actual))
-            appendUtf8(typedCharsAccumulator, cp);
+            appendUtf8(m_typedChars, cp);
     }
 
-    static void onRawKey(uint32_t keycode, bool pressed)
+    void X11Input::ensureKeyboardPrimed()
     {
-        processKey(static_cast<KeyCode>(keycode), pressed);
-    }
-
-    static void ensureRegistered()
-    {
-        static bool done = false;
-        if (done)
+        if (m_keyboardPrimed)
             return;
-        done = true;
-        setX11KeyCallback(onRawKey);
+        m_keyboardPrimed = true;
         // cache the keymap once so the first shifted character is correct.
-        if (Display* display = x11Display())
-            XQueryKeymap(display, cachedKeymap);
+        if (Display* display = connection())
+            XQueryKeymap(display, m_cachedKeymap);
     }
 
-    void beginKeyboardInputFrameX11()
+    void X11Input::beginKeyboardFrame()
     {
-        keymapFrameId++;
+        std::lock_guard<std::recursive_mutex> lock(m_mutex);
+        m_keymapFrameId++;
     }
 
     uint32_t convertToKeySymX11(std::string key)
@@ -147,62 +125,64 @@ namespace VkHook
         return result;
     }
 
-    bool isKeyPressedX11(uint32_t ks)
+    bool X11Input::isKeyPressed(uint32_t ks)
     {
-        Display* display = x11Display();
+        std::lock_guard<std::recursive_mutex> lock(m_mutex);
+        Display* display = connection();
         if (!display)
             return false;
 
-        ensureRegistered();
+        ensureKeyboardPrimed();
 
         // hotkeys belong to the game window: polling the keyboard from here
         // would otherwise fire them while another application has the focus.
-        // x11GameFocused() answers from a cache, so this costs no round trip.
-        if (!x11GameFocused())
+        // gameFocused() answers from a cache, so this costs no round trip.
+        if (!gameFocusedLocked(m_window))
             return false;
 
-        if (lastQueriedKeymapFrame != keymapFrameId)
+        if (m_lastQueriedKeymapFrame != m_keymapFrameId)
         {
-            XQueryKeymap(display, cachedKeymap);
-            lastQueriedKeymapFrame = keymapFrameId;
+            XQueryKeymap(display, m_cachedKeymap);
+            m_lastQueriedKeymapFrame = m_keymapFrameId;
         }
 
         KeyCode keycode = 0;
-        auto cached = keysymToKeycodeCache.find(ks);
-        if (cached != keysymToKeycodeCache.end())
+        auto cached = m_keysymToKeycode.find(ks);
+        if (cached != m_keysymToKeycode.end())
             keycode = cached->second;
         else
         {
             keycode = XKeysymToKeycode(display, (KeySym)ks);
-            keysymToKeycodeCache.emplace(ks, keycode);
+            m_keysymToKeycode.emplace(ks, keycode);
         }
 
         if (keycode == 0)
             return false;
 
-        return !!(cachedKeymap[keycode >> 3] & (1 << (keycode & 7)));
+        return !!(m_cachedKeymap[keycode >> 3] & (1 << (keycode & 7)));
     }
 
-    KeyboardState getKeyboardStateX11()
+    KeyboardState X11Input::keyboardState()
     {
+        std::lock_guard<std::recursive_mutex> lock(m_mutex);
         KeyboardState state;
-        if (!x11Available())
+        if (!connection())
             return state;
 
-        ensureRegistered();
-        pumpX11Input();
+        ensureKeyboardPrimed();
+        pumpLocked();
 
-        state.typedChars = std::move(typedCharsAccumulator);
-        state.lastKeyName = std::move(lastKeyNameAccumulator);
-        state.navPresses = std::move(navAccumulator);
-        state.shift = shiftDown > 0;
-        state.ctrl = ctrlDown > 0;
-        state.alt = altDown > 0;
-        state.super = superDown > 0;
+        state.typedChars = std::move(m_typedChars);
+        state.lastKeyName = std::move(m_lastKeyName);
+        state.navPresses = std::move(m_navPresses);
+        state.shift = m_shiftDown > 0;
+        state.ctrl = m_ctrlDown > 0;
+        state.alt = m_altDown > 0;
+        state.super = m_superDown > 0;
 
-        typedCharsAccumulator.clear();
-        lastKeyNameAccumulator.clear();
-        navAccumulator.clear();
+        m_typedChars.clear();
+        m_lastKeyName.clear();
+        m_navPresses.clear();
 
         return state;
     }

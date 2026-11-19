@@ -4,14 +4,6 @@
 namespace VkHook
 {
 
-    VkDescriptorPool createDescriptorPool(LogicalDevice* logicalDevice, const std::vector<VkDescriptorPoolSize>& poolSizes)
-    {
-        uint32_t setCount = 0;
-        for (const VkDescriptorPoolSize& size : poolSizes)
-            setCount += size.descriptorCount;
-        return createDescriptorPool(logicalDevice, poolSizes, setCount);
-    }
-
     VkDescriptorPool createDescriptorPool(LogicalDevice*                          logicalDevice,
                                           const std::vector<VkDescriptorPoolSize>& poolSizes,
                                           uint32_t                                maxSets)

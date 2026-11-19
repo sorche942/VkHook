@@ -72,6 +72,8 @@ namespace
         if (!logicalDevice)
             return;
         LogicalDevice& d = *logicalDevice;
+        // the renderer retires its own objects; it goes before the images it draws into
+        overlay.reset();
         auto drop = [&](VkObjectType type, auto handle) {
             if (!handle)
                 return;

@@ -16,9 +16,10 @@
 #include "format.hh"
 #include "util.hh"
 #include "logger.hh"
-#include "settings_manager.hh"
+#include "store.hh"
 #include "config.hh"
-#include "imgui_overlay.hh"
+#include "input_session.hh"
+#include "overlay/overlay_renderer.hh"
 #include "effects/effect.hh"
 #include "effects/effect_reshade.hh"
 #include "effects/effect_transfer.hh"
@@ -162,9 +163,9 @@ namespace VkHook
                     logicalDevice, logicalSwapchain->format, logicalSwapchain->imageExtent,
                     firstImages, secondImages, &effectRegistry, texturePool, effectStrings[i], effectPath, customDefs);
                 logicalSwapchain->effects.push_back(reshadeEffect);
-                if (reshadeEffect->getOutputWrites() == 0)
+                if (reshadeEffect->requiresOutputForward())
                 {
-                    Logger::debug("deterministic forwarding for zero-output-write effect: " + effectStrings[i]);
+                    Logger::debug("forwarding the in-place result of effect: " + effectStrings[i]);
                     logicalSwapchain->effects.push_back(std::make_shared<TransferEffect>(logicalDevice, logicalSwapchain->format, logicalSwapchain->imageExtent,
                                            firstImages, secondImages, config));
                 }
@@ -363,6 +364,24 @@ namespace
         return serveImages(sc.faked() ? sc.fakeImages : sc.images, sc.imageCount, pCount, out);
     }
 
+    // The device's OverlayUi, created with its first swapchain and shared by every
+    // swapchain's renderer. The overlay grabs the surface's input while it is up.
+    OverlayUi* ensureOverlayUi(LogicalDevice* logicalDevice, InputSession* input)
+    {
+        OverlayControl& overlay = deviceControl(logicalDevice).overlay;
+        if (OverlayUi* existing = overlay.ui())
+            return existing;
+
+        OverlayUi* ui = overlay.ensureUi();
+        if (ui && input)
+        {
+            // Input blocking (grabs all input when the overlay is visible)
+            input->initBlocker(ConfigStore::instance().getOverlayBlockInput());
+            input->setBlocked(ui->isVisible());
+        }
+        return ui;
+    }
+
     // Builds the first generation of a swapchain from its real images. Returns
     // the generation (faked or passthrough) or null with `error` set.
     std::shared_ptr<LogicalSwapchain> buildFirstGeneration(LogicalDevice* logicalDevice, VkDevice device,
@@ -441,7 +460,7 @@ namespace
         if (skeleton->passthrough || zeroExtent || layered)
             return passthroughGeneration(skeleton->passthrough ? "surface lacks TRANSFER_DST" : zeroExtent ? "zero extent" : "multi-layer");
         // a surface neither backend processes gets the real images so it still presents
-        if (!isWayland() && !isX11())
+        if (!shared.input || !shared.input->alive())
             return passthroughGeneration("unsupported windowing system");
 
         // Image views of the real images, for overlay rendering
@@ -470,9 +489,9 @@ namespace
 
         const auto selectedEffects = effectRegistry.getSelectedEffects();
 
-        // Allow dynamic effect loading by allocating for more effects than configured.
-        // Clamp maxEffects to a safe range to avoid pathological allocations.
-        const int32_t maxEffects  = std::clamp(settingsManager.getMaxEffects(), 1, 200);
+        // Allow dynamic effect loading by allocating for more effects than configured
+        // (the store clamps maxEffects to its schema range).
+        const int32_t maxEffects  = ConfigStore::instance().getMaxEffects();
         const size_t  effectSlots = std::max(selectedEffects.size(), static_cast<size_t>(maxEffects));
         next->maxEffectSlots      = effectSlots;
 
@@ -519,6 +538,14 @@ namespace
             }
         }
 
+        // This swapchain's overlay target. A swapchain without one presents without
+        // the overlay; it is not a reason to give up the effects.
+        guardLayerWork(logicalDevice, "overlay renderer", [&] {
+            OverlayUi* ui = ensureOverlayUi(logicalDevice, shared.input.get());
+            if (ui)
+                shared.overlay = OverlayRenderer::create(*ui, logicalDevice, next->format, next->imageCount);
+        });
+
         // the swapchain-lifetime objects are in `shared`; the generation carries value copies
         next->imageViews         = shared.imageViews;
         next->fakeImages         = shared.fakeImages;
@@ -532,8 +559,7 @@ namespace
         {
             // Resize with effects - use pass-through and debounce for smooth resize
             Logger::debug("using pass-through during resize, will restore effects after debounce");
-            resizeDebounce.pending        = true;
-            resizeDebounce.lastResizeTime = std::chrono::steady_clock::now();
+            deviceControl(logicalDevice).noteResize();
         }
         else
         {
@@ -552,43 +578,6 @@ namespace
         Logger::debug("built chain generation " + std::to_string(next->generation) + " with "
                       + std::to_string(next->effects.size()) + " effects");
         return next;
-    }
-
-    // The overlay lives at device level and survives swapchain recreation.
-    void ensureOverlay(LogicalDevice* logicalDevice, const LogicalSwapchain& sc)
-    {
-        std::unique_ptr<ImGuiOverlay> created;
-        bool needsOverlay;
-        {
-            std::lock_guard<std::mutex> l(logicalDevice->stateLock);
-            needsOverlay = !logicalDevice->imguiOverlay;
-            if (needsOverlay && !logicalDevice->overlayPersistentState)
-                logicalDevice->overlayPersistentState = std::make_unique<OverlayPersistentState>();
-        }
-
-        if (needsOverlay)
-        {
-            created = std::make_unique<ImGuiOverlay>(logicalDevice, sc.format, sc.imageCount,
-                                                     logicalDevice->overlayPersistentState.get());
-            // Set the effect registry pointer (single source of truth for enabled states)
-            created->setEffectRegistry(&effectRegistry);
-            // Set game/profile info for auto-save
-            created->setGameProfile(detectedGameName, activeProfileName, activeProfilePath);
-
-            std::lock_guard<std::mutex> l(logicalDevice->stateLock);
-            if (!logicalDevice->imguiOverlay)
-            {
-                // Initialize input blocking (grabs all input when overlay is visible);
-                // the overlay is created once per device, so this runs once per device
-                initInputBlocker(settingsManager.getOverlayBlockInput());
-                setInputBlocked(created->isVisible());
-                logicalDevice->imguiOverlay = std::move(created);
-            }
-            return;
-        }
-
-        // an existing overlay follows the new swapchain's format and image count
-        logicalDevice->imguiOverlay->onSwapchainChanged(sc.format, sc.imageCount);
     }
 
     VKAPI_ATTR VkResult VKAPI_CALL VkHook_CreateSwapchainKHR(VkDevice                        device,
@@ -719,6 +708,7 @@ namespace
             skeleton->useMutableFormat  = useMutableFormat;
             skeleton->passthrough       = !fakeable;
             skeleton->shared            = std::make_shared<SwapchainShared>(logicalDevice);
+            skeleton->shared->input     = findSurfaceSession(pCreateInfo->surface);
             skeleton->depthReallocPending = true;
         });
 
@@ -856,10 +846,7 @@ namespace
         built = true;
 
         if (first->faked())
-        {
-            guardLayerWork(logicalDevice, "vkGetSwapchainImagesKHR", [&] { ensureOverlay(logicalDevice, *first); });
             Logger::trace("vkGetSwapchainImagesKHR");
-        }
         return serveGeneration(*first, pCount, swapchainImages);
     }
 

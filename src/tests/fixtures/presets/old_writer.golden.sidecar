@@ -1,0 +1,14 @@
+[VKHOOK]
+Effects=Bloom@qUINT_bloom.fx, Bloom.2@qUINT_bloom.fx, *Vibrance@Vibrance.fx, DLSS5
+
+[Bloom]
+BLOOM_INT=0.500000
+BLOOM_THRESHOLD=0.900000
+
+[Bloom.2]
+BLOOM_INT=1.500000
+BLOOM_THRESHOLD=0.100000
+
+[Vibrance]
+Vibrance=0.750000
+Vibrance_RGB_balance=1.000000,0.900000,0.800000

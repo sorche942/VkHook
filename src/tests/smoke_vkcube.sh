@@ -10,8 +10,6 @@
 #
 # VKHOOK_SMOKE_DEPTH_REFRESH sets how often, in ms, the run forces a depth
 # re-detect (default 500), which is what drives the rebuild assertions below.
-# VKHOOK_SMOKE_REBUILD_MODE=1 seeds the fast rebuild path instead of the safe
-# default; on a GPU, run both to cover the two.
 #
 # needs a display. on CI wrap it: xvfb-run -a src/tests/smoke_vkcube.sh
 # there is no GPU on a CI runner either, so point VK_ICD_FILENAMES at lavapipe
@@ -167,12 +165,6 @@ INI
     # Exercise automatic or manual scale without changing the user's config.
     if [[ -n "${VKHOOK_SMOKE_UI_SCALE:-}" ]]; then
         printf 'uiScale = %s\n' "$VKHOOK_SMOKE_UI_SCALE" >>"$base/VkHook.conf"
-    fi
-
-    # Which path the forced rebuilds below take: 0 = safe (idles the queue),
-    # 1 = fast (fence-gated). Unset leaves the shipped default (safe).
-    if [[ -n "${VKHOOK_SMOKE_REBUILD_MODE:-}" ]]; then
-        printf 'depthRebuildMode = %s\n' "$VKHOOK_SMOKE_REBUILD_MODE" >>"$base/VkHook.conf"
     fi
 }
 

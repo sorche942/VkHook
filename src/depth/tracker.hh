@@ -87,6 +87,18 @@ namespace VkHook
     void destroyPersistentDepthStorage(LogicalDevice* logicalDevice);
     void ensurePersistentDepthStorage(LogicalDevice* logicalDevice, VkFormat format, const VkExtent3D& extent);
 
+    // Entry points for the control plane (overlay commands, applied at a present
+    // boundary). Unlike the Locked functions they take stateLock themselves, so
+    // nothing outside the tracker writes the device's depth fields.
+    //   pinDepthView          false when `view` is not a tracked depth view
+    //   clearDepthPin         back to automatic promotion
+    //   refreshDepthDetection forget the active buffer, the best candidate and any pin
+    //   requestDepthRealloc   re-record the depth resolve path of every swapchain
+    bool pinDepthView(LogicalDevice* logicalDevice, VkImageView view);
+    void clearDepthPin(LogicalDevice* logicalDevice);
+    void refreshDepthDetection(LogicalDevice* logicalDevice);
+    void requestDepthRealloc(LogicalDevice* logicalDevice);
+
     // wipes scope tracking, the best candidate and any pending copy; the hold
     // lifts on the first observation from the new generation
     void armDepthTransitionHoldLocked(LogicalDevice* logicalDevice, const char* reason);

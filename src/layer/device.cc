@@ -7,8 +7,6 @@
 #include "depth/tracker.hh"
 #include "diag/gpu_crash.hh"
 
-#include "keyboard_input_wayland.hh"
-#include "mouse_input_wayland.hh"
 #include "util.hh"
 #include "logger.hh"
 #include "effects/dlss5_config.hh"
@@ -17,7 +15,6 @@
 #endif
 #include "layer/device_plan.hh"
 #include "layer/pipeline_cache.hh"
-#include "imgui_overlay.hh"
 #include "gpu/retire_device.hh"
 
 #include <algorithm>
@@ -205,6 +202,8 @@ namespace
 
         loadPipelineCache(*logicalDevice, deviceProps);
 
+        logicalDevice->control = std::make_shared<DeviceControlState>(logicalDevice.get());
+
         return logicalDevice;
     }
 
@@ -369,8 +368,15 @@ namespace
             }
             swapchains.clear();
 
-            // the overlay uses device resources
-            logicalDevice->imguiOverlay.reset();
+#ifdef VKHOOK_DLSS5
+            // the effects are gone: drop the cached networks of this device before its
+            // handle can be reused by a later one
+            clearDlss5ModelCache(device);
+#endif
+
+            // the overlay's UI uses device resources; every renderer that drew with it
+            // went with the swapchains above
+            logicalDevice->control.reset();
 
             destroyPersistentDepthStorage(logicalDevice);
 
@@ -394,10 +400,6 @@ namespace
                     logicalDevice->vkd.DestroyCommandPool(device, pool, pAllocator);
             });
 
-            // Clean up Wayland input resources (no-op if not initialized)
-            cleanupWaylandKeyboard();
-            cleanupWaylandMouse();
-
             // everything the layer retired, including the overlay's handles above
             logicalDevice->retireQueue.drainAll();
 
@@ -409,7 +411,6 @@ namespace
             }
 
             logicalDevice->queues.destroy();
-            releaseDeviceControl(logicalDevice);
         });
 
         unregisterDevice(GetKey(device));

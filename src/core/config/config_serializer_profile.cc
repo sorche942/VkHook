@@ -24,9 +24,7 @@ namespace VkHook
     std::string ConfigSerializer::getProfilePath(const std::string& gameName)
     {
         std::string configsDir = getConfigsDir();
-        if (configsDir.empty() || gameName.empty() ||
-            gameName.find('/') != std::string::npos || gameName.find('\\') != std::string::npos ||
-            gameName == "." || gameName == "..")
+        if (configsDir.empty() || !isSafePathComponent(gameName))
             return "";
 
         return configsDir + "/" + gameName + ".conf";
@@ -54,21 +52,6 @@ namespace VkHook
             return profilePath;
         }
 
-        // Move configs created by the experimental <game>@default.conf naming
-        // to the canonical <game>.conf path. Both files are in the same
-        // directory, so rename is atomic on the filesystem.
-        const std::string previousPath = configsDir + "/" + gameName + "@default.conf";
-        if (stat(previousPath.c_str(), &st) == 0)
-        {
-            if (std::rename(previousPath.c_str(), profilePath.c_str()) != 0)
-            {
-                Logger::err("Could not rename game config " + previousPath + " to " + profilePath);
-                return previousPath;
-            }
-            Logger::info("Renamed game config " + previousPath + " to " + profilePath);
-            return profilePath;
-        }
-
         // Create default profile with empty effects
         std::string contents = "# VkHook profile for " + gameName + "\n";
         contents += "# Auto-created on first launch\n\n";
@@ -87,10 +70,7 @@ namespace VkHook
     std::string ConfigSerializer::getShaderProfilePath(const std::string& gameName, const std::string& profileName)
     {
         const std::string base = getBaseConfigDir();
-        if (base.empty() || gameName.empty() || profileName.empty() ||
-            gameName.find('/') != std::string::npos || gameName.find('\\') != std::string::npos ||
-            gameName == "." || gameName == ".." || profileName.find('/') != std::string::npos ||
-            profileName.find('\\') != std::string::npos || profileName == "." || profileName == "..")
+        if (base.empty() || !isSafePathComponent(gameName) || !isSafePathComponent(profileName))
             return "";
         const std::string shaderDir = base + "/configs/shaders/";
         const std::string gameProfilePath = shaderDir + gameName + "@" + profileName + ".ini";
@@ -113,28 +93,20 @@ namespace VkHook
                 ("." + presetPath.filename().string() + "_disabled-effectvalues")).string();
     }
 
-    namespace
+    bool ConfigSerializer::isSafePathComponent(const std::string& name)
     {
-        // A macro value may itself contain commas (float3(1,0,0)), and the
-        // list separator is ", ", so a literal comma is written doubled.
-        void appendEscapedMacroValue(std::string& out, const std::string& value)
-        {
-            for (const char c : value)
-            {
-                out += c;
-                if (c == ',')
-                    out += ',';
-            }
-        }
+        if (name.empty() || name == "." || name == "..")
+            return false;
+        for (const unsigned char c : name)
+            if (c < 0x20 || c == 0x7f || c == '/' || c == '\\')
+                return false;
+        return true;
     }
 
     std::string ConfigSerializer::getGameShaderProfilePath(const std::string& gameName, const std::string& profileName)
     {
         const std::string base = ConfigSerializer::getBaseConfigDir();
-        if (base.empty() || gameName.empty() || profileName.empty() ||
-            gameName.find('/') != std::string::npos || gameName.find('\\') != std::string::npos ||
-            profileName.find('/') != std::string::npos || profileName.find('\\') != std::string::npos ||
-            gameName == "." || gameName == ".." || profileName == "." || profileName == "..")
+        if (base.empty() || !isSafePathComponent(gameName) || !isSafePathComponent(profileName))
             return "";
         return base + "/configs/shaders/" + gameName + "@" + profileName + ".ini";
     }
@@ -185,9 +157,7 @@ namespace VkHook
 
     bool ConfigSerializer::setLastShaderProfile(const std::string& gameName, const std::string& profileName)
     {
-        if (gameName.empty() || profileName.empty() || gameName.find('/') != std::string::npos ||
-            gameName.find('\\') != std::string::npos || profileName.find('/') != std::string::npos ||
-            profileName.find('\\') != std::string::npos)
+        if (!isSafePathComponent(gameName) || !isSafePathComponent(profileName))
             return false;
         const auto path = getBaseConfigDir() + "/configs/shaders/" + gameName + ".last-profile";
         std::error_code ec;
@@ -199,7 +169,7 @@ namespace VkHook
 
     std::string ConfigSerializer::getLastShaderProfile(const std::string& gameName)
     {
-        if (gameName.empty() || gameName.find('/') != std::string::npos || gameName.find('\\') != std::string::npos)
+        if (!isSafePathComponent(gameName))
             return "";
         std::ifstream file(getBaseConfigDir() + "/configs/shaders/" + gameName + ".last-profile");
         std::string profileName;
@@ -213,7 +183,7 @@ namespace VkHook
         // Creation always targets a game-specific file. The regular lookup
         // intentionally falls back to imported global presets for selection.
         const std::string path = getGameShaderProfilePath(gameName, profileName);
-        if (path.empty() || profileName.find('/') != std::string::npos || profileName.find('\\') != std::string::npos)
+        if (path.empty())
             return false;
         std::error_code ec;
         std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
@@ -278,14 +248,7 @@ namespace VkHook
 
     bool ConfigSerializer::isValidShaderProfileName(const std::string& name)
     {
-        if (name.empty() || name == "." || name == "..")
-            return false;
-        for (const unsigned char c : name)
-            if (c < 0x20 || c == 0x7f)
-                return false;
-        return name.find('/') == std::string::npos &&
-               name.find('\\') == std::string::npos &&
-               name.find('@') == std::string::npos;
+        return isSafePathComponent(name) && name.find('@') == std::string::npos;
     }
 
     bool ConfigSerializer::renameShaderProfile(const std::string& gameName, const std::string& oldName,
@@ -393,13 +356,8 @@ namespace VkHook
         return name;
     }
 
-    bool ConfigSerializer::saveShaderProfile(const std::string& path, const std::vector<ConfigParam>& params,
-                                             const std::vector<std::string>& effects,
-                                             const std::vector<std::string>& disabledEffects,
-                                             const std::map<std::string, std::string>& effectPaths,
-                                             const std::vector<std::string>& enabledTechniques,
-                                             const std::vector<std::string>& techniqueSorting,
-                                             const std::vector<ConfigParam>& disabledEffectParams)
+    bool ConfigSerializer::writeShaderProfile(const std::string& path, const std::string& ini,
+                                              const std::string& sidecar)
     {
         if (path.empty())
             return false;
@@ -408,388 +366,19 @@ namespace VkHook
             std::filesystem::create_directories(parent, ec);
         if (ec)
             return false;
-        auto sectionFor = [&effectPaths](const std::string& effectName) {
-            const auto it = effectPaths.find(effectName);
-            if (it != effectPaths.end() && std::filesystem::path(it->second).extension() == ".fx")
-                // ReShade looks up preset sections by the shader filename.
-                // Using VkHook instance names here makes imported presets lose
-                // their parameter values in ReShade.
-                return std::filesystem::path(it->second).filename().string();
-            return effectName;
-        };
-        auto mergeParams = [&sectionFor](const std::vector<ConfigParam>& source) {
-            std::map<std::pair<std::string, std::string>, std::string> merged;
-            for (const auto& [effectName, paramName, value] : source)
-                merged[{sectionFor(effectName), paramName}] = value;
-            return merged;
-        };
-        const auto merged = mergeParams(params);
-        const auto mergedDisabledParams = mergeParams(disabledEffectParams);
-        std::set<std::string> disabled(disabledEffects.begin(), disabledEffects.end());
-
-        // Two instances of the same shader file collapse into one filename-keyed
-        // section. Mirror their values into the sidecar under the instance name
-        // so they reload per-instance (the sidecar is replayed after the .ini).
-        std::map<std::string, int> sectionCount;
-        for (const auto& effect : effects)
-            sectionCount[sectionFor(effect)]++;
-        std::map<std::string, std::map<std::string, std::string>> duplicateInstanceParams;
-        auto collectDuplicateParams = [&](const std::vector<ConfigParam>& source) {
-            for (const auto& [effectName, paramName, value] : source)
-                if (sectionCount[sectionFor(effectName)] > 1)
-                    duplicateInstanceParams[effectName][paramName] = value;
-        };
-        collectDuplicateParams(params);
-        collectDuplicateParams(disabledEffectParams);
-
-        std::vector<std::string> techniques = enabledTechniques;
-        std::vector<std::string> sortedTechniques = techniqueSorting;
-        if (techniques.empty())
-        {
-            for (const auto& effect : effects)
-            {
-                if (disabled.count(effect))
-                    continue;
-                const std::string section = sectionFor(effect);
-                if (std::filesystem::path(section).extension() == ".fx")
-                    techniques.push_back(std::filesystem::path(section).stem().string() + "@" + section);
-            }
-        }
-        if (sortedTechniques.empty())
-            sortedTechniques = techniques;
-        auto deduplicate = [](std::vector<std::string>& values) {
-            std::set<std::string> seen;
-            values.erase(std::remove_if(values.begin(), values.end(), [&seen](const std::string& value) {
-                return !seen.insert(value).second;
-            }), values.end());
-        };
-        deduplicate(techniques);
-        deduplicate(sortedTechniques);
-        std::ostringstream file;
-        file << "Techniques=";
-        for (size_t i = 0; i < techniques.size(); ++i)
-        {
-            if (i) file << ',';
-            file << techniques[i];
-        }
-        file << "\nTechniqueSorting=";
-        for (size_t i = 0; i < sortedTechniques.size(); ++i)
-        {
-            if (i) file << ',';
-            file << sortedTechniques[i];
-        }
-        file << "\n\n";
-        std::map<std::pair<std::string, std::string>, std::string> outputValues;
-        std::map<std::pair<std::string, std::string>, std::map<size_t, std::string>> vectorValues;
-        for (const auto& [key, value] : merged)
-        {
-            if (!key.second.empty() && key.second.front() == '@')
-                continue;
-            const auto open = key.second.rfind('[');
-            if (open != std::string::npos && key.second.back() == ']')
-            {
-                try
-                {
-                    const size_t component = std::stoul(key.second.substr(open + 1, key.second.size() - open - 2));
-                    vectorValues[{key.first, key.second.substr(0, open)}][component] = value;
-                    continue;
-                }
-                catch (...) {}
-            }
-            outputValues[key] = value;
-        }
-        for (const auto& [key, components] : vectorValues)
-        {
-            std::string value;
-            for (const auto& [index, component] : components)
-            {
-                if (!value.empty()) value += ", ";
-                value += component;
-            }
-            outputValues[key] = value;
-        }
-        std::map<std::string, std::map<std::string, std::string>> preprocessorValues;
-        for (const auto& [key, value] : merged)
-            if (!key.second.empty() && key.second.front() == '@')
-                preprocessorValues[key.first][key.second.substr(1)] = value;
-        auto writePreprocessorDefinitions = [&file](const std::map<std::string, std::string>& macros) {
-            file << "PreprocessorDefinitions=";
-            bool first = true;
-            for (const auto& [name, macroValue] : macros)
-            {
-                if (!first) file << ", ";
-                file << name << '=';
-                std::string escaped;
-                appendEscapedMacroValue(escaped, macroValue);
-                file << escaped;
-                first = false;
-            }
-            file << '\n';
-        };
-        const auto globalMacros = preprocessorValues.find("");
-        if (globalMacros != preprocessorValues.end())
-        {
-            writePreprocessorDefinitions(globalMacros->second);
-            preprocessorValues.erase(globalMacros);
-        }
-        std::string current;
-        for (const auto& [key, value] : outputValues)
-        {
-            if (key.first != current)
-            {
-                file << '\n';
-                current = key.first;
-                file << "[" << current << "]\n";
-                const auto macros = preprocessorValues.find(current);
-                if (macros != preprocessorValues.end())
-                {
-                    writePreprocessorDefinitions(macros->second);
-                    preprocessorValues.erase(macros);
-                }
-            }
-            file << key.second << "=" << value << "\n";
-        }
-        if (!current.empty())
-            file << "\n";
-        for (const auto& [section, macros] : preprocessorValues)
-        {
-            file << "[" << section << "]\n";
-            writePreprocessorDefinitions(macros);
-            file << "\n";
-        }
-        if (!file.good() || !writeAtomically(path, file.str()))
-            return false;
-
-        // the sidecar keeps VkHook-only state out of the ReShade preset:
-        // the ordered instance list ("*" marks unchecked) plus values for
-        // disabled effects. it is always written so the .ini is recognised
-        // as ours and applies its stack exactly on the next load.
-        auto instanceEntry = [&effectPaths](const std::string& effectName, bool isDisabled) {
-            std::string type;
-            const auto it = effectPaths.find(effectName);
-            if (it != effectPaths.end() && !it->second.empty())
-            {
-                const std::filesystem::path p(it->second);
-                type = p.extension() == ".fx" ? p.filename().string() : it->second;
-            }
-            std::string entry = (type.empty() || type == effectName) ? effectName : effectName + "@" + type;
-            if (isDisabled)
-                entry.insert(entry.begin(), '*');
-            return entry;
-        };
-        const std::string sidecarPath = getShaderProfileSidecarPath(path);
-        std::ostringstream sidecar;
-        sidecar << "[VKHOOK]\nEffects=";
-        for (size_t i = 0; i < effects.size(); ++i)
-        {
-            if (i) sidecar << ", ";
-            sidecar << instanceEntry(effects[i], disabled.count(effects[i]) != 0);
-        }
-        sidecar << "\n\n";
-        for (const auto& [key, value] : mergedDisabledParams)
-        {
-            if (!key.second.empty() && key.second.front() == '@')
-            {
-                std::string escaped;
-                appendEscapedMacroValue(escaped, value);
-                sidecar << '[' << key.first << "]\nPreprocessorDefinitions="
-                        << key.second.substr(1) << '=' << escaped << "\n\n";
-            }
-            else
-                sidecar << '[' << key.first << "]\n" << key.second << '=' << value << "\n\n";
-        }
-        auto writeSidecarMacros = [&sidecar](const std::map<std::string, std::string>& macros) {
-            sidecar << "PreprocessorDefinitions=";
-            bool first = true;
-            for (const auto& [name, value] : macros)
-            {
-                if (!first) sidecar << ", ";
-                sidecar << name << '=';
-                std::string escaped;
-                appendEscapedMacroValue(escaped, value);
-                sidecar << escaped;
-                first = false;
-            }
-            sidecar << '\n';
-        };
-        for (const auto& [instance, paramMap] : duplicateInstanceParams)
-        {
-            std::map<std::string, std::string> scalars;
-            std::map<std::string, std::map<size_t, std::string>> vectors;
-            std::map<std::string, std::string> macros;
-            for (const auto& [key, value] : paramMap)
-            {
-                if (!key.empty() && key.front() == '@')
-                {
-                    macros[key.substr(1)] = value;
-                    continue;
-                }
-                const auto open = key.rfind('[');
-                if (open != std::string::npos && key.back() == ']')
-                {
-                    try
-                    {
-                        vectors[key.substr(0, open)][std::stoul(key.substr(open + 1, key.size() - open - 2))] = value;
-                        continue;
-                    }
-                    catch (...) {}
-                }
-                scalars[key] = value;
-            }
-            sidecar << '[' << instance << "]\n";
-            if (!macros.empty())
-                writeSidecarMacros(macros);
-            for (const auto& [key, value] : scalars)
-                sidecar << key << '=' << value << '\n';
-            for (const auto& [key, components] : vectors)
-            {
-                std::string joined;
-                for (const auto& [index, component] : components)
-                {
-                    if (!joined.empty()) joined += ", ";
-                    joined += component;
-                }
-                sidecar << key << '=' << joined << '\n';
-            }
-            sidecar << '\n';
-        }
-        return sidecar.good() && writeAtomically(sidecarPath, sidecar.str());
+        // the sidecar is always written, so the ini is recognised as ours and
+        // applies its stack exactly on the next load
+        return writeAtomically(path, ini) && writeAtomically(getShaderProfileSidecarPath(path), sidecar);
     }
 
-    ShaderProfileData ConfigSerializer::loadShaderProfileData(const std::string& path)
+    void ConfigSerializer::readShaderProfile(const std::string& path, std::string& ini, std::string& sidecar)
     {
-        ShaderProfileData data;
-        std::ifstream file(path);
-        std::string line, section;
-        while (std::getline(file, line))
-        {
-            const auto first = line.find_first_not_of(" \t\r");
-            if (first == std::string::npos || line[first] == ';' || line[first] == '#')
-                continue;
-            if (line[first] == '[')
-            {
-                const auto end = line.find(']', first + 1);
-                section = end == std::string::npos ? "" : line.substr(first + 1, end - first - 1);
-                continue;
-            }
-            const auto eq = line.find('=', first);
-            if (eq == std::string::npos)
-                continue;
-            auto trim = [](std::string s) {
-                const auto b = s.find_first_not_of(" \t\r");
-                if (b == std::string::npos) return std::string();
-                const auto e = s.find_last_not_of(" \t\r");
-                return s.substr(b, e - b + 1);
-            };
-            const auto key = trim(line.substr(first, eq - first));
-            const auto value = trim(line.substr(eq + 1));
-            auto splitValues = [&trim](const std::string& text, char delimiter) {
-                std::vector<std::string> values;
-                std::string item;
-                for (size_t i = 0; i < text.size(); ++i)
-                {
-                    if (text[i] == delimiter)
-                    {
-                        if (delimiter == ',' && i + 1 < text.size() && text[i + 1] == ',')
-                        {
-                            item += delimiter;
-                            ++i;
-                        }
-                        else
-                        {
-                            item = trim(std::move(item));
-                            if (!item.empty()) values.push_back(std::move(item));
-                            item.clear();
-                        }
-                    }
-                    else
-                        item += text[i];
-                }
-                item = trim(std::move(item));
-                if (!item.empty()) values.push_back(std::move(item));
-                return values;
-            };
-            if (section == "VKHOOK")
-            {
-                data.owned = true;
-                if (key == "Effects")
-                {
-                    for (const auto& entry : splitValues(value, ','))
-                    {
-                        std::string item = entry;
-                        ShaderProfileInstance instance;
-                        if (!item.empty() && item.front() == '*')
-                        {
-                            instance.enabled = false;
-                            item.erase(item.begin());
-                        }
-                        const auto at = item.rfind('@');
-                        if (at == std::string::npos || at + 1 >= item.size())
-                        {
-                            instance.name = item;
-                            instance.type = item;
-                        }
-                        else
-                        {
-                            instance.name = item.substr(0, at);
-                            instance.type = item.substr(at + 1);
-                        }
-                        if (!instance.name.empty())
-                            data.instances.push_back(instance);
-                    }
-                }
-                continue;
-            }
-            if (section.empty() && key == "Techniques")
-            {
-                data.hasTechniques = true;
-                data.techniques = splitValues(value, ',');
-                continue;
-            }
-            if (section.empty() && key == "TechniqueSorting")
-            {
-                data.techniqueSorting = splitValues(value, ',');
-                continue;
-            }
-            if (section.empty() && key == "VkHookEffects")
-            {
-                data.hasEffectList = true;
-                data.effects = splitValues(value, ':');
-                continue;
-            }
-            if (section.empty() && key == "VkHookDisabledEffects")
-            {
-                data.hasEffectList = true;
-                data.disabledEffects = splitValues(value, ':');
-                continue;
-            }
-            if (key == "PreprocessorDefinitions")
-            {
-                for (const auto& definition : splitValues(value, ','))
-                {
-                    const auto split = definition.find('=');
-                    if (split != std::string::npos)
-                        data.params.push_back({section, "@" + trim(definition.substr(0, split)), trim(definition.substr(split + 1))});
-                }
-                continue;
-            }
-            if (section.empty() || section == "GENERAL")
-                continue;
-            if (value.find(',') == std::string::npos)
-                data.params.push_back({section, key, value});
-            else
-            {
-                const auto components = splitValues(value, ',');
-                for (size_t index = 0; index < components.size(); ++index)
-                    data.params.push_back({section, key + "[" + std::to_string(index) + "]", components[index]});
-            }
-        }
-        return data;
-    }
-
-    std::vector<ConfigParam> ConfigSerializer::loadShaderProfile(const std::string& path)
-    {
-        return loadShaderProfileData(path).params;
+        auto slurp = [](const std::string& file) {
+            std::ifstream stream(file, std::ios::binary);
+            return std::string(std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>());
+        };
+        ini = slurp(path);
+        sidecar = slurp(getShaderProfileSidecarPath(path));
     }
 
 

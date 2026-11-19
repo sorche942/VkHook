@@ -10,11 +10,11 @@
 
 #include "command_buffer.hh"
 #include "format.hh"
-#include "settings_manager.hh"
-#include "imgui_overlay.hh"
+#include "store.hh"
+#include "input_session.hh"
+#include "overlay/overlay_renderer.hh"
 #include "logger.hh"
 #include "util.hh"
-#include "wayland_display.hh"
 #include "wayland_interpose_patch.hh"
 #include "wayland_syncobj_gate.hh"
 #include "effects/effect.hh"
@@ -41,6 +41,19 @@ namespace
         bool layerSubmitted = false;
     };
 
+    // The input session of the first presented swapchain that has one: its
+    // surface is what the hotkeys poll and what the syncobj gate guards.
+    std::shared_ptr<InputSession> presentSession(LogicalDevice& logicalDevice, const VkPresentInfoKHR* presentInfo)
+    {
+        for (uint32_t i = 0; i < presentInfo->swapchainCount; ++i)
+        {
+            const std::shared_ptr<LogicalSwapchain> swapchain = findSwapchain(logicalDevice, presentInfo->pSwapchains[i]);
+            if (swapchain && swapchain->shared && swapchain->shared->input && swapchain->shared->input->alive())
+                return swapchain->shared->input;
+        }
+        return nullptr;
+    }
+
     // The real present, bracketed so Mesa's explicit-sync points inside it
     // are not interleaved with window commits from other threads.
     VkResult realPresent(LogicalDevice* logicalDevice, VkQueue queue, const VkPresentInfoKHR* presentInfo,
@@ -48,7 +61,8 @@ namespace
     {
         installWaylandInterposeHooks();
 
-        const uint32_t surfaceId = WaylandSyncobjGate::waylandSurfaceId();
+        const std::shared_ptr<InputSession> session = presentSession(*logicalDevice, presentInfo);
+        const uint32_t surfaceId = session ? session->waylandSurfaceId() : 0;
         if (surfaceId)
             WaylandSyncobjGate::beginPresent(surfaceId);
 
@@ -97,7 +111,7 @@ namespace
     VkFence overlayFenceFor(void* context, uint32_t)
     {
         auto* ctx = static_cast<SubmitContext*>(context);
-        return ctx->device->imguiOverlay->getCommandBufferFence(ctx->index);
+        return ctx->swapchain->shared->overlay->fenceForSubmit(ctx->index);
     }
 
     // The layer's submit queue: the present queue when it belongs to the
@@ -236,8 +250,11 @@ namespace
             return realPresent(logicalDevice, queue, pPresentInfo, "vkQueuePresentKHR(device lost)",
                                "Vulkan device lost during present on a lost device");
 
+        // The window this present draws to: its input session serves the hotkeys
+        const std::shared_ptr<InputSession> session = presentSession(*logicalDevice, pPresentInfo);
         // Mark new input frame so dispatch deduplication resets
-        beginInputFrame();
+        if (session)
+            session->beginFrame();
 
         // The control step (hotkeys, hot-reload, overlay requests) runs with no
         // lock held. A soft-disabled device no longer runs it: the layer is not
@@ -245,7 +262,7 @@ namespace
         DeviceControlState& control = deviceControl(logicalDevice);
         bool effectsOn = false;
         if (!softDisabled)
-            effectsOn = runFrontendFrame(logicalDevice, control);
+            effectsOn = runFrontendFrame(logicalDevice, control, session.get());
 
         // Snapshot the swapchains of this present; every present thread keeps its
         // generation alive by reference.
@@ -411,10 +428,10 @@ namespace
                 target.prepare = &prepareEffectSubmission;
 
             // the overlay frame follows in every mode
-            if (logicalDevice->imguiOverlay)
+            if (shared.overlay)
             {
                 guardLayerWork(logicalDevice, "overlay record", [&] {
-                    const VkCommandBuffer overlayCmd = logicalDevice->imguiOverlay->recordFrame(
+                    const VkCommandBuffer overlayCmd = shared.overlay->record(
                         index, shared.imageViews[index], sc->imageExtent.width, sc->imageExtent.height);
                     if (overlayCmd != VK_NULL_HANDLE)
                     {

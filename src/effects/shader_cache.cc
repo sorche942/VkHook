@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "logger.hh"
+#include "paths.hh"
 #include "persist.hh"
 #include "reshade_compile.hh"
 #include "reshade_module_io.hh"
@@ -211,19 +212,8 @@ namespace VkHook
 
     std::string defaultShaderCacheDirectory()
     {
-        const auto variable = [](const char* name) {
-            const char* value = std::getenv(name);
-            return value && *value ? std::string(value) : std::string();
-        };
-        std::string base = variable("XDG_CACHE_HOME");
-        if (base.empty())
-        {
-            const std::string home = variable("HOME");
-            if (home.empty())
-                return {};
-            base = home + "/.cache";
-        }
-        return base + "/VkHook/shaders";
+        const std::string base = Paths::cacheHome();
+        return base.empty() ? std::string() : base + "/VkHook/shaders";
     }
 
     ShaderCache::ShaderCache(size_t memoryCapacity, std::string directory, std::string compilerTag, WriteScheduler scheduler)

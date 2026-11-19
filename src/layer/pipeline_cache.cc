@@ -17,15 +17,6 @@ namespace VkHook
 {
     namespace
     {
-        std::string cacheHome()
-        {
-            if (std::string xdg = Paths::env("XDG_CACHE_HOME"); !xdg.empty())
-                return xdg;
-            if (std::string home = Paths::env("HOME"); !home.empty())
-                return home + "/.cache";
-            return "";
-        }
-
         std::string hex(const uint8_t* bytes, size_t count)
         {
             std::string out;
@@ -62,7 +53,7 @@ namespace VkHook
 
     std::string pipelineCachePath(const VkPhysicalDeviceProperties& properties)
     {
-        const std::string home = cacheHome();
+        const std::string home = Paths::cacheHome();
         if (home.empty())
             return "";
         return home + "/VkHook/pipeline-" + std::to_string(properties.vendorID) + "-" + std::to_string(properties.deviceID)

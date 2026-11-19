@@ -29,6 +29,8 @@ namespace VkHook
         return *(void**) inst;
     }
 
+    class InputSession;
+
     struct InstanceState
     {
         InstanceDispatch dispatch;
@@ -57,6 +59,14 @@ namespace VkHook
         bool             found      = false;
     };
     InstanceSnapshot snapshotInstance(void* key);
+
+    // The input session of a surface: created by vkCreate{Wayland,Xlib,Xcb}SurfaceKHR,
+    // destroyed by vkDestroySurfaceKHR. A swapchain keeps the session of the
+    // surface it was created on, so it outlives nothing it depends on.
+    void registerSurface(VkSurfaceKHR surface, std::shared_ptr<InputSession> session);
+    // Forgets the surface and returns its session (null when none was registered).
+    std::shared_ptr<InputSession> unregisterSurface(VkSurfaceKHR surface);
+    std::shared_ptr<InputSession> findSurfaceSession(VkSurfaceKHR surface);
 
     // Takes device.stateLock for the lookup only.
     std::shared_ptr<LogicalSwapchain> findSwapchain(LogicalDevice& device, VkSwapchainKHR swapchain);

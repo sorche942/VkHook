@@ -1,4 +1,4 @@
-#include "imgui_overlay.hh"
+#include "overlay_ui.hh"
 #include "config_serializer.hh"
 #include "logger.hh"
 #include "overlay/ui_theme.hh"
@@ -426,7 +426,7 @@ namespace VkHook
     }
 
     // Everything the diagnostics tab samples. One per overlay (owned through
-    // ImGuiOverlay::diagnostics), so two overlays never share history.
+    // OverlayUi::diagnostics), so two overlays never share history.
     struct DiagnosticsState
     {
         RingBuffer<float, 300> frameTimeHistory;
@@ -455,11 +455,12 @@ namespace VkHook
         bool  dispHasVram = false, dispHasGtt = false;
     };
 
-    void ImGuiOverlay::sampleDiagnostics()
+    void OverlayUi::sampleDiagnostics()
     {
         if (!diagnostics)
             diagnostics = std::make_shared<DiagnosticsState>();
         DiagnosticsState& d = *diagnostics;
+        const DeviceInfo& deviceInfo = snapshot->device;
         const auto now = std::chrono::steady_clock::now();
 
         if (!d.initialized || d.resolvedSlot != deviceInfo.gpuPciSlot)
@@ -526,11 +527,12 @@ namespace VkHook
         }
     }
 
-    void ImGuiOverlay::renderDiagnosticsView()
+    void OverlayUi::renderDiagnosticsView()
     {
         if (!diagnostics)
             diagnostics = std::make_shared<DiagnosticsState>();
         DiagnosticsState& d = *diagnostics;
+        const DeviceInfo& deviceInfo = snapshot->device;
         if (ImGui::Button("Back to settings"))
         {
             openSubView = SubView_None;

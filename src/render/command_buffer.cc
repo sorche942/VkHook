@@ -6,7 +6,7 @@
 #include "graphics_pipeline.hh"
 #include "image_view.hh"
 #include "logical_swapchain.hh"
-#include "settings_manager.hh"
+#include "store.hh"
 #include "util.hh"
 
 namespace VkHook
@@ -202,7 +202,7 @@ namespace VkHook
                       "DepthPushConstants size must be 20 bytes to match GLSL");
 
         DepthPushConstants pushData = {};
-        const auto settings = settingsManager.snapshot();
+        const auto settings = ConfigStore::instance().snapshot();
         pushData.depthMode = static_cast<int32_t>(std::clamp(settings->depthSourceChannel, 0, 6));
         pushData.invertDepth = settings->depthInvert ? 1 : 0;
         pushData.normalize = 1;

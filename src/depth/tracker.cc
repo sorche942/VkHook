@@ -13,7 +13,7 @@
 #include "descriptor_set.hh"
 #include "graphics_pipeline.hh"
 #include "buffer.hh"
-#include "settings_manager.hh"
+#include "store.hh"
 #include "shader_sources.hh"
 #include "shader.hh"
 #include "logger.hh"
@@ -897,10 +897,10 @@ namespace VkHook
     // transform forces the shader path even for attachment-layout depth.
     static bool depthTransformRequested()
     {
-        return settingsManager.getDepthInvert()
-            || settingsManager.getDepthFlip()
-            || settingsManager.getDepthFlop()
-            || settingsManager.getDepthSourceChannel() != 0;
+        return ConfigStore::instance().getDepthInvert()
+            || ConfigStore::instance().getDepthFlip()
+            || ConfigStore::instance().getDepthFlop()
+            || ConfigStore::instance().getDepthSourceChannel() != 0;
     }
 
     void initializeDepthResolveLayout(LogicalSwapchain* logicalSwapchain, const DepthState& depth)
@@ -939,7 +939,7 @@ namespace VkHook
         VkResolveModeFlagBits chosenMode = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
         if (useMsaaResolve)
         {
-            const int modePref = settingsManager.getDepthResolveMode();
+            const int modePref = ConfigStore::instance().getDepthResolveMode();
             const bool wantsAverage =
                 (modePref == 0 || modePref == 2) && (logicalDevice->supportedDepthResolveModes & VK_RESOLVE_MODE_AVERAGE_BIT);
             chosenMode = wantsAverage ? VK_RESOLVE_MODE_AVERAGE_BIT : VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
@@ -1089,7 +1089,7 @@ namespace VkHook
                 VkDescriptorPoolSize imagePoolSize = {};
                 imagePoolSize.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
                 imagePoolSize.descriptorCount = logicalSwapchain->imageCount;
-                logicalSwapchain->depthResolveDescriptorPool = createDescriptorPool(logicalDevice, {imagePoolSize});
+                logicalSwapchain->depthResolveDescriptorPool = createDescriptorPool(logicalDevice, {imagePoolSize}, logicalSwapchain->imageCount);
 
                 std::vector<VkImageView> resolvedViews(logicalSwapchain->imageCount, VK_NULL_HANDLE);
                 for (uint32_t i = 0; i < logicalSwapchain->imageCount && i < logicalSwapchain->depthResolvePerImage.size(); ++i)
@@ -1138,7 +1138,7 @@ namespace VkHook
         VkDescriptorPoolSize imagePoolSize = {};
         imagePoolSize.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         imagePoolSize.descriptorCount = logicalSwapchain->imageCount;
-        logicalSwapchain->depthResolveDescriptorPool = createDescriptorPool(logicalDevice, {imagePoolSize});
+        logicalSwapchain->depthResolveDescriptorPool = createDescriptorPool(logicalDevice, {imagePoolSize}, logicalSwapchain->imageCount);
 
         std::vector<VkImageView> sourceViews(logicalSwapchain->imageCount, depth.imageView);
         logicalSwapchain->depthResolveDescriptorSets = allocateAndWriteImageSamplerDescriptorSets(
@@ -1596,6 +1596,39 @@ namespace VkHook
         // new generation off-lock and swaps it in; it never waits for the GPU),
         // and coalesces bursts of updates. Arming all swapchains here would
         // rebuild on the very next present of each, skipping the coalescing.
+        logicalDevice->depthReallocPending = true;
+    }
+
+    bool pinDepthView(LogicalDevice* logicalDevice, VkImageView view)
+    {
+        std::lock_guard<std::mutex> l(logicalDevice->stateLock);
+        if (logicalDevice->depthViewStates.find(view) == logicalDevice->depthViewStates.end())
+            return false;
+        logicalDevice->pinnedDepthImageView = view;
+        // the resolve's descriptor sets and MSAA framebuffers follow the source view
+        logicalDevice->depthReallocPending = true;
+        return true;
+    }
+
+    void clearDepthPin(LogicalDevice* logicalDevice)
+    {
+        std::lock_guard<std::mutex> l(logicalDevice->stateLock);
+        logicalDevice->pinnedDepthImageView = VK_NULL_HANDLE;
+        logicalDevice->depthReallocPending  = true;
+    }
+
+    void refreshDepthDetection(LogicalDevice* logicalDevice)
+    {
+        std::lock_guard<std::mutex> l(logicalDevice->stateLock);
+        logicalDevice->activeDepthState     = DepthState{};
+        logicalDevice->bestDepthCandidate   = LogicalDevice::DepthCandidateTrackingState{};
+        logicalDevice->pinnedDepthImageView = VK_NULL_HANDLE;
+        logicalDevice->depthReallocPending  = true;
+    }
+
+    void requestDepthRealloc(LogicalDevice* logicalDevice)
+    {
+        std::lock_guard<std::mutex> l(logicalDevice->stateLock);
         logicalDevice->depthReallocPending = true;
     }
 

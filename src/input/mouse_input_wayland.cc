@@ -1,63 +1,127 @@
-#include "mouse_input_wayland.hh"
-#include "wayland_input_common.hh"
-#include "wayland_interpose.hh"
-#include "wayland_display.hh"
+#include "wayland_input.hh"
+
 #include "logger.hh"
+#include "wayland_interpose.hh"
 
 #include <wayland-client.h>
 
 #include <chrono>
 #include <cstring>
+#include <string>
 
 namespace VkHook
 {
-    // Mouse-specific state (seat/queue come from wayland_input_common)
-    static wl_pointer* wlPointer = nullptr;
-    // which surface the pointer currently has focus on (motion carries no surface)
-    static wl_surface* pointerFocusSurface = nullptr;
-
-    // Mouse state
-    static int pointerX = 0;
-    static int pointerY = 0;
-    static bool leftButton = false;
-    static bool rightButton = false;
-    static bool middleButton = false;
-    static float scrollAccumulator = 0.0f;
-
-    // Protocol events within a frame can arrive in any order. Commit exactly
-    // one representation at frame end: value120, discrete, or continuous.
-    static float continuousScroll = 0.0f;
-    static float discreteScroll = 0.0f;
-    static float highResolutionScroll = 0.0f;
-    static bool hasDiscreteScroll = false;
-    static bool hasHighResolutionScroll = false;
-
-    // Stuck-button safety net. Button state is authoritative from
-    // wl_pointer.button: the compositor delivers the release even when the
-    // pointer leaves the surface under an implicit grab, so we do not
-    // synthesise a release on leave. A very long press timeout remains in
-    // case a compositor grab swallows the release entirely.
-    using Clock = std::chrono::steady_clock;
-    static Clock::time_point leftPressTime{};
-    static Clock::time_point rightPressTime{};
-    static Clock::time_point middlePressTime{};
-    static constexpr int AUTO_RELEASE_HARD_TIMEOUT_MS = 30000;
-
-    static bool mouseInitialized = false;
-
-    // Pointer listener callbacks
-    static void pointerEnter(void* /*data*/, wl_pointer* /*pointer*/,
-                             uint32_t /*serial*/, wl_surface* surface,
-                             wl_fixed_t sx, wl_fixed_t sy)
+    namespace
     {
-        pointerFocusSurface = surface;
-        // events on our capture surface are surface-local; shift them into the
-        // game's framebuffer space, which is what ImGui draws in.
-        const bool onInputSurface = (surface == getWaylandInputSurface());
-        const int originX = onInputSurface ? static_cast<int>(getWaylandInputSurfaceX()) : 0;
-        const int originY = onInputSurface ? static_cast<int>(getWaylandInputSurfaceY()) : 0;
-        pointerX = wl_fixed_to_int(sx) + originX;
-        pointerY = wl_fixed_to_int(sy) + originY;
+        // Linux evdev button codes: BTN_LEFT=0x110, BTN_RIGHT=0x111, BTN_MIDDLE=0x112
+        constexpr uint32_t kButtonLeft = 0x110;
+        constexpr uint32_t kButtonRight = 0x111;
+        constexpr uint32_t kButtonMiddle = 0x112;
+        constexpr int kAutoReleaseHardTimeoutMs = 30000;
+    } // namespace
+
+    // Every event libwayland 1.26 defines has an entry: a pointer bound at the
+    // seat's version can be sent any of them.
+    struct WaylandPointerListeners
+    {
+        static void enter(void* data, wl_pointer*, uint32_t, wl_surface* surface, wl_fixed_t sx, wl_fixed_t sy)
+        {
+            static_cast<WaylandInput*>(data)->onPointerEnter(surface, sx, sy);
+        }
+
+        static void leave(void* data, wl_pointer*, uint32_t, wl_surface* surface)
+        {
+            static_cast<WaylandInput*>(data)->onPointerLeave(surface);
+        }
+
+        static void motion(void* data, wl_pointer*, uint32_t, wl_fixed_t sx, wl_fixed_t sy)
+        {
+            static_cast<WaylandInput*>(data)->onPointerMotion(sx, sy);
+        }
+
+        static void button(void* data, wl_pointer*, uint32_t, uint32_t, uint32_t button, uint32_t state)
+        {
+            static_cast<WaylandInput*>(data)->onPointerButton(button, state == WL_POINTER_BUTTON_STATE_PRESSED);
+        }
+
+        static void axis(void* data, wl_pointer* pointer, uint32_t, uint32_t axis, wl_fixed_t value)
+        {
+            if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL)
+                static_cast<WaylandInput*>(data)->onPointerAxis(pointer, wl_fixed_to_double(value));
+        }
+
+        static void frame(void* data, wl_pointer*)
+        {
+            static_cast<WaylandInput*>(data)->onPointerFrame();
+        }
+
+        static void axisSource(void*, wl_pointer*, uint32_t)
+        {
+        }
+
+        static void axisStop(void*, wl_pointer*, uint32_t, uint32_t)
+        {
+        }
+
+        static void axisDiscrete(void* data, wl_pointer*, uint32_t axis, int32_t discrete)
+        {
+            static_cast<WaylandInput*>(data)->onPointerAxisDiscrete(axis, discrete);
+        }
+
+        static void axisValue120(void* data, wl_pointer*, uint32_t axis, int32_t value120)
+        {
+            static_cast<WaylandInput*>(data)->onPointerAxisValue120(axis, value120);
+        }
+
+        // wl_pointer v9: which way the compositor flipped the axis ("natural
+        // scrolling"). The overlay scrolls with the delta it is given.
+        static void axisRelativeDirection(void*, wl_pointer*, uint32_t, uint32_t)
+        {
+        }
+
+        // wl_pointer v11: the compositor moved the pointer itself
+        static void warp(void* data, wl_pointer*, wl_fixed_t sx, wl_fixed_t sy)
+        {
+            static_cast<WaylandInput*>(data)->onPointerMotion(sx, sy);
+        }
+
+        static constexpr wl_pointer_listener listener = {
+            .enter = enter,
+            .leave = leave,
+            .motion = motion,
+            .button = button,
+            .axis = axis,
+            .frame = frame,
+            .axis_source = axisSource,
+            .axis_stop = axisStop,
+            .axis_discrete = axisDiscrete,
+            .axis_value120 = axisValue120,
+            .axis_relative_direction = axisRelativeDirection,
+            .warp = warp,
+        };
+    };
+
+    // Events on our capture surface are surface-local; shift them into the
+    // game's framebuffer space, which is what ImGui draws in. Caller holds
+    // m_mouseMutex.
+    void WaylandInput::setPointerPosition(int32_t sx, int32_t sy)
+    {
+        const bool onInputSurface = m_inputSurface != nullptr && m_pointerFocusSurface == m_inputSurface;
+        const int originX = onInputSurface ? static_cast<int>(m_inputSurfaceX) : 0;
+        const int originY = onInputSurface ? static_cast<int>(m_inputSurfaceY) : 0;
+        m_pointerX = wl_fixed_to_int(sx) + originX;
+        m_pointerY = wl_fixed_to_int(sy) + originY;
+    }
+
+    void WaylandInput::onPointerEnter(wl_surface* surface, int32_t sx, int32_t sy)
+    {
+        const uintptr_t parent = m_parentAtomic.load(std::memory_order_acquire);
+        m_pointerFocus.store(reinterpret_cast<uintptr_t>(surface) == parent || surface == m_inputSurface,
+                             std::memory_order_release);
+
+        std::lock_guard<std::mutex> lock(m_mouseMutex);
+        m_pointerFocusSurface = surface;
+        setPointerPosition(sx, sy);
 
         // Do NOT clear button state here. Surface reconfigurations (swapchain
         // resize) cause rapid leave/enter cycles while the user is dragging.
@@ -65,247 +129,166 @@ namespace VkHook
         // is tracked purely from wl_pointer.button events. If a compositor grab
         // (Alt+drag) consumes a release, the next user click naturally clears it.
 
-        Logger::trace("Wayland: pointer enter at " + std::to_string(pointerX) + "," + std::to_string(pointerY));
+        Logger::trace("Wayland: pointer enter at " + std::to_string(m_pointerX) + "," + std::to_string(m_pointerY));
     }
 
-    static void pointerLeave(void* /*data*/, wl_pointer* /*pointer*/,
-                             uint32_t /*serial*/, wl_surface* surface)
+    void WaylandInput::onPointerLeave(wl_surface* /*surface*/)
     {
-        (void)surface;   // keep the last focus: motion carries no surface, and
-                         // clearing it here mistranslates the next one.
+        // keep the last focus surface: motion carries no surface, and clearing
+        // it here mistranslates the next one.
+        m_pointerFocus.store(false, std::memory_order_release);
         Logger::trace("Wayland: pointer leave");
     }
 
-    static void pointerMotion(void* /*data*/, wl_pointer* /*pointer*/,
-                              uint32_t /*time*/, wl_fixed_t sx, wl_fixed_t sy)
+    void WaylandInput::onPointerMotion(int32_t sx, int32_t sy)
     {
-        const bool onInputSurface =
-            getWaylandInputSurface() != nullptr && pointerFocusSurface == getWaylandInputSurface();
-        const int originX = onInputSurface ? static_cast<int>(getWaylandInputSurfaceX()) : 0;
-        const int originY = onInputSurface ? static_cast<int>(getWaylandInputSurfaceY()) : 0;
-        pointerX = wl_fixed_to_int(sx) + originX;
-        pointerY = wl_fixed_to_int(sy) + originY;
+        std::lock_guard<std::mutex> lock(m_mouseMutex);
+        setPointerPosition(sx, sy);
     }
 
-    static void pointerButton(void* /*data*/, wl_pointer* /*pointer*/,
-                              uint32_t /*serial*/, uint32_t /*time*/,
-                              uint32_t button, uint32_t state)
+    void WaylandInput::onPointerButton(uint32_t button, bool pressed)
     {
-        bool pressed = (state == WL_POINTER_BUTTON_STATE_PRESSED);
         Logger::trace("Wayland: pointer button " + std::to_string(button) + " " + (pressed ? "pressed" : "released"));
+        mirrorButton(button, pressed);
+    }
 
-        // Linux evdev button codes: BTN_LEFT=0x110, BTN_RIGHT=0x111, BTN_MIDDLE=0x112
-        auto now = Clock::now();
+    void WaylandInput::mirrorButton(uint32_t button, bool pressed)
+    {
+        std::lock_guard<std::mutex> lock(m_mouseMutex);
+        const auto now = Clock::now();
         switch (button)
         {
-            case 0x110:
-                leftButton = pressed;
-                if (pressed) leftPressTime = now;
+            case kButtonLeft:
+                m_leftButton = pressed;
+                if (pressed) m_leftPressTime = now;
                 break;
-            case 0x111:
-                rightButton = pressed;
-                if (pressed) rightPressTime = now;
+            case kButtonRight:
+                m_rightButton = pressed;
+                if (pressed) m_rightPressTime = now;
                 break;
-            case 0x112:
-                middleButton = pressed;
-                if (pressed) middlePressTime = now;
+            case kButtonMiddle:
+                m_middleButton = pressed;
+                if (pressed) m_middlePressTime = now;
+                break;
+            default:
                 break;
         }
     }
 
-    static void pointerAxis(void* /*data*/, wl_pointer* pointer,
-                            uint32_t /*time*/, uint32_t axis, wl_fixed_t value)
+    void WaylandInput::onPointerAxis(wl_pointer* pointer, double value)
     {
-        if (axis != WL_POINTER_AXIS_VERTICAL_SCROLL)
-            return;
-        const float scroll = -static_cast<float>(wl_fixed_to_double(value)) / 10.0f;
+        const float scroll = -static_cast<float>(value) / 10.0f;
+        std::lock_guard<std::mutex> lock(m_mouseMutex);
         if (wl_proxy_get_version(reinterpret_cast<wl_proxy*>(pointer)) < WL_POINTER_FRAME_SINCE_VERSION)
-            scrollAccumulator += scroll;
+            m_scroll += scroll;
         else
-            continuousScroll += scroll;
+            m_continuousScroll += scroll;
     }
 
-    static void pointerFrame(void* /*data*/, wl_pointer* /*pointer*/)
+    void WaylandInput::onPointerFrame()
     {
-        scrollAccumulator += hasHighResolutionScroll ? highResolutionScroll
-                           : hasDiscreteScroll ? discreteScroll : continuousScroll;
-        continuousScroll = discreteScroll = highResolutionScroll = 0.0f;
-        hasDiscreteScroll = hasHighResolutionScroll = false;
+        std::lock_guard<std::mutex> lock(m_mouseMutex);
+        m_scroll += m_hasHighResolutionScroll ? m_highResolutionScroll
+                  : m_hasDiscreteScroll ? m_discreteScroll : m_continuousScroll;
+        m_continuousScroll = m_discreteScroll = m_highResolutionScroll = 0.0f;
+        m_hasDiscreteScroll = m_hasHighResolutionScroll = false;
     }
 
-    static void pointerAxisSource(void* /*data*/, wl_pointer* /*pointer*/, uint32_t /*source*/)
+    // Discrete scroll events (wheel clicks) — preferred over continuous axis
+    void WaylandInput::onPointerAxisDiscrete(uint32_t axis, int32_t discrete)
     {
-    }
-
-    static void pointerAxisStop(void* /*data*/, wl_pointer* /*pointer*/,
-                                uint32_t /*time*/, uint32_t /*axis*/)
-    {
-    }
-
-    static void pointerAxisDiscrete(void* /*data*/, wl_pointer* /*pointer*/,
-                                    uint32_t axis, int32_t discrete)
-    {
-        // Discrete scroll events (wheel clicks) — preferred over continuous axis
         if (axis != 0)
             return;
 
-        hasDiscreteScroll = true;
-        discreteScroll -= static_cast<float>(discrete);
+        std::lock_guard<std::mutex> lock(m_mouseMutex);
+        m_hasDiscreteScroll = true;
+        m_discreteScroll -= static_cast<float>(discrete);
     }
 
-    static void pointerAxisValue120(void* /*data*/, wl_pointer* /*pointer*/,
-                                    uint32_t axis, int32_t value120)
+    // High-resolution scroll (wl_pointer v8+). 120 units = one wheel click.
+    // Preferred over both axis and axis_discrete when available.
+    void WaylandInput::onPointerAxisValue120(uint32_t axis, int32_t value120)
     {
-        // High-resolution scroll (wl_pointer v8+). 120 units = one wheel click.
-        // Preferred over both axis and axis_discrete when available.
         if (axis != 0)
             return;
 
-        hasHighResolutionScroll = true;
-        highResolutionScroll -= static_cast<float>(value120) / 120.0f;
+        std::lock_guard<std::mutex> lock(m_mouseMutex);
+        m_hasHighResolutionScroll = true;
+        m_highResolutionScroll -= static_cast<float>(value120) / 120.0f;
     }
 
-    // wl_pointer v9: which way the compositor flipped the axis ("natural
-    // scrolling"). The overlay scrolls with the delta it is given.
-    static void pointerAxisRelativeDirection(void* /*data*/, wl_pointer* /*pointer*/,
-                                             uint32_t /*axis*/, uint32_t /*direction*/)
+    // Called with the seat's pointer capability available
+    void WaylandInput::bindPointer()
     {
-    }
-
-    // wl_pointer v11: the compositor moved the pointer itself
-    static void pointerWarp(void* /*data*/, wl_pointer* /*pointer*/, wl_fixed_t sx, wl_fixed_t sy)
-    {
-        const bool onInputSurface =
-            getWaylandInputSurface() != nullptr && pointerFocusSurface == getWaylandInputSurface();
-        pointerX = wl_fixed_to_int(sx) + (onInputSurface ? static_cast<int>(getWaylandInputSurfaceX()) : 0);
-        pointerY = wl_fixed_to_int(sy) + (onInputSurface ? static_cast<int>(getWaylandInputSurfaceY()) : 0);
-    }
-
-    // Every event libwayland 1.26 defines has an entry: a pointer bound at the
-    // seat's version can be sent any of them.
-    static const wl_pointer_listener pointerListener = {
-        .enter = pointerEnter,
-        .leave = pointerLeave,
-        .motion = pointerMotion,
-        .button = pointerButton,
-        .axis = pointerAxis,
-        .frame = pointerFrame,
-        .axis_source = pointerAxisSource,
-        .axis_stop = pointerAxisStop,
-        .axis_discrete = pointerAxisDiscrete,
-        .axis_value120 = pointerAxisValue120,
-        .axis_relative_direction = pointerAxisRelativeDirection,
-        .warp = pointerWarp,
-    };
-
-    // Called by shared seat listener when pointer capability is available
-    static void bindPointer(wl_seat* seat)
-    {
-        if (wlPointer)
+        if (m_pointer)
             return;
 
-        wlPointer = wl_seat_get_pointer(seat);
+        m_pointer = wl_seat_get_pointer(m_seat);
+        m_releases.push([this] {
+            unregisterOverlayProxy(reinterpret_cast<wl_proxy*>(m_pointer));
+            wl_pointer_destroy(m_pointer);
+            m_pointer = nullptr;
+        });
         // Register as overlay proxy BEFORE add_listener so the interposition
         // layer passes this through without wrapping
-        registerOverlayProxy((wl_proxy*)wlPointer);
-        wl_pointer_add_listener(wlPointer, &pointerListener, nullptr);
+        registerOverlayProxy(reinterpret_cast<wl_proxy*>(m_pointer));
+        wl_pointer_add_listener(m_pointer, &WaylandPointerListeners::listener, this);
         Logger::debug("Wayland: pointer bound from shared seat");
     }
 
-    bool initWaylandMouse()
+    bool WaylandInput::initPointer()
     {
-        if (mouseInitialized)
-            return wlPointer != nullptr;
-
-        // Register our callback before initializing shared resources
-        setPointerBindCallback(bindPointer);
+        if (m_pointer)
+            return true;
 
         // Initialize shared seat/queue/registry (triggers seat capability callbacks)
-        if (!initWaylandInputCommon())
+        if (!ensureCommon(false, true))
             return false;
 
-        if (wlPointer)
-        {
-            mouseInitialized = true;
+        if (m_pointer)
             Logger::info("Wayland mouse input initialized");
-        }
         else
             Logger::warn("Wayland: no pointer found on seat");
 
-        return wlPointer != nullptr;
+        return m_pointer != nullptr;
     }
 
-    void cleanupWaylandMouse()
-    {
-        if (wlPointer)
-        {
-            unregisterOverlayProxy((wl_proxy*)wlPointer);
-            wl_pointer_destroy(wlPointer);
-            wlPointer = nullptr;
-        }
-
-        mouseInitialized = false;
-
-        // Clean up shared resources (idempotent)
-        cleanupWaylandInputCommon();
-    }
-
-    void mirrorButtonState(uint32_t button, bool pressed)
-    {
-        auto now = Clock::now();
-        switch (button)
-        {
-            case 0x110:
-                leftButton = pressed;
-                if (pressed) leftPressTime = now;
-                break;
-            case 0x111:
-                rightButton = pressed;
-                if (pressed) rightPressTime = now;
-                break;
-            case 0x112:
-                middleButton = pressed;
-                if (pressed) middlePressTime = now;
-                break;
-        }
-    }
-
-    MouseState getMouseStateWayland()
+    MouseState WaylandInput::mouseState()
     {
         MouseState state;
 
-        if (!initWaylandMouse())
+        std::lock_guard<std::mutex> lifecycle(m_lifecycle);
+        if (!initPointer())
             return state;
 
-        dispatchWaylandInputEvents();
+        dispatchPending();
+
+        std::lock_guard<std::mutex> lock(m_mouseMutex);
 
         // Stuck-button safety net only: a normal press holds as long as the
         // compositor says so. The old leave-based release fired whenever a
         // compositor dropped pointer focus mid-press (a transient leave on a
         // subsurface is common), which cleared `held` and snapped the button
         // morph back before the user released.
-        auto now = Clock::now();
-        if (leftButton || rightButton || middleButton)
-        {
-            auto leftMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - leftPressTime).count();
-            auto rightMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - rightPressTime).count();
-            auto middleMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - middlePressTime).count();
+        const auto now = Clock::now();
+        auto expired = [&](bool down, Clock::time_point since) {
+            return down && std::chrono::duration_cast<std::chrono::milliseconds>(now - since).count()
+                               > kAutoReleaseHardTimeoutMs;
+        };
+        if (expired(m_leftButton, m_leftPressTime))
+            m_leftButton = false;
+        if (expired(m_rightButton, m_rightPressTime))
+            m_rightButton = false;
+        if (expired(m_middleButton, m_middlePressTime))
+            m_middleButton = false;
 
-            if (leftButton && leftMs > AUTO_RELEASE_HARD_TIMEOUT_MS)
-                leftButton = false;
-            if (rightButton && rightMs > AUTO_RELEASE_HARD_TIMEOUT_MS)
-                rightButton = false;
-            if (middleButton && middleMs > AUTO_RELEASE_HARD_TIMEOUT_MS)
-                middleButton = false;
-        }
-
-        state.x = pointerX;
-        state.y = pointerY;
-        state.leftButton = leftButton;
-        state.rightButton = rightButton;
-        state.middleButton = middleButton;
-        state.scrollDelta = scrollAccumulator;
-        scrollAccumulator = 0.0f;
+        state.x = m_pointerX;
+        state.y = m_pointerY;
+        state.leftButton = m_leftButton;
+        state.rightButton = m_rightButton;
+        state.middleButton = m_middleButton;
+        state.scrollDelta = m_scroll;
+        m_scroll = 0.0f;
 
         return state;
     }

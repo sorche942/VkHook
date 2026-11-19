@@ -1,13 +1,14 @@
 #pragma once
 
-// Control plane of the layer: config selection, hotkeys, hot-reload requests
-// coming from the overlay, and the overlay state handed back to it. The control
-// step runs on a present thread at a present boundary with NO layer lock held
-// (it does file I/O and shader scans); it takes LogicalDevice::stateLock itself
-// only for short accesses to the pending-reload state.
+// Control plane of the layer: config selection, hotkeys, the overlay's commands
+// and the snapshot handed back to it. The control step runs on a present thread
+// at a present boundary with NO layer lock held (it does file I/O and shader
+// scans); it takes LogicalDevice::stateLock itself only for short accesses to
+// the pending-reload state.
 
 #include "vulkan_include.hh"
 #include "config.hh"
+#include "control/commands_apply.hh"
 #include "diag/gpu_crash.hh"
 #include "effects/effect_registry.hh"
 #include "logical_device.hh"
@@ -39,14 +40,6 @@ namespace VkHook
     extern std::string activeProfilePath;
     extern std::string activeShaderProfilePath;
 
-    // A resize was seen; the chain is rebuilt once the size has been stable
-    struct ResizeDebounceState
-    {
-        std::chrono::steady_clock::time_point lastResizeTime;
-        bool                                  pending = false;
-    };
-    extern ResizeDebounceState resizeDebounce;
-
     void initConfigs();
     void switchConfig(const std::string& configPath, const std::string& shaderPath = "");
 
@@ -57,18 +50,20 @@ namespace VkHook
                              std::map<std::string, std::string>& effectPaths);
     void invalidateAvailableEffects();
 
-    // Edge-triggered key query: true on the key-down edge only.
-    bool handleKeyPress(uint32_t keySymbol, bool& wasPressed);
+    class InputSession;
 
-    // Mark the start of an input frame (dispatch de-duplication resets).
-    void beginInputFrame();
+    // Edge-triggered key query on the swapchain's input session: true on the
+    // key-down edge only. A null session (an unsupported windowing system) never
+    // presses anything.
+    bool handleKeyPress(InputSession* session, uint32_t keySymbol, bool& wasPressed);
 
-    // Per-device control state. Only the thread that wins
-    // LogicalDevice::frontendBusy touches the plain members; `lastEffectsOn`
-    // is what the other present threads of the device reuse meanwhile.
+    // Per-device control state, owned by LogicalDevice::control. Only the thread
+    // that wins LogicalDevice::frontendBusy touches the plain members;
+    // `lastEffectsOn` is what the other present threads of the device reuse
+    // meanwhile.
     struct DeviceControlState
     {
-        DeviceControlState();
+        explicit DeviceControlState(LogicalDevice* device);
 
         uint32_t keySymbol       = 0;
         uint32_t reloadKeySymbol = 0;
@@ -87,17 +82,27 @@ namespace VkHook
 
         // last effects-on decision, published at the end of every control step
         std::atomic<bool> lastEffectsOn{true};
+
+        // The overlay: its UI, the command queue it fills and the snapshot it
+        // reads. Declared last so it is destroyed first.
+        OverlayControl overlay;
+
+        // A resize was seen: swapchain creation notes it, and the chain is
+        // rebuilt once the size has been stable for the debounce interval.
+        void noteResize();
+        std::atomic<bool>    resizePending{false};
+        std::atomic<int64_t> lastResizeNs{0};
     };
 
-    // Per-device control state; the reference stays valid until
-    // releaseDeviceControl. Thread-safe (own small mutex).
-    DeviceControlState& deviceControl(LogicalDevice* logicalDevice);
-    void releaseDeviceControl(LogicalDevice* logicalDevice);
+    // The device's control state (created in vkCreateDevice, so never null for
+    // a device the layer tracks). The reference stays valid until the device is destroyed.
+    inline DeviceControlState& deviceControl(LogicalDevice* logicalDevice) { return *logicalDevice->control; }
 
-    // Present-boundary control step: settings reload, hotkeys, overlay requests,
-    // hot-reload, resize debounce and the overlay state update. Returns whether
-    // effects are on for this present. No lock held by the caller. If another
-    // present thread of the device is already inside the step, returns that
-    // thread's previous decision without running it.
-    bool runFrontendFrame(LogicalDevice* logicalDevice, DeviceControlState& state);
+    // Present-boundary control step: overlay commands, settings reload, hotkeys,
+    // hot-reload, resize debounce and the overlay snapshot. `session` is the
+    // input session of the swapchain being presented (null when it has none).
+    // Returns whether effects are on for this present. No lock held by the
+    // caller. If another present thread of the device is already inside the
+    // step, returns that thread's previous decision without running it.
+    bool runFrontendFrame(LogicalDevice* logicalDevice, DeviceControlState& state, InputSession* session);
 } // namespace VkHook

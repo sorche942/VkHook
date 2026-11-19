@@ -7,7 +7,7 @@
 #include <sstream>
 
 #include "reshade_parser.hh"
-#include "settings_manager.hh"
+#include "store.hh"
 #include "config_serializer.hh"
 #include "logger.hh"
 #include "dlss5_config.hh"
@@ -315,7 +315,7 @@ namespace VkHook
         setup.bufferWidth = bufferWidth;
         setup.bufferHeight = bufferHeight;
         setup.colorBitDepth = colorBitDepth;
-        setup.depthSourceMode = settingsManager.getDepthSourceChannel();
+        setup.depthSourceMode = ConfigStore::instance().getDepthSourceChannel();
         setup.userDefs = std::move(userDefs);
         setup.includePaths = ConfigSerializer::loadShaderManagerConfig().discoveredShaderPaths;
         return setup;

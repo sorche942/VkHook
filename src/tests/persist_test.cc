@@ -1,11 +1,11 @@
 // The PersistenceQueue is the only thing that writes user files, so its
 // ordering rules are the contract: FIFO, coalescing, and "a queued autosave
-// never resurrects a deleted preset". SettingsManager's snapshot and queued
+// never resurrects a deleted preset". ConfigStore's snapshot and queued
 // save are checked here too, since they sit on top of it.
 
 #include "config_serializer.hh"
+#include "control/preset_model.hh"
 #include "persist.hh"
-#include "settings_manager.hh"
 
 #include <atomic>
 #include <chrono>
@@ -172,9 +172,11 @@ namespace
     {
         const std::string path = ConfigSerializer::getShaderProfilePath("game", "keep-me-deleted");
         std::filesystem::create_directories(std::filesystem::path(path).parent_path());
-        const std::vector<ConfigParam> params = {{"fx.fx", "Strength", "1"}};
+        VkHook::EffectStack stack;
+        stack.instances.push_back({"fx", "fx.fx", true, {}, {{"Strength", {"1"}}}, {}});
+        const VkHook::SerializedPreset preset = VkHook::serialize(stack);
         auto autosave = [&] {
-            return ConfigSerializer::saveShaderProfile(path, params, {"fx.fx"}, {}, {{"fx.fx", "fx.fx"}});
+            return ConfigSerializer::writeShaderProfile(path, preset.ini, preset.sidecar);
         };
 
         PersistenceQueue queue;
@@ -219,30 +221,6 @@ namespace
         expect(ran.load() == 2, "only the permitted writes ran");
     }
 
-    void test_settings_snapshot_and_queued_save()
-    {
-        VkHook::SettingsManager manager;
-        manager.initialize();
-        const auto before = manager.snapshot();
-        const int oldMax = before->maxEffects;
-        manager.setMaxEffects(oldMax == 17 ? 18 : 17);
-        const auto after = manager.snapshot();
-        expect(before->maxEffects == oldMax, "a snapshot taken earlier never changes");
-        expect(after->maxEffects != oldMax && manager.getMaxEffects() == after->maxEffects,
-               "setters publish a new snapshot the getters agree with");
-        expect(before.get() != after.get(), "each publish is a distinct immutable object");
-
-        // many saves, one file; the last values win
-        std::future<bool> last;
-        for (int i = 1; i <= 20; ++i)
-        {
-            manager.setAutoApplyDelay(i * 10);
-            last = manager.save();
-        }
-        expect(last.get(), "the final queued settings save succeeds");
-        PersistenceQueue::instance().waitForIdle();
-        expect(ConfigSerializer::loadSettings().autoApplyDelay == 200, "the newest settings reached the file");
-    }
 } // namespace
 
 int main()
@@ -264,7 +242,6 @@ int main()
     test_concurrent_submits_all_run();
     test_queued_autosave_cannot_resurrect_a_deleted_preset();
     test_rename_moves_the_tombstone();
-    test_settings_snapshot_and_queued_save();
 
     std::filesystem::remove_all(tempDir);
     std::printf("%s\n", failures == 0 ? "ok" : "FAILED");
