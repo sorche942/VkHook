@@ -79,17 +79,28 @@ namespace VkHook
             std::mutex use;
         };
 
+        // Keyed by the device explicitly: the network's Vulkan context and weights
+        // belong to one VkDevice, so two devices (or a device recreated at the same
+        // address after a destroy) never share an entry.
         using ModelKey = std::pair<VkDevice, std::string>;
 
+        // Process-wide, because the effects are built from the layer's hooks with no
+        // per-device object to hang this on (the registry is a core-owned global
+        // until core makes it per-device; once it does, this moves into it). The
+        // lifetime is bounded by the device key: an entry is created by the first
+        // DLSS5 effect built on a device and is released by clearDlss5ModelCache at
+        // vkDestroyDevice, while the device is alive. Nothing is released at process
+        // exit, deliberately: the devices are already gone and freeing GPU objects
+        // then would call into a dead driver.
         struct ModelCache
         {
             std::mutex                                   mutex;
             std::map<ModelKey, std::shared_ptr<ModelEntry>> entries;
         };
 
-        // Deliberately never destroyed: at process exit the devices are already
-        // gone, and releasing GPU objects then would call into a dead driver.
-        // clearDlss5ModelCache is what releases an entry, at device destruction.
+        // Constructed on first use and never destroyed (see ModelCache). Not
+        // function-local mutable state of a hook: it is only reached through
+        // acquireModel/clearDlss5ModelCache with an explicit device key.
         ModelCache& modelCache()
         {
             static ModelCache* cache = new ModelCache;

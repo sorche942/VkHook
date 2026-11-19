@@ -3,7 +3,7 @@
 // argv[1] is tests/fixtures. Inputs live in fixtures/presets/*.ini (+ .sidecar);
 // the checked-in outputs are *.golden.ini / *.golden.sidecar. After an
 // intentional format change, regenerate them with VKHOOK_UPDATE_GOLDEN=1 and
-// review the diff.
+// review the diff. An instance is one technique of a shader file (an EffectId).
 
 #include "control/preset_model.hh"
 
@@ -99,6 +99,23 @@ namespace
         file << text;
     }
 
+    std::vector<std::string> enabledKeys(const std::string& ini);
+
+    // Techniques= is exactly the enabled instances of .fx files, once each, in stack order.
+    std::vector<std::string> expectedEnabledKeys(const EffectStack& stack)
+    {
+        std::vector<std::string> keys;
+        for (const auto& instance : stack.instances)
+        {
+            if (!instance.enabled || instance.id.isBuiltin() || instance.id.technique.empty())
+                continue;
+            const std::string key = instance.id.reshadeKey();
+            if (std::find(keys.begin(), keys.end(), key) == keys.end())
+                keys.push_back(key);
+        }
+        return keys;
+    }
+
     // serialize(x) is the checked-in golden pair, and reading the golden back
     // gives x again: the format loses nothing it writes.
     void checkGolden(const std::string& name, const EffectStack& stack)
@@ -111,6 +128,7 @@ namespace
             writeFile(goldenIni, out.ini);
             writeFile(goldenSidecar, out.sidecar);
         }
+        expect(enabledKeys(out.ini) == expectedEnabledKeys(stack), name + ": Techniques= is exactly the enabled set");
         expect(out.ini == readFile(goldenIni), name + ": serialized .ini matches the golden file");
         expect(out.sidecar == readFile(goldenSidecar), name + ": serialized sidecar matches the golden file");
 
@@ -125,7 +143,7 @@ namespace
     const EffectInstance* find(const EffectStack& stack, const std::string& name)
     {
         for (const auto& instance : stack.instances)
-            if (instance.name == name)
+            if (instance.name() == name)
                 return &instance;
         return nullptr;
     }
@@ -134,8 +152,16 @@ namespace
     {
         std::vector<std::string> result;
         for (const auto& instance : stack.instances)
-            result.push_back(instance.name);
+            result.push_back(instance.name());
         return result;
+    }
+
+    EffectInstance make(const std::string& file, const std::string& technique, uint32_t ordinal = 1, bool enabled = true)
+    {
+        EffectInstance instance;
+        instance.id = {file, technique, ordinal};
+        instance.enabled = enabled;
+        return instance;
     }
 
     const PresetParam* param(const EffectInstance& instance, const std::string& key)
@@ -167,6 +193,27 @@ namespace
             begin = end + 1;
         }
         return result;
+    }
+
+    // the ReShade keys the ini's Techniques= line lists, in order
+    std::vector<std::string> enabledKeys(const std::string& ini)
+    {
+        for (const auto& line : lines(ini))
+            if (line.starts_with("Techniques="))
+            {
+                std::vector<std::string> keys;
+                size_t begin = std::string("Techniques=").size();
+                while (begin < line.size())
+                {
+                    size_t end = line.find(',', begin);
+                    if (end == std::string::npos)
+                        end = line.size();
+                    keys.push_back(line.substr(begin, end - begin));
+                    begin = end + 1;
+                }
+                return keys;
+            }
+        return {};
     }
 
     // ReShade reads PreprocessorDefinitions, Techniques and TechniqueSorting
@@ -202,27 +249,27 @@ namespace
         const auto parsed = parseFixture("qUINT_pack");
         const auto& stack = parsed.stack;
         expect(stack.authoritative, "a preset with techniques is authoritative");
-        expect(names(stack) == std::vector<std::string>({"qUINT_mxao", "qUINT_bloom", "LumaSharpen", "Vibrance"}),
+        expect(names(stack) == std::vector<std::string>({"qUINT_mxao.fx|MXAO", "qUINT_bloom.fx|Bloom",
+                                                         "LumaSharpen.fx|LumaSharpen", "Vibrance.fx|Vibrance"}),
                "instances follow the preset's sorting; sorting-only Tonemap is not imported");
         expect(parsed.diagnostics.messages.empty(), "a clean preset reports nothing");
         expect(stack.globalMacros.size() == 4 &&
                    macro(stack.globalMacros, "RESHADE_DEPTH_LINEARIZATION_FAR_PLANE") == "1000",
                "global definitions parse");
 
-        const auto* mxao = find(stack, "qUINT_mxao");
-        expect(mxao && mxao->type == "qUINT_mxao.fx" && mxao->enabled, "MXAO lands on the installed file");
-        expect(mxao && mxao->techniques == std::vector<PresetTechnique>{{"MXAO", true}},
-               "technique name is kept apart from the instance name");
+        const auto* mxao = find(stack, "qUINT_mxao.fx|MXAO");
+        expect(mxao && mxao->id.canonicalPath == "qUINT_mxao.fx" && mxao->id.technique == "MXAO" && mxao->enabled,
+               "MXAO lands on the installed file and runs its technique");
         expect(mxao && macro(mxao->macros, "MXAO_MIPLEVEL_IL") == "2", "per-effect definitions parse");
         expect(mxao && param(*mxao, "MXAO_SAMPLE_RADIUS") &&
                    param(*mxao, "MXAO_SAMPLE_RADIUS")->values == std::vector<std::string>{"2.500000"},
                "scalar parameter parses");
 
-        const auto* luma = find(stack, "LumaSharpen");
+        const auto* luma = find(stack, "LumaSharpen.fx|LumaSharpen");
         expect(luma && macro(luma->macros, "TINT") == "float3(1,0.9,0.8)" && macro(luma->macros, "LS_QUALITY") == "2",
                "doubled commas in a macro value read back as literal commas");
 
-        const auto* vibrance = find(stack, "Vibrance");
+        const auto* vibrance = find(stack, "Vibrance.fx|Vibrance");
         expect(vibrance && param(*vibrance, "Vibrance_RGB_balance") &&
                    param(*vibrance, "Vibrance_RGB_balance")->values.size() == 3,
                "vector parameter keeps its components");
@@ -241,9 +288,9 @@ namespace
         const auto crlf = parseFixture("sweetfx_crlf");
         expect(input("sweetfx_crlf.ini").find("\r\n") != std::string::npos, "the CRLF fixture is CRLF");
         expect(lf.stack == crlf.stack, "CRLF and LF presets parse to the same stack");
-        expect(names(lf.stack) == std::vector<std::string>({"SMAA", "Tonemap"}),
+        expect(names(lf.stack) == std::vector<std::string>({"SMAA.fx|SMAA", "Tonemap.fx|Tonemap"}),
                "ReShade 4 [GENERAL] keys are read; Vibrance (sorting only) is not imported");
-        const auto* tonemap = find(lf.stack, "Tonemap");
+        const auto* tonemap = find(lf.stack, "Tonemap.fx|Tonemap");
         expect(tonemap && param(*tonemap, "FogColor") && param(*tonemap, "FogColor")->values.size() == 3 &&
                    param(*tonemap, "Exposure")->values == std::vector<std::string>{"-0.100000"},
                "CRLF values carry no stray carriage return");
@@ -256,40 +303,114 @@ namespace
 
     void testMultipleTechniquesPerFile()
     {
+        // a foreign preset: each enabled technique is its own instance, in
+        // sorting order; the disabled LumaDebug is not imported
         const auto parsed = parseFixture("multi_technique");
         const auto& stack = parsed.stack;
-        expect(names(stack) == std::vector<std::string>({"LumaStack", "Vibrance"}),
-               "several techniques of one file are one instance");
-        const auto* luma = find(stack, "LumaStack");
-        expect(luma && luma->techniques ==
-                           std::vector<PresetTechnique>({{"LumaPre", true}, {"LumaPost", true}, {"LumaDebug", false}}),
-               "every technique of the file is kept, with its own enabled flag");
+        expect(names(stack) == std::vector<std::string>({"LumaStack.fx|LumaPre", "Vibrance.fx|Vibrance",
+                                                         "LumaStack.fx|LumaPost"}),
+               "every enabled technique of a file is one instance");
+        expect(parsed.diagnostics.messages.empty(), "nothing is reported");
+        const auto* pre = find(stack, "LumaStack.fx|LumaPre");
+        const auto* post = find(stack, "LumaStack.fx|LumaPost");
+        expect(pre && post && pre->params == post->params && param(*pre, "Strength"),
+               "the file's [section] applies to each of its techniques");
         const SerializedPreset out = serialize(stack);
-        expect(out.ini.find("Techniques=LumaPre@LumaStack.fx,LumaPost@LumaStack.fx,Vibrance@Vibrance.fx\n") !=
+        expect(out.ini.find("Techniques=LumaPre@LumaStack.fx,Vibrance@Vibrance.fx,LumaPost@LumaStack.fx\n") !=
                    std::string::npos,
                "enabled techniques are all written");
-        expect(out.ini.find("LumaDebug@LumaStack.fx") != std::string::npos &&
-                   out.ini.find("Techniques=LumaPre@LumaStack.fx,LumaPost@LumaStack.fx,Vibrance@Vibrance.fx,LumaDebug") ==
-                       std::string::npos,
-               "the disabled technique stays in the sorting list only");
+        expect(out.ini.find("LumaDebug") == std::string::npos, "a technique that was never an instance is not invented");
         checkReShadeShape("multi_technique", out.ini);
         checkGolden("multi_technique", stack);
 
-        // an owned preset whose instance is disabled keeps every technique
+        // a disabled technique stays an instance and leaves Techniques= but not the sorting list
         EffectStack disabled = stack;
         disabled.instances[0].enabled = false;
-        for (auto& technique : disabled.instances[0].techniques)
-            technique.enabled = true;
         const SerializedPreset off = serialize(disabled);
-        expect(off.ini.find("Techniques=Vibrance@Vibrance.fx\n") != std::string::npos,
+        expect(enabledKeys(off.ini) == std::vector<std::string>({"Vibrance@Vibrance.fx", "LumaPost@LumaStack.fx"}),
                "a disabled instance contributes no enabled technique");
-        expect(parse(off.ini, off.sidecar, resolveFake) == disabled, "disabled multi-technique instance round-trips");
+        expect(off.ini.find("TechniqueSorting=LumaPre@LumaStack.fx,Vibrance@Vibrance.fx,LumaPost@LumaStack.fx\n") !=
+                   std::string::npos,
+               "it stays in the sorting list");
+        expect(parse(off.ini, off.sidecar, resolveFake) == disabled, "a disabled technique round-trips");
+    }
+
+    // A preset enabling only technique #2 of a three-technique file runs #2.
+    void testSecondTechniqueOnly()
+    {
+        const auto parsed = parseFixture("second_technique");
+        expect(names(parsed.stack) == std::vector<std::string>({"LumaStack.fx|LumaPost"}) &&
+                   parsed.diagnostics.messages.empty(),
+               "only the enabled technique becomes an instance");
+        expect(parsed.stack.instances[0].id.ordinal == 1 && parsed.stack.instances[0].enabled, "as copy 1, enabled");
+        const SerializedPreset out = serialize(parsed.stack);
+        expect(enabledKeys(out.ini) == std::vector<std::string>({"LumaPost@LumaStack.fx"}),
+               "it is written back as the one enabled technique");
+        checkReShadeShape("second_technique", out.ini);
+        checkGolden("second_technique", parsed.stack);
+    }
+
+    // Techniques #1 and #3 plus a second copy of #1: the sidecar lists them all;
+    // without the sidecar a foreign reader gets exactly the enabled techniques.
+    void testCopiesOfTechniques()
+    {
+        const auto parsed = parseFixture("copies");
+        const auto& stack = parsed.stack;
+        expect(names(stack) == std::vector<std::string>({"LumaStack.fx|LumaPre", "LumaStack.fx|LumaDebug",
+                                                         "LumaStack.fx|LumaPre|2"}),
+               "techniques 1 and 3 and the copy of 1 are the stack");
+        expect(param(*find(stack, "LumaStack.fx|LumaPre"), "Strength")->values == std::vector<std::string>{"0.400000"} &&
+                   param(*find(stack, "LumaStack.fx|LumaDebug"), "Strength")->values ==
+                       std::vector<std::string>{"0.400000"} &&
+                   param(*find(stack, "LumaStack.fx|LumaPre|2"), "Strength")->values ==
+                       std::vector<std::string>{"0.900000"},
+               "the file section covers every entry, the copy's own section overrides");
+        const SerializedPreset out = serialize(stack);
+        expect(enabledKeys(out.ini) == std::vector<std::string>({"LumaPre@LumaStack.fx", "LumaDebug@LumaStack.fx"}),
+               "a copy adds no second Techniques= entry");
+        checkReShadeShape("copies", out.ini);
+        checkGolden("copies", stack);
+
+        const EffectStack foreign = parse(out.ini, "", resolveFake);
+        expect(names(foreign) == std::vector<std::string>({"LumaStack.fx|LumaPre", "LumaStack.fx|LumaDebug"}),
+               "the ini alone gives one instance per enabled technique");
+    }
+
+    // A legacy sidecar (instance names, name@file, name.N) migrates to ids.
+    void testLegacySidecarMigration()
+    {
+        const auto parsed = parseFixture("legacy_copies");
+        const auto& stack = parsed.stack;
+        expect(names(stack) == std::vector<std::string>({"LumaStack.fx|LumaPre", "LumaStack.fx|LumaPre|2",
+                                                         "LumaStack.fx|LumaPre|3", "Vibrance.fx|Vibrance"}) &&
+                   parsed.diagnostics.messages.empty(),
+               "legacy names become ids on the file's first listed technique; .N keeps its copy number");
+        expect(stack.instances[0].enabled && stack.instances[1].enabled && !stack.instances[2].enabled,
+               "'*' stays disabled");
+        expect(param(stack.instances[1], "Strength")->values == std::vector<std::string>{"0.900000"} &&
+                   param(stack.instances[2], "Strength")->values == std::vector<std::string>{"0.100000"} &&
+                   param(stack.instances[0], "Strength")->values == std::vector<std::string>{"0.400000"},
+               "a legacy [name] section applies to the migrated entry");
+        const SerializedPreset out = serialize(stack);
+        expect(out.sidecar.find('@') == std::string::npos && out.sidecar.find("Luma.2") == std::string::npos,
+               "the legacy spelling is never written again");
+        checkGolden("legacy_copies", stack);
+
+        // copy numbers: a free .N is honoured, a taken one falls to the smallest free
+        Diagnostics diagnostics;
+        const EffectStack taken = parse("Techniques=\nTechniqueSorting=\n",
+                                        "[VKHOOK]\nEffects=Vibrance.2@Vibrance.fx, Vibrance.2@Vibrance.fx, Vibrance, "
+                                        "Vibrance.fx||2, Tonemap.fx|Tonemap|1\n",
+                                        resolveFake, &diagnostics);
+        expect(names(taken) == std::vector<std::string>({"Vibrance.fx||2", "Vibrance.fx", "Tonemap.fx|Tonemap"}),
+               "a free .N is kept, the next copy takes the smallest free ordinal, ids keep their own");
+        expect(diagnostics.messages.size() == 2, "the repeated legacy name and the repeated id are reported");
     }
 
     void testUnknownEntriesAreDropped()
     {
         const auto parsed = parseFixture("unknown_entries");
-        expect(names(parsed.stack) == std::vector<std::string>({"qUINT_mxao", "Vibrance"}),
+        expect(names(parsed.stack) == std::vector<std::string>({"qUINT_mxao.fx|MXAO", "Vibrance.fx|Vibrance"}),
                "a technique naming no installed shader does not become an instance");
         expect(parsed.diagnostics.messages.size() == 1 &&
                    parsed.diagnostics.messages[0].find("Ghost@NoSuchShader.fx") != std::string::npos,
@@ -305,10 +426,10 @@ namespace
         const EffectStack owned = parse("Techniques=\nTechniqueSorting=\n",
                                         "[VKHOOK]\nEffects=Vibrance, MXAO, *cas, Bloom.2@qUINT_bloom.fx\n", resolveFake,
                                         &diagnostics);
-        expect(names(owned) == std::vector<std::string>({"Vibrance", "Bloom.2"}),
+        expect(names(owned) == std::vector<std::string>({"Vibrance.fx", "qUINT_bloom.fx||2"}),
                "owned instances naming nothing (the ghost MXAO, a removed built-in) are dropped");
         expect(diagnostics.messages.size() == 2, "each dropped owned instance is reported");
-        expect(find(owned, "Bloom.2") && find(owned, "Bloom.2")->type == "qUINT_bloom.fx",
+        expect(find(owned, "qUINT_bloom.fx||2") && find(owned, "qUINT_bloom.fx||2")->id.canonicalPath == "qUINT_bloom.fx",
                "a renamed instance resolves through its shader file");
     }
 
@@ -317,12 +438,12 @@ namespace
         const auto parsed = parseFixture("legacy_vkhook_effects");
         const auto& stack = parsed.stack;
         expect(stack.authoritative, "the legacy list is authoritative");
-        expect(names(stack) == std::vector<std::string>({"qUINT_mxao", "Vibrance"}),
-               "legacy VkHookEffects entries resolve; the ghost MXAO and the removed cas are dropped");
+        expect(names(stack) == std::vector<std::string>({"qUINT_mxao.fx", "Vibrance.fx"}),
+               "legacy VkHookEffects entries resolve (the technique stays unresolved: the ini names none); the ghost MXAO and the removed cas are dropped");
         expect(parsed.diagnostics.messages.size() == 2, "both dropped legacy entries are reported");
-        expect(find(stack, "Vibrance") && !find(stack, "Vibrance")->enabled && find(stack, "qUINT_mxao")->enabled,
+        expect(find(stack, "Vibrance.fx") && !find(stack, "Vibrance.fx")->enabled && find(stack, "qUINT_mxao.fx")->enabled,
                "legacy VkHookDisabledEffects disables");
-        expect(find(stack, "Vibrance") && param(*find(stack, "Vibrance"), "Vibrance")->values.front() == "0.300000",
+        expect(find(stack, "Vibrance.fx") && param(*find(stack, "Vibrance.fx"), "Vibrance")->values.front() == "0.300000",
                "legacy presets keep their parameter sections");
         // writing migrates the preset to the one current format
         const SerializedPreset out = serialize(stack);
@@ -334,18 +455,20 @@ namespace
     {
         const auto parsed = parseFixture("old_writer");
         const auto& stack = parsed.stack;
-        expect(names(stack) == std::vector<std::string>({"Bloom", "Bloom.2", "Vibrance", "DLSS5"}),
-               "the sidecar is the complete ordered stack; the removed built-in cas is dropped");
-        expect(!find(stack, "Vibrance")->enabled && find(stack, "Bloom")->enabled && find(stack, "DLSS5")->enabled,
+        expect(names(stack) == std::vector<std::string>({"qUINT_bloom.fx|Bloom", "qUINT_bloom.fx|Bloom|2",
+                                                         "Vibrance.fx|Vibrance", "DLSS5"}),
+               "the sidecar is the complete ordered stack, migrated to ids; the removed built-in cas is dropped");
+        expect(!find(stack, "Vibrance.fx|Vibrance")->enabled && find(stack, "qUINT_bloom.fx|Bloom")->enabled &&
+                   find(stack, "DLSS5")->enabled,
                "'*' marks a disabled instance");
-        expect(find(stack, "DLSS5")->type == "DLSS5" && find(stack, "DLSS5")->techniques.empty(),
-               "a built-in has no technique entries");
+        expect(find(stack, "DLSS5")->id.isBuiltin() && find(stack, "DLSS5")->id.technique.empty(),
+               "a built-in has no technique");
         expect(param(*find(stack, "DLSS5"), "skinStructure")->values.front() == "-1",
                "built-in parameters live in a section named after the instance");
-        expect(param(*find(stack, "Bloom"), "BLOOM_INT")->values.front() == "0.500000" &&
-                   param(*find(stack, "Bloom.2"), "BLOOM_INT")->values.front() == "1.500000",
-               "duplicate instances of one file keep their own values from the sidecar");
-        const auto* vibrance = find(stack, "Vibrance");
+        expect(param(*find(stack, "qUINT_bloom.fx|Bloom"), "BLOOM_INT")->values.front() == "0.500000" &&
+                   param(*find(stack, "qUINT_bloom.fx|Bloom|2"), "BLOOM_INT")->values.front() == "1.500000",
+               "duplicate instances of one file keep their own values from the legacy [name] sections");
+        const auto* vibrance = find(stack, "Vibrance.fx|Vibrance");
         expect(param(*vibrance, "Vibrance")->values.front() == "0.750000" &&
                    param(*vibrance, "Vibrance_RGB_balance")->values ==
                        std::vector<std::string>({"1.000000", "0.900000", "0.800000"}),
@@ -354,8 +477,9 @@ namespace
         checkGolden("old_writer", stack);
 
         const SerializedPreset out = serialize(stack);
-        expect(out.sidecar.find("[Bloom]\n") != std::string::npos && out.sidecar.find("[Bloom.2]\n") != std::string::npos &&
-                   out.sidecar.find("[Vibrance]\n") != std::string::npos,
+        expect(out.sidecar.find("[qUINT_bloom.fx|Bloom]\n") != std::string::npos &&
+                   out.sidecar.find("[qUINT_bloom.fx|Bloom|2]\n") != std::string::npos &&
+                   out.sidecar.find("[Vibrance.fx|Vibrance]\n") != std::string::npos,
                "instances that the shared section cannot describe get their own sidecar section");
         expect(out.sidecar.find("[DLSS5]") == std::string::npos, "an enabled lone instance stays in the ini only");
     }
@@ -376,43 +500,31 @@ namespace
         EffectStack stack;
         stack.globalMacros = {{"RESHADE_DEPTH_INPUT_IS_REVERSED", "1"}, {"GLOBAL_TINT", "float3(0,1,0)"}};
 
-        EffectInstance bloom;
-        bloom.name = "Bloom";
-        bloom.type = "qUINT_bloom.fx";
-        bloom.techniques = {{"Bloom", true}};
+        EffectInstance bloom = make("qUINT_bloom.fx", "Bloom");
         bloom.params = {{"BLOOM_INT", {"0.500000"}}, {"BLOOM_TINT", {"1.000000", "0.500000", "0.250000"}}};
         bloom.macros = {{"BLOOM_QUALITY", "2"}};
 
         EffectInstance bloom2 = bloom;
-        bloom2.name = "Bloom.2";
+        bloom2.id.ordinal = 2;
         bloom2.params = {{"BLOOM_INT", {"1.500000"}}, {"BLOOM_TINT", {"0.000000", "0.000000", "1.000000"}}};
         bloom2.macros = {{"BLOOM_QUALITY", "float2(1,2)"}};
 
-        EffectInstance luma;
-        luma.name = "LumaStack";
-        luma.type = "LumaStack.fx";
-        luma.techniques = {{"LumaPre", true}, {"LumaPost", false}};
+        EffectInstance luma = make("LumaStack.fx", "LumaPre");
         luma.params = {{"Strength", {"0.400000"}}};
+        EffectInstance lumaPost = luma;
+        lumaPost.id.technique = "LumaPost";
+        lumaPost.enabled = false;
 
-        EffectInstance vibrance;
-        vibrance.name = "Vibrance";
-        vibrance.type = "Vibrance.fx";
-        vibrance.enabled = false;
-        vibrance.techniques = {{"Vibrance", true}};
+        EffectInstance vibrance = make("Vibrance.fx", "Vibrance", 1, false);
         vibrance.params = {{"Vibrance", {"0.750000"}}, {"Vibrance_RGB_balance", {"1.000000", "0.900000", "0.800000"}}};
         vibrance.macros = {{"VIB_TINT", "float3(1,0,0)"}, {"VIB_MODE", "1"}};
 
-        EffectInstance dlss;
-        dlss.name = "DLSS5";
-        dlss.type = "DLSS5";
+        EffectInstance dlss = make(EffectId::kDlss5, "");
         dlss.params = {{"intensity", {"1"}}, {"skinStructure", {"-1"}}};
 
-        EffectInstance noValues;
-        noValues.name = "Tonemap";
-        noValues.type = "Tonemap.fx";
-        noValues.techniques = {{"Tonemap", true}};
+        EffectInstance noValues = make("Tonemap.fx", "Tonemap");
 
-        stack.instances = {bloom, luma, bloom2, vibrance, dlss, noValues};
+        stack.instances = {bloom, luma, bloom2, lumaPost, vibrance, dlss, noValues};
         const SerializedPreset out = serialize(stack);
         checkReShadeShape("full_stack", out.ini);
         expect(out.ini.find("GLOBAL_TINT=float3(0,,1,,0)") != std::string::npos,
@@ -421,8 +533,8 @@ namespace
                "a disabled instance's values stay out of the ReShade ini");
         expect(out.sidecar.find("VIB_TINT=float3(1,,0,,0)") != std::string::npos,
                "a disabled instance's macro commas survive the sidecar");
-        expect(out.sidecar.find("Effects=Bloom@qUINT_bloom.fx, LumaStack@LumaStack.fx, Bloom.2@qUINT_bloom.fx, "
-                                "*Vibrance@Vibrance.fx, DLSS5, Tonemap@Tonemap.fx\n") !=
+        expect(out.sidecar.find("Effects=qUINT_bloom.fx|Bloom, LumaStack.fx|LumaPre, qUINT_bloom.fx|Bloom|2, "
+                                "*LumaStack.fx|LumaPost, *Vibrance.fx|Vibrance, DLSS5, Tonemap.fx|Tonemap\n") !=
                    std::string::npos,
                "the sidecar lists the full ordered stack");
         checkGolden("full_stack", stack);
@@ -442,31 +554,20 @@ namespace
         ParseOptions capped;
         capped.maxEffects = 2;
         Parsed limited = parseFixture("qUINT_pack", capped);
-        expect(names(limited.stack) == std::vector<std::string>({"qUINT_mxao", "qUINT_bloom"}),
+        expect(names(limited.stack) == std::vector<std::string>({"qUINT_mxao.fx|MXAO", "qUINT_bloom.fx|Bloom"}),
                "instances beyond maxEffects are dropped");
         expect(!limited.diagnostics.messages.empty(), "the cap is reported");
-
-        // a technique lands on the instance name the caller already has for the
-        // shader file, but only one that really is that file
-        ParseOptions configured;
-        configured.configuredNames = [](std::string_view file) {
-            return file == "quint_mxao.fx" ? std::vector<std::string>{"Occlusion"} : std::vector<std::string>{};
-        };
-        const PathResolver withOcclusion = [](std::string_view key) {
-            return key == "Occlusion" ? std::string("/shaders/qUINT_mxao.fx") : resolveFake(key);
-        };
-        const EffectStack named = parse(input("qUINT_pack.ini"), "", withOcclusion, nullptr, configured);
-        expect(names(named) == std::vector<std::string>({"Occlusion", "qUINT_bloom", "LumaSharpen", "Vibrance"}) &&
-                   find(named, "Occlusion") && param(*find(named, "Occlusion"), "MXAO_SAMPLE_RADIUS"),
-               "a foreign preset applies to the caller's own instance of the shader");
 
         // a technique name that resolves to some OTHER shader is not an instance
         const PathResolver collides = [](std::string_view key) {
             return key == "MXAO" ? std::string("/shaders/MXAO.fx") : resolveFake(key);
         };
         const EffectStack safe = parse(input("qUINT_pack.ini"), "", collides);
-        expect(find(safe, "qUINT_mxao") && !find(safe, "MXAO"),
-               "the bare technique name never becomes an effect-list entry");
+        expect(find(safe, "qUINT_mxao.fx|MXAO") && std::none_of(safe.instances.begin(), safe.instances.end(),
+                                                                [](const EffectInstance& instance) {
+                                                                    return instance.id.canonicalPath == "MXAO.fx";
+                                                                }),
+               "the bare technique name never resolves to another shader");
 
         // a preset that lists nothing leaves the caller's list alone
         const EffectStack nothing = parse("Techniques=\nTechniqueSorting=\n", "", resolveFake);
@@ -474,6 +575,60 @@ namespace
 
         // no filesystem or global state: the same inputs give the same stack
         expect(parseFixture("qUINT_pack").stack == parseFixture("qUINT_pack").stack, "parse is deterministic");
+    }
+
+    // Several techniques of one file, copies with ordinal gaps, disabled entries
+    // and two built-ins: parse(serialize(x)) == x, and Techniques= is exactly
+    // the enabled set.
+    void testRoundTripAndEnabledSet()
+    {
+        EffectStack stack;
+        stack.globalMacros = {{"QUALITY", "2"}};
+        auto luma = [](const std::string& technique, uint32_t ordinal, bool enabled, const std::string& strength) {
+            EffectInstance instance = make("LumaStack.fx", technique, ordinal, enabled);
+            instance.params = {{"Strength", {strength}}};
+            return instance;
+        };
+        EffectInstance vibrance = make("Vibrance.fx", "Vibrance", 1, false);
+        vibrance.params = {{"Vibrance", {"0.500000"}}};
+        EffectInstance vibrance3 = make("Vibrance.fx", "Vibrance", 3, true);
+        vibrance3.params = {{"Vibrance", {"0.700000"}}};
+        EffectInstance dlss = make(EffectId::kDlss5, "");
+        dlss.params = {{"intensity", {"1"}}};
+        EffectInstance dlss2 = make(EffectId::kDlss5, "", 2);
+        dlss2.params = {{"intensity", {"0.5"}}};
+        stack.instances = {luma("LumaPre", 1, true, "0.400000"),  luma("LumaPost", 1, true, "0.400000"),
+                           luma("LumaDebug", 1, false, "0.400000"), luma("LumaPre", 2, true, "0.800000"),
+                           vibrance,                                  vibrance3,
+                           dlss,                                      dlss2};
+
+        const SerializedPreset out = serialize(stack);
+        expect(enabledKeys(out.ini) ==
+                   std::vector<std::string>({"LumaPre@LumaStack.fx", "LumaPost@LumaStack.fx", "Vibrance@Vibrance.fx"}),
+               "exactly the enabled techniques are exported, once each");
+        expect(out.ini.find("TechniqueSorting=LumaPre@LumaStack.fx,LumaPost@LumaStack.fx,LumaDebug@LumaStack.fx,"
+                            "Vibrance@Vibrance.fx\n") != std::string::npos,
+               "the sorting list holds every technique, enabled or not");
+        const EffectStack reread = parse(out.ini, out.sidecar, resolveFake);
+        expect(reread == stack, "parse(serialize(x)) == x for techniques, copies and disabled entries");
+        expect(reread.authoritative, "an owned preset is authoritative");
+
+        // disabling everything exports no technique but keeps the stack
+        EffectStack off = stack;
+        for (auto& instance : off.instances)
+            instance.enabled = false;
+        const SerializedPreset none = serialize(off);
+        expect(enabledKeys(none.ini).empty(), "a stack with nothing enabled exports an empty Techniques=");
+        expect(parse(none.ini, none.sidecar, resolveFake) == off, "an all-disabled stack round-trips");
+
+        // an id whose technique is not resolved yet has no ReShade name and
+        // stays in the sidecar only
+        EffectStack unresolved;
+        unresolved.instances = {make("Vibrance.fx", "")};
+        const SerializedPreset pending = serialize(unresolved);
+        expect(enabledKeys(pending.ini).empty() && pending.sidecar.find("Effects=Vibrance.fx\n") != std::string::npos,
+               "an unresolved technique is written only to the sidecar");
+        expect(parse(pending.ini, pending.sidecar, resolveFake) == unresolved, "and reads back unresolved");
     }
 
     void testInstanceSetters()
@@ -492,9 +647,7 @@ namespace
 
         // values with a comma round-trip as vector components, never as a macro
         EffectStack stack;
-        instance.name = "Simple";
-        instance.type = "Vibrance.fx";
-        instance.techniques = {{"Vibrance", true}};
+        instance.id = {"Vibrance.fx", "Vibrance", 1};
         stack.instances = {instance};
         const SerializedPreset out = serialize(stack);
         expect(out.ini.find("Tint=0.1,0.2\n") != std::string::npos && out.ini.find("QUALITY=low") != std::string::npos,
@@ -516,12 +669,16 @@ int main(int argc, char** argv)
     testForeignPack();
     testCrlfAndGeneralSection();
     testMultipleTechniquesPerFile();
+    testSecondTechniqueOnly();
+    testCopiesOfTechniques();
+    testLegacySidecarMigration();
     testUnknownEntriesAreDropped();
     testLegacyEffectKeys();
     testOldWriterOutput();
     testEarlierSidecarSectionName();
     testFullStack();
     testCallerPolicy();
+    testRoundTripAndEnabledSet();
     testInstanceSetters();
 
     if (failures != 0)

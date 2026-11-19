@@ -3,8 +3,10 @@
 #include <algorithm>
 #include <cctype>
 #include <charconv>
+#include <cstdint>
 #include <filesystem>
 #include <map>
+#include <optional>
 #include <set>
 
 namespace VkHook
@@ -254,28 +256,63 @@ namespace VkHook
             return section.empty() || section == "GENERAL" || section == "VKHOOK" || section == "VKINTOX";
         }
 
-        // sections of the shared .ini name a shader file; sidecar sections name
-        // an instance (or, in files written by older versions, a file).
-        std::vector<EffectInstance*> sectionTargets(std::vector<EffectInstance>& instances,
-                                                    const std::string& section)
+        // The instances a value section applies to. A section of the shared
+        // .ini names a shader file (every instance of it) or a built-in. A
+        // sidecar section names one instance by its id, or by the legacy
+        // instance name of an older sidecar, or (older still) a file.
+        std::vector<EffectInstance*> sectionTargets(std::vector<EffectInstance>& instances, const std::string& section,
+                                                    bool fromSidecar,
+                                                    const std::map<std::string, size_t>& legacyIndex)
         {
             std::vector<EffectInstance*> targets;
-            const std::string lowered = lower(section);
-            for (auto& instance : instances)
-                if (isFx(instance.type) && lower(instance.type) == lowered)
-                    targets.push_back(&instance);
-            if (!targets.empty())
-                return targets;
-            for (auto& instance : instances)
-                if (instance.name == section)
-                    targets.push_back(&instance);
-            if (!targets.empty() || !isFx(section))
-                return targets;
-            const std::string stem = stemOf(section);
-            for (auto& instance : instances)
-                if (instance.name == stem)
-                    targets.push_back(&instance);
+            if (fromSidecar)
+                if (const auto legacy = legacyIndex.find(section); legacy != legacyIndex.end())
+                    return {&instances[legacy->second]};
+            const auto id = EffectId::parse(section);
+            if (id && (fromSidecar || id->isBuiltin()))
+            {
+                for (auto& instance : instances)
+                    if (instance.id == *id)
+                        targets.push_back(&instance);
+                if (!targets.empty())
+                    return targets;
+            }
+            if (isFx(section))
+            {
+                const std::string lowered = lower(section);
+                for (auto& instance : instances)
+                    if (!instance.id.isBuiltin() && lower(instance.id.canonicalPath) == lowered)
+                        targets.push_back(&instance);
+            }
             return targets;
+        }
+
+        // The file a resolved path names: the built-in's id, the shader's file
+        // name, or empty for anything else.
+        std::string canonicalFile(const std::string& path)
+        {
+            if (path.empty())
+                return {};
+            if (isBuiltinEffectPath(path))
+                return EffectId::kDlss5;
+            return isFx(path) ? filenameOf(path) : std::string();
+        }
+
+        // "Bloom.2" -> 2; 0 when the name has no copy suffix
+        uint32_t legacyCopyNumber(std::string_view name)
+        {
+            const auto dot = name.rfind('.');
+            if (dot == std::string_view::npos || dot + 1 >= name.size())
+                return 0;
+            uint32_t value = 0;
+            const auto digits = name.substr(dot + 1);
+            const auto [ptr, ec] = std::from_chars(digits.data(), digits.data() + digits.size(), value);
+            return ec == std::errc() && ptr == digits.data() + digits.size() ? value : 0;
+        }
+
+        bool sameValues(const EffectInstance& a, const EffectInstance& b)
+        {
+            return a.params == b.params && a.macros == b.macros;
         }
     } // namespace
 
@@ -343,8 +380,7 @@ namespace VkHook
 
         struct Declared
         {
-            std::string name;
-            std::string type;
+            std::string text;
             bool enabled = true;
         };
         bool owned = false;
@@ -372,82 +408,116 @@ namespace VkHook
                     decl.enabled = false;
                     item.erase(item.begin());
                 }
-                const auto at = item.rfind('@');
-                if (at == std::string::npos || at + 1 >= item.size())
-                    decl.name = decl.type = item;
-                else
-                {
-                    decl.name = item.substr(0, at);
-                    decl.type = item.substr(at + 1);
-                }
-                if (!decl.name.empty())
+                decl.text = trimmed(item);
+                if (!decl.text.empty())
                     declared.push_back(std::move(decl));
             }
         }
 
-        std::set<std::string> usedNames;
         auto atCap = [&] { return stack.instances.size() >= options.maxEffects; };
+        auto resolveFile = [&](std::string_view key) { return canonicalFile(resolve(key)); };
 
-        // The techniques a shader file contributes to an instance. The ini's
-        // sorting list is the full set; Techniques marks the enabled ones.
-        auto assignTechniques = [&](EffectInstance& instance, const std::set<std::string>* enabledKeys) {
-            if (!isFx(instance.type))
-                return;
-            const std::string file = lower(instance.type);
-            std::set<std::string> seen;
-            auto add = [&](const std::vector<TechniqueRef>& refs) {
-                for (const auto& ref : refs)
-                    if (lower(ref.file) == file && seen.insert(ref.name).second)
-                        instance.techniques.push_back(
-                            {ref.name, !enabledKeys || enabledKeys->count(ref.key()) != 0});
-            };
-            add(sorting);
-            add(techniques);
-            if (instance.techniques.empty())
-                instance.techniques.push_back({stemOf(instance.type), true});
-            const bool anyEnabled = std::any_of(instance.techniques.begin(), instance.techniques.end(),
-                                                [](const PresetTechnique& t) { return t.enabled; });
-            // an owned preset's sidecar decides whether the instance runs; the
-            // per-technique flags only narrow an enabled instance
-            if (!instance.enabled || !anyEnabled)
-                for (auto& technique : instance.techniques)
-                    technique.enabled = true;
+        auto ordinalUsed = [&](const EffectId& id, uint32_t ordinal) {
+            return std::any_of(stack.instances.begin(), stack.instances.end(), [&](const EffectInstance& instance) {
+                return instance.id.sameTechnique(id) && instance.id.ordinal == ordinal;
+            });
+        };
+        // `wanted` when it is free, else the smallest free ordinal
+        auto freeOrdinal = [&](const EffectId& id, uint32_t wanted) {
+            if (wanted >= 1 && !ordinalUsed(id, wanted))
+                return wanted;
+            uint32_t ordinal = 1;
+            while (ordinalUsed(id, ordinal))
+                ++ordinal;
+            return ordinal;
+        };
+        // the instance index, or npos when the cap dropped it
+        auto push = [&](EffectId id, bool enabled, const std::string& label) -> size_t {
+            if (atCap())
+            {
+                report(label + " exceeds the effect limit; dropped");
+                return std::string::npos;
+            }
+            EffectInstance instance;
+            instance.id = std::move(id);
+            instance.enabled = enabled;
+            stack.instances.push_back(std::move(instance));
+            return stack.instances.size() - 1;
         };
 
-        std::set<std::string> enabledKeys;
-        for (const auto& ref : techniques)
-            enabledKeys.insert(ref.key());
-        const std::set<std::string>* enabledFilter = hasTechniques ? &enabledKeys : nullptr;
+        // the technique an old instance of this file ran: the first one the
+        // ini names for it; empty (the file's first technique) when none
+        auto firstTechniqueOf = [&](const std::string& file) {
+            const std::string wanted = lower(file);
+            for (const auto* refs : {&sorting, &techniques})
+                for (const auto& ref : *refs)
+                    if (lower(ref.file) == wanted)
+                        return ref.name;
+            return std::string();
+        };
+
+        std::map<std::string, size_t> legacyIndex;  // legacy instance name -> stack index
+        std::set<std::string> legacySeen;
+        auto migrateLegacy = [&](const std::string& name, const std::string& type, bool enabled) {
+            std::string file = resolveFile(name);
+            if (file.empty() && !type.empty() && type != name)
+                file = resolveFile(type);
+            if (file.empty())
+            {
+                const bool aliased = !type.empty() && type != name;
+                report("effect '" + name + "'" + (aliased ? " (" + type + ")" : "") +
+                       " matches no installed effect; dropped");
+                return;
+            }
+            if (!legacySeen.insert(name).second)
+            {
+                report("effect '" + name + "' is listed twice; dropped");
+                return;
+            }
+            EffectId id;
+            id.canonicalPath = file;
+            if (!id.isBuiltin())
+                id.technique = firstTechniqueOf(file);
+            id.ordinal = freeOrdinal(id, legacyCopyNumber(name));
+            const size_t index = push(std::move(id), enabled, "effect '" + name + "'");
+            if (index != std::string::npos)
+                legacyIndex[name] = index;
+        };
 
         if (owned)
         {
             stack.authoritative = true;
             for (const auto& decl : declared)
             {
-                if (atCap())
+                // "name@file.fx" would parse as a file named that, but '@' is
+                // the legacy name/type pairing; an id's separator is '|'
+                const bool legacyText = decl.text.find('|') == std::string::npos && decl.text.find('@') != std::string::npos;
+                const std::optional<EffectId> id = legacyText ? std::nullopt : EffectId::parse(decl.text);
+                if (!id)
                 {
-                    report("effect '" + decl.name + "' exceeds the effect limit; dropped");
+                    const auto at = decl.text.rfind('@');
+                    if (at == std::string::npos || at == 0 || at + 1 >= decl.text.size())
+                        migrateLegacy(decl.text, decl.text, decl.enabled);
+                    else
+                        migrateLegacy(decl.text.substr(0, at), decl.text.substr(at + 1), decl.enabled);
                     continue;
                 }
-                std::string path = resolve(decl.name);
-                if (path.empty() && decl.type != decl.name)
-                    path = resolve(decl.type);
-                if (path.empty())
+                EffectId resolved = *id;
+                resolved.canonicalPath = resolveFile(id->canonicalPath);
+                if (resolved.canonicalPath.empty())
                 {
-                    report("effect '" + decl.name + "' (" + decl.type + ") matches no installed effect; dropped");
+                    report("effect '" + decl.text + "' matches no installed effect; dropped");
                     continue;
                 }
-                if (!usedNames.insert(decl.name).second)
+                if (resolved.isBuiltin())
+                    resolved.technique.clear();
+                if (std::any_of(stack.instances.begin(), stack.instances.end(),
+                                [&](const EffectInstance& instance) { return instance.id == resolved; }))
                 {
-                    report("effect '" + decl.name + "' is listed twice; dropped");
+                    report("effect '" + decl.text + "' is listed twice; dropped");
                     continue;
                 }
-                EffectInstance instance;
-                instance.name = decl.name;
-                instance.type = decl.type;
-                instance.enabled = decl.enabled;
-                assignTechniques(instance, enabledFilter);
-                stack.instances.push_back(std::move(instance));
+                push(std::move(resolved), decl.enabled, "effect '" + decl.text + "'");
             }
         }
         else if (hasLegacyList)
@@ -455,132 +525,60 @@ namespace VkHook
             stack.authoritative = true;
             const std::set<std::string> disabled(legacyDisabled.begin(), legacyDisabled.end());
             for (const auto& name : legacyEffects)
-            {
-                if (atCap())
-                {
-                    report("effect '" + name + "' exceeds the effect limit; dropped");
-                    continue;
-                }
-                const std::string path = resolve(name);
-                if (path.empty())
-                {
-                    report("effect '" + name + "' matches no installed effect; dropped");
-                    continue;
-                }
-                if (!usedNames.insert(name).second)
-                    continue;
-                EffectInstance instance;
-                instance.name = name;
-                instance.type = isFx(path) ? filenameOf(path) : name;
-                instance.enabled = disabled.count(name) == 0;
-                assignTechniques(instance, nullptr);
-                stack.instances.push_back(std::move(instance));
-            }
+                migrateLegacy(name, {}, disabled.count(name) == 0);
         }
         else if (!techniques.empty() || !sorting.empty())
         {
             stack.authoritative = true;
             // TechniqueSorting orders every technique the preset knows;
-            // Techniques is the enabled set. Only files with an enabled
-            // technique become instances, so a pack-wide sorting list does not
-            // import hundreds of disabled effects.
-            std::vector<TechniqueRef> ordered = sorting.empty() ? techniques : sorting;
-            if (!sorting.empty())
-            {
-                std::set<std::string> known;
-                for (const auto& ref : sorting)
-                    known.insert(ref.key());
-                for (const auto& ref : techniques)
-                    if (known.insert(ref.key()).second)
-                        ordered.push_back(ref);
-            }
-            std::set<std::string> enabledFiles;
-            for (const auto& ref : ordered)
-                if (!enabledFilter || enabledFilter->count(ref.key()))
-                    enabledFiles.insert(lower(ref.file));
+            // Techniques is the enabled set. Only enabled techniques become
+            // instances, so a pack-wide sorting list does not import hundreds
+            // of disabled effects.
+            std::vector<TechniqueRef> ordered = sorting;
+            std::set<std::string> known;
+            for (const auto& ref : sorting)
+                known.insert(ref.key());
+            for (const auto& ref : techniques)
+                if (known.insert(ref.key()).second)
+                    ordered.push_back(ref);
+            std::set<std::string> enabledKeys;
+            for (const auto& ref : techniques)
+                enabledKeys.insert(ref.key());
 
-            std::map<std::string, size_t> instanceOfFile;
-            std::set<std::string> failedFiles;
+            std::map<std::string, std::string> fileOf;  // lowercase ini file -> installed file name
             for (const auto& ref : ordered)
             {
-                const std::string file = lower(ref.file);
-                if (!enabledFiles.count(file) || failedFiles.count(file))
+                if (hasTechniques && !enabledKeys.count(ref.key()))
                     continue;
-                auto existing = instanceOfFile.find(file);
-                if (existing == instanceOfFile.end())
+                const std::string label = "technique '" + ref.key() + "'";
+                auto cached = fileOf.find(lower(ref.file));
+                if (cached == fileOf.end())
                 {
-                    if (atCap())
-                    {
-                        failedFiles.insert(file);
-                        report("technique '" + ref.name + "@" + ref.file + "' exceeds the effect limit; dropped");
-                        continue;
-                    }
-                    std::string name, path;
-                    // an instance the caller already has for this technique
-                    // name, but only when it really is this shader file
-                    if (!usedNames.count(ref.name))
-                        if (const std::string candidate = resolve(ref.name);
-                            !candidate.empty() && lower(filenameOf(candidate)) == file)
-                        {
-                            name = ref.name;
-                            path = candidate;
-                        }
-                    if (name.empty() && options.configuredNames)
-                    {
-                        const auto configured = options.configuredNames(file);
-                        std::string pick;
-                        if (std::find(configured.begin(), configured.end(), ref.name) != configured.end())
-                            pick = ref.name;
-                        else if (configured.size() == 1)
-                            pick = configured.front();
-                        if (!pick.empty() && !usedNames.count(pick))
-                            if (std::string candidate = resolve(pick); !candidate.empty())
-                            {
-                                name = pick;
-                                path = std::move(candidate);
-                            }
-                    }
-                    // not an instance the caller has: name a new one after the
-                    // installed shader. never fall back to the bare technique
-                    // name, which names nothing and would ghost in the UI.
-                    if (name.empty())
-                    {
-                        std::string candidate = resolve(ref.file);
-                        if (candidate.empty())
-                            candidate = resolve(stemOf(ref.file));
-                        if (!candidate.empty() && !usedNames.count(stemOf(ref.file)))
-                        {
-                            name = stemOf(ref.file);
-                            path = std::move(candidate);
-                        }
-                    }
-                    if (name.empty())
-                    {
-                        failedFiles.insert(file);
-                        report("technique '" + ref.name + "@" + ref.file + "' matches no installed effect; dropped");
-                        continue;
-                    }
-                    usedNames.insert(name);
-                    EffectInstance instance;
-                    instance.name = name;
-                    instance.type = isFx(path) ? filenameOf(path) : ref.file;
-                    stack.instances.push_back(std::move(instance));
-                    existing = instanceOfFile.emplace(file, stack.instances.size() - 1).first;
+                    std::string file = resolveFile(ref.file);
+                    if (file.empty())
+                        file = resolveFile(stemOf(ref.file));
+                    cached = fileOf.emplace(lower(ref.file), std::move(file)).first;
                 }
-                auto& instance = stack.instances[existing->second];
-                const bool seen = std::any_of(instance.techniques.begin(), instance.techniques.end(),
-                                              [&](const PresetTechnique& t) { return t.name == ref.name; });
-                if (!seen)
-                    instance.techniques.push_back({ref.name, !enabledFilter || enabledFilter->count(ref.key()) != 0});
+                if (cached->second.empty())
+                {
+                    report(label + " matches no installed effect; dropped");
+                    continue;
+                }
+                EffectId id;
+                id.canonicalPath = cached->second;
+                if (!id.isBuiltin())
+                    id.technique = ref.name;
+                id.ordinal = freeOrdinal(id, 1);
+                push(std::move(id), true, label);
             }
         }
 
-        auto applyValues = [&](const std::vector<Entry>& entries) {
+        auto applyValues = [&](const std::vector<Entry>& entries, bool fromSidecar) {
             for (const auto& entry : entries)
             {
                 if (isReservedSection(entry.section))
                     continue;
-                const auto targets = sectionTargets(stack.instances, entry.section);
+                const auto targets = sectionTargets(stack.instances, entry.section, fromSidecar, legacyIndex);
                 if (entry.key == "PreprocessorDefinitions")
                 {
                     for (auto* target : targets)
@@ -592,8 +590,8 @@ namespace VkHook
                     paramNamed(target->params, entry.key).values = splitValue(entry.value);
             }
         };
-        applyValues(ini);
-        applyValues(sidecar);
+        applyValues(ini, false);
+        applyValues(sidecar, true);
         return stack;
     }
 
@@ -601,25 +599,20 @@ namespace VkHook
     {
         SerializedPreset out;
 
+        // Techniques= is exactly the enabled instances, TechniqueSorting= every
+        // instance. An id whose technique is still unresolved has no ReShade
+        // name; the sidecar keeps it. Built-ins have no ini technique entry.
         std::vector<std::string> enabledList, sortedList;
         std::set<std::string> enabledSeen, sortedSeen;
-        std::map<std::string, int> sharedCount;
         for (const auto& instance : stack.instances)
         {
-            if (!isFx(instance.type))
+            if (instance.id.isBuiltin() || instance.id.technique.empty())
                 continue;
-            ++sharedCount[lower(instance.type)];
-            std::vector<PresetTechnique> techniques = instance.techniques;
-            if (techniques.empty())
-                techniques.push_back({stemOf(instance.type), true});
-            for (const auto& technique : techniques)
-            {
-                const std::string entry = technique.name + "@" + instance.type;
-                if (sortedSeen.insert(entry).second)
-                    sortedList.push_back(entry);
-                if (instance.enabled && technique.enabled && enabledSeen.insert(entry).second)
-                    enabledList.push_back(entry);
-            }
+            const std::string key = instance.id.reshadeKey();
+            if (sortedSeen.insert(key).second)
+                sortedList.push_back(key);
+            if (instance.enabled && enabledSeen.insert(key).second)
+                enabledList.push_back(key);
         }
 
         // ReShade's own key order: definitions, techniques, sorting, sections
@@ -629,16 +622,17 @@ namespace VkHook
         out.ini += "TechniqueSorting=" + joined(sortedList, ",") + "\n";
 
         // One section per shader file (per instance for built-ins), written
-        // from the last enabled instance that uses it. Disabled instances and
-        // instances sharing a file keep their own values in the sidecar.
+        // from the last enabled instance that uses it.
+        auto sectionKey = [](const EffectInstance& instance) {
+            return instance.id.isBuiltin() ? instance.id.format() : lower(instance.id.canonicalPath);
+        };
         std::vector<std::string> sectionOrder;
         std::map<std::string, const EffectInstance*> sectionOwner;
         for (const auto& instance : stack.instances)
         {
             if (!instance.enabled)
                 continue;
-            const std::string section = isFx(instance.type) ? instance.type : instance.name;
-            const std::string key = isFx(instance.type) ? lower(section) : section;
+            const std::string key = sectionKey(instance);
             if (sectionOwner.emplace(key, &instance).second)
                 sectionOrder.push_back(key);
             else
@@ -659,27 +653,27 @@ namespace VkHook
             const EffectInstance& owner = *sectionOwner[key];
             if (!hasValues(owner))
                 continue;
-            out.ini += "\n[" + (isFx(owner.type) ? owner.type : owner.name) + "]\n";
+            out.ini += "\n[" + (owner.id.isBuiltin() ? owner.id.format() : owner.id.canonicalPath) + "]\n";
             writeValues(out.ini, owner);
         }
 
         std::vector<std::string> entries;
         for (const auto& instance : stack.instances)
-        {
-            std::string entry = instance.type.empty() || instance.type == instance.name
-                                    ? instance.name
-                                    : instance.name + "@" + instance.type;
-            if (!instance.enabled)
-                entry.insert(entry.begin(), '*');
-            entries.push_back(std::move(entry));
-        }
+            entries.push_back((instance.enabled ? "" : "*") + instance.id.format());
         out.sidecar = "[VKHOOK]\nEffects=" + joined(entries, ", ") + "\n";
+
+        // What the shared section cannot describe: disabled instances, extra
+        // copies and instances whose values differ from the file's section.
         for (const auto& instance : stack.instances)
         {
-            const bool shared = isFx(instance.type) && sharedCount[lower(instance.type)] > 1;
-            if ((instance.enabled && !shared) || !hasValues(instance))
+            if (!hasValues(instance))
                 continue;
-            out.sidecar += "\n[" + instance.name + "]\n";
+            bool needed = !instance.enabled;
+            if (!needed && !instance.id.isBuiltin())
+                needed = instance.id.ordinal > 1 || !sameValues(instance, *sectionOwner[sectionKey(instance)]);
+            if (!needed)
+                continue;
+            out.sidecar += "\n[" + instance.id.format() + "]\n";
             writeValues(out.sidecar, instance);
         }
         return out;

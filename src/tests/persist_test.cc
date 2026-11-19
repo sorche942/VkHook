@@ -173,7 +173,7 @@ namespace
         const std::string path = ConfigSerializer::getShaderProfilePath("game", "keep-me-deleted");
         std::filesystem::create_directories(std::filesystem::path(path).parent_path());
         VkHook::EffectStack stack;
-        stack.instances.push_back({"fx", "fx.fx", true, {}, {{"Strength", {"1"}}}, {}});
+        stack.instances.push_back({{"fx.fx", "fx", 1}, true, {{"Strength", {"1"}}}, {}});
         const VkHook::SerializedPreset preset = VkHook::serialize(stack);
         auto autosave = [&] {
             return ConfigSerializer::writeShaderProfile(path, preset.ini, preset.sidecar);

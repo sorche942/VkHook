@@ -248,18 +248,21 @@ namespace
         finish(12, 3);
     }
 
-    // Instances X and X.2 of one effect file must not share private textures
-    // (history included), while the first instance of another file that declares
-    // the same name still shares with the first, as ReShade does across files.
+    // Instances (EffectId ordinals) 1 and 2 of one effect file must not share
+    // private textures (history included); techniques of the same file and
+    // ordinal do, and the first instance of another file that declares the same
+    // name still shares with the first, as ReShade does across files.
     void instancesOfSameEffect(LogicalDevice& device)
     {
         reset();
         {
             ReshadeTexturePool pool(&device, testHook());
-            const uint32_t first = pool.beginEffect("Temporal.fx");
-            const uint32_t second = pool.beginEffect("Temporal.fx");
-            const uint32_t otherFile = pool.beginEffect("Other.fx");
-            expect(first == 0 && second == 1 && otherFile == 0, "instance ordinals count per effect file");
+            const uint32_t first = pool.beginEffect("Temporal.fx", 1);
+            const uint32_t second = pool.beginEffect("Temporal.fx", 2);
+            const uint32_t otherTechnique = pool.beginEffect("Temporal.fx", 1);
+            const uint32_t otherFile = pool.beginEffect("Other.fx", 1);
+            expect(first == 0 && second == 1 && otherFile == 0, "instance groups follow the EffectId ordinal");
+            expect(otherTechnique == first, "techniques of one file and ordinal share an instance group");
 
             auto firstHistory = pool.acquire("VHistory", standard, first);
             auto secondHistory = pool.acquire("VHistory", standard, second);

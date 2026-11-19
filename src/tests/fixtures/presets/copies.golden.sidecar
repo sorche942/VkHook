@@ -1,0 +1,14 @@
+[VKHOOK]
+Effects=LumaStack.fx|LumaPre, LumaStack.fx|LumaDebug, LumaStack.fx|LumaPre|2
+
+[LumaStack.fx|LumaPre]
+Strength=0.400000
+Radius=3
+
+[LumaStack.fx|LumaDebug]
+Strength=0.400000
+Radius=3
+
+[LumaStack.fx|LumaPre|2]
+Strength=0.900000
+Radius=3

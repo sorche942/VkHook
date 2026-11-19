@@ -162,9 +162,11 @@ CONF
     # vkcube is the game name the layer derives from the process, so the config
     # and profile files are keyed on it. Parameters are deliberately omitted so the
     # effect runs on the defaults declared in the shader itself.
+    # The chain comes from the ReShade preset below: its enabled technique
+    # becomes the entry "DisplayDepth.fx|DisplayDepth". (The shared-texture smoke
+    # covers a config of old instance names, which the registry migrates.)
     cat >"$base/configs/vkcube.conf" <<'CONF'
-DisplayDepth = DisplayDepth.fx
-effects = DisplayDepth
+effects =
 CONF
 
     cat >"$base/configs/shaders/vkcube@smoke.ini" <<'INI'
@@ -299,7 +301,7 @@ fi
 #
 # passes= must be non-zero: zero would mean the effect object exists but never
 # got a pipeline, so it never drew.
-if grep -qE '\[effect-built\] DisplayDepth passes=[1-9]' "$LAYER_LOG"; then
+if grep -qE '\[effect-built\] DisplayDepth\.fx\|DisplayDepth passes=[1-9]' "$LAYER_LOG"; then
     ok "DisplayDepth compiled and built a render pass"
 elif grep -q 'pass through only' "$LAYER_LOG"; then
     # The layer supports Wayland surfaces only. On X11 it deliberately does

@@ -22,21 +22,18 @@ namespace VkHook
         std::string errorMessage;   // Error message if failed
     };
 
-    // Parse a ReShade .fx file and extract its parameters without creating Vulkan resources.
-    // effectName: display name for the effect (used in EffectParam.effectName)
-    // effectPath: full path to the .fx file
-    // config: config for current param values
-    // setup: the shared preprocess setup (extent, user macros, include paths)
-    // outError, when given, is set to a non-empty message on any fatal
-    // preprocessor/parse failure, including a throwing compiler. That lets a
-    // caller use this parse as its compile check.
-    std::vector<std::unique_ptr<EffectParam>> parseReshadeEffect(
+    // The user-facing parameters of a compiled module (one per non-internal
+    // uniform), with their values read from `config`. Never writes to `config`.
+    // effectName: the effect's id text (EffectId::format()); stored in
+    //   EffectParam.effectName and the first key looked up
+    //   (`<effectName>.<uniform>`, then `<effectName>@<uniform>`)
+    // legacyName: when non-empty and config has no value under effectName, the
+    //   value is read under this pre-EffectId name instead
+    std::vector<std::unique_ptr<EffectParam>> parametersFromModule(
+        const reshadefx::module& module,
         const std::string& effectName,
-        const std::string& effectPath,
         Config* config,
-        const ReshadePreprocessSetup& setup,
-        std::vector<std::string>* techniqueNames = nullptr,
-        std::string* outError = nullptr);
+        const std::string& legacyName = {});
 
     // Test a ReShade .fx shader for compilation errors without creating Vulkan resources.
     // Returns a ShaderTestResult with success status and any error messages.

@@ -1,6 +1,8 @@
 #include "overlay_ui.hh"
 #include "reshade_parser.hh"
 #include "config_serializer.hh"
+#include "effect_names.hh"
+#include "effects/technique_scan.hh"
 
 #include <algorithm>
 #include <cstdio>
@@ -85,6 +87,20 @@ namespace VkHook
         return (shaders + 2 < parts.size()) ? parts[shaders + 1] : std::string();
     }
 
+    // One read per file version: a click reuses the scan until the file's mtime moves.
+    const std::vector<std::string>& OverlayUi::techniquesOf(const std::string& path)
+    {
+        std::error_code error;
+        const auto mtime = std::filesystem::last_write_time(path, error);
+        auto [entry, inserted] = techniqueScans.try_emplace(path);
+        if (inserted || error || entry->second.mtime != mtime)
+        {
+            entry->second.mtime = error ? std::filesystem::file_time_type{} : mtime;
+            entry->second.names = scanTechniqueNames(path);
+        }
+        return entry->second.names;
+    }
+
     void OverlayUi::renderAddEffectsView()
     {
         std::vector<std::string> selectedEffects;
@@ -125,21 +141,46 @@ namespace VkHook
             }
         }
 
+        const auto& effectPaths = snapshot->effects.effectPaths;
         const size_t maxEffectsLimit = static_cast<size_t>(settings().maxEffects);
         const size_t currentCount = selectedEffects.size();
         const size_t pendingCount = pendingAddEffects.size();
+
+        // An add-page "type" is a shader file (by definition name or file name);
+        // its chain entries are the entries of that file, or just the one entry
+        // when the type itself names a technique.
+        auto chainEntriesOf = [&](const std::string& type) {
+            std::vector<std::string> names;
+            const auto typeId = EffectId::parse(type);
+            const bool oneTechnique = typeId && !typeId->technique.empty();
+            const std::string key = lowerAscii(typeFileName(type, effectPaths));
+            for (const EffectView& effect : snapshot->effects.chain)
+            {
+                if (oneTechnique)
+                {
+                    const auto id = EffectId::parse(effect.name);
+                    if (id && id->sameTechnique(*typeId))
+                        names.push_back(effect.name);
+                }
+                else if (effectFileKey(effect) == key)
+                    names.push_back(effect.name);
+            }
+            return names;
+        };
+
         // removals free slots, so they count against the limit too
         size_t removedPresent = 0;
         for (const auto& removed : addEffectsRemoved)
-            if (std::find(selectedEffects.begin(), selectedEffects.end(), removed) != selectedEffects.end())
-                removedPresent++;
-        const bool atLimit = currentCount - removedPresent + pendingCount >= maxEffectsLimit;
+            removedPresent += chainEntriesOf(removed).size();
+        const bool atLimit = currentCount - std::min(removedPresent, currentCount) + pendingCount >= maxEffectsLimit;
 
         auto isNameUsed = [&](const std::string& name) {
-            if (std::find(selectedEffects.begin(), selectedEffects.end(), name) != selectedEffects.end())
-                return true;
+            const std::string lowered = lowerAscii(name);
+            for (const auto& selected : selectedEffects)
+                if (lowerAscii(selected) == lowered)
+                    return true;
             for (const auto& p : pendingAddEffects)
-                if (p.first == name)
+                if (lowerAscii(p.first) == lowered)
                     return true;
             return false;
         };
@@ -149,16 +190,39 @@ namespace VkHook
                     return true;
             return false;
         };
-        auto getNextInstanceName = [&](const std::string& effectType) -> std::string {
-            if (!isNameUsed(effectType))
-                return effectType;
-            for (int n = 2; n <= 99; n++)
+        // the smallest ordinal of this technique that neither the chain nor the queue uses
+        auto nextEffectId = [&](const EffectId& base) {
+            for (uint32_t ordinal = 1; ordinal <= 99; ordinal++)
             {
-                std::string candidate = effectType + "." + std::to_string(n);
-                if (!isNameUsed(candidate))
+                const EffectId candidate = base.withOrdinal(ordinal);
+                if (!isNameUsed(candidate.format()))
                     return candidate;
             }
-            return effectType + ".99";
+            return base.withOrdinal(99);
+        };
+        // The entries one copy of a type adds: every technique of its file, or
+        // the one technique the type names. An unreadable file queues its
+        // first technique unresolved; the registry names it.
+        auto techniquesForType = [&](const std::string& type) {
+            std::vector<EffectId> bases;
+            if (const auto typeId = EffectId::parse(type); typeId && (typeId->isBuiltin() || !typeId->technique.empty()))
+            {
+                bases.push_back(typeId->withOrdinal(1));
+                return bases;
+            }
+            EffectId file;
+            file.canonicalPath = typeFileName(type, effectPaths);
+            const auto path = effectPaths.find(type);
+            if (!file.isBuiltin() && path != effectPaths.end() && isFxPath(path->second))
+                for (const std::string& technique : techniquesOf(path->second))
+                {
+                    EffectId id = file;
+                    id.technique = technique;
+                    bases.push_back(std::move(id));
+                }
+            if (bases.empty())
+                bases.push_back(file);
+            return bases;
         };
 
         // Session-scoped recents, so frequently used shaders are one click away.
@@ -170,17 +234,24 @@ namespace VkHook
             if (recentEffects.size() > 8)
                 recentEffects.resize(8);
         };
+        auto queueCopies = [&](const std::string& type, int copies) {
+            for (int i = 0; i < copies; i++)
+                for (const EffectId& base : techniquesForType(type))
+                {
+                    if (selectedEffects.size() + pendingAddEffects.size() >= maxEffectsLimit)
+                        return;
+                    pendingAddEffects.push_back({nextEffectId(base).format(), type});
+                }
+        };
         auto queueEffect = [&](const std::string& effectType) {
             if (atLimit || isPending(effectType))
                 return;
-            pendingAddEffects.push_back({getNextInstanceName(effectType), effectType});
+            queueCopies(effectType, 1);
             addEffectsRemoved.erase(effectType);
             pushRecent(effectType);
         };
 
-        auto alreadyInConfig = [&](const std::string& type) {
-            return std::find(selectedEffects.begin(), selectedEffects.end(), type) != selectedEffects.end();
-        };
+        auto alreadyInConfig = [&](const std::string& type) { return !chainEntriesOf(type).empty(); };
         auto removeQueued = [&](const std::string& type) {
             pendingAddEffects.erase(std::remove_if(pendingAddEffects.begin(), pendingAddEffects.end(),
                                                    [&](const auto& p) { return p.second == type; }),
@@ -190,11 +261,6 @@ namespace VkHook
         auto duplicateCountFor = [&](const std::string& type) {
             auto it = addEffectsDuplicateCount.find(type);
             return (it == addEffectsDuplicateCount.end()) ? 0 : std::max(0, it->second);
-        };
-        auto queueCopies = [&](const std::string& type, int copies) {
-            for (int i = 0; i < copies && selectedEffects.size() + pendingAddEffects.size() < maxEffectsLimit; i++)
-                pendingAddEffects.push_back({getNextInstanceName(type), type});
-            pushRecent(type);
         };
         // the switch is the whole group: an already-listed effect keeps its
         // original, a new one gets one copy, and the count adds extra copies
@@ -214,6 +280,7 @@ namespace VkHook
             }
             addEffectsRemoved.erase(type);
             queueCopies(type, copiesFor(type));
+            pushRecent(type);
         };
 
         // ---- Build the working set ------------------------------------------
@@ -228,7 +295,6 @@ namespace VkHook
 
             std::vector<std::string> sortedCurrent = snapshot->effects.currentConfigEffects;
             std::vector<std::string> sortedDefault = snapshot->effects.defaultConfigEffects;
-            const auto& effectPaths = snapshot->effects.effectPaths;
             std::sort(sortedCurrent.begin(), sortedCurrent.end());
             std::sort(sortedDefault.begin(), sortedDefault.end());
 
@@ -452,7 +518,7 @@ namespace VkHook
                 break;
             }
             ImGui::SameLine();
-            ImGui::TextUnformatted(pendingAddEffects[i].first.c_str());
+            ImGui::TextUnformatted(effectLabel(pendingAddEffects[i].first).c_str());
             ImGui::PopID();
         }
         ImGui::EndChild();
@@ -475,8 +541,9 @@ namespace VkHook
             EditChain edit;
             for (const auto& removed : addEffectsRemoved)
             {
-                if (std::find(selectedEffects.begin(), selectedEffects.end(), removed) != selectedEffects.end())
-                    edit.remove.push_back(removed);
+                for (const std::string& name : chainEntriesOf(removed))
+                    if (std::find(edit.remove.begin(), edit.remove.end(), name) == edit.remove.end())
+                        edit.remove.push_back(name);
             }
             edit.add = pendingAddEffects;
             edit.position = insertPosition;

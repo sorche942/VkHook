@@ -12,6 +12,7 @@
 #include "reshade/effect_parser.hh"
 #include "reshade/effect_codegen.hh"
 #include "reshade_compile.hh"
+#include "user_macros.hh"
 
 #include "logger.hh"
 #include "config_serializer.hh"
@@ -95,10 +96,29 @@ namespace VkHook
                 p.maxValue = getAnnotationInt(*maxIt);
         }
 
+        // Where a parameter's saved value is read from: `<effectName>.<param>`
+        // (or `@`), and only when that has no value, the same key under the
+        // effect's pre-EffectId name.
+        struct ParamSource
+        {
+            const Config* config;
+            const std::string& effectName;
+            const std::string& legacyName;
+
+            template<typename T>
+            T get(const std::string& paramName, const T& defaultValue) const
+            {
+                if (!legacyName.empty() && !config->hasOption(effectName + "." + paramName) &&
+                    !config->hasOption(effectName + "@" + paramName))
+                    return config->getInstanceOption<T>(legacyName, paramName, defaultValue);
+                return config->getInstanceOption<T>(effectName, paramName, defaultValue);
+            }
+        };
+
         std::unique_ptr<EffectParam> convertUniform(
             const reshadefx::uniform_info& spec,
             const std::string& effectName,
-            Config* config)
+            const ParamSource& source)
         {
             // Label (common to all types)
             auto labelIt = findAnnotation(spec.annotations, "ui_label");
@@ -127,7 +147,7 @@ namespace VkHook
                 {
                     std::string suffix = "[" + std::to_string(c) + "]";
                     p.defaultValue[c] = spec.initializer_value.as_float[c];
-                    p.value[c] = config->getInstanceOption<float>(effectName, spec.name + suffix, p.defaultValue[c]);
+                    p.value[c] = source.get<float>(spec.name + suffix, p.defaultValue[c]);
                     if (minIt != spec.annotations.end())
                         p.minValue[c] = getAnnotationFloat(*minIt);
                     if (maxIt != spec.annotations.end())
@@ -154,7 +174,7 @@ namespace VkHook
                 {
                     std::string suffix = "[" + std::to_string(c) + "]";
                     p.defaultValue[c] = spec.initializer_value.as_int[c];
-                    p.value[c] = config->getInstanceOption<int32_t>(effectName, spec.name + suffix, p.defaultValue[c]);
+                    p.value[c] = source.get<int32_t>(spec.name + suffix, p.defaultValue[c]);
                     if (minIt != spec.annotations.end())
                         p.minValue[c] = getAnnotationInt(*minIt);
                     if (maxIt != spec.annotations.end())
@@ -181,7 +201,7 @@ namespace VkHook
                 {
                     std::string suffix = "[" + std::to_string(c) + "]";
                     p.defaultValue[c] = spec.initializer_value.as_uint[c];
-                    p.value[c] = config->getInstanceOption<uint32_t>(effectName, spec.name + suffix, p.defaultValue[c]);
+                    p.value[c] = source.get<uint32_t>(spec.name + suffix, p.defaultValue[c]);
                     if (minIt != spec.annotations.end())
                         p.minValue[c] = static_cast<uint32_t>(getAnnotationInt(*minIt));
                     if (maxIt != spec.annotations.end())
@@ -211,7 +231,7 @@ namespace VkHook
                 p->tooltip = tooltip;
                 p->uiType = uiType;
                 p->defaultValue = spec.initializer_value.as_float[0];
-                p->value = config->getInstanceOption<float>(effectName, spec.name, p->defaultValue);
+                p->value = source.get<float>(spec.name, p->defaultValue);
                 applyFloatRange(*p, spec.annotations);
 
                 auto stepIt = findAnnotation(spec.annotations, "ui_step");
@@ -229,7 +249,7 @@ namespace VkHook
                 p->tooltip = tooltip;
                 p->uiType = uiType;
                 p->defaultValue = (spec.initializer_value.as_uint[0] != 0);
-                p->value = config->getInstanceOption<bool>(effectName, spec.name, p->defaultValue);
+                p->value = source.get<bool>(spec.name, p->defaultValue);
                 return p;
             }
             else if (spec.type.is_integral() && spec.type.is_signed() && spec.type.rows >= 2 && spec.type.rows <= 4)
@@ -249,7 +269,7 @@ namespace VkHook
                 p->tooltip = tooltip;
                 p->uiType = uiType;
                 p->defaultValue = spec.initializer_value.as_int[0];
-                p->value = config->getInstanceOption<int32_t>(effectName, spec.name, p->defaultValue);
+                p->value = source.get<int32_t>(spec.name, p->defaultValue);
                 applyIntRange(*p, spec.annotations);
 
                 auto stepIt = findAnnotation(spec.annotations, "ui_step");
@@ -279,7 +299,7 @@ namespace VkHook
                 p->tooltip = tooltip;
                 p->uiType = uiType;
                 p->defaultValue = spec.initializer_value.as_uint[0];
-                p->value = config->getInstanceOption<uint32_t>(effectName, spec.name, p->defaultValue);
+                p->value = source.get<uint32_t>(spec.name, p->defaultValue);
 
                 auto minIt = findAnnotation(spec.annotations, "ui_min");
                 auto maxIt = findAnnotation(spec.annotations, "ui_max");
@@ -310,36 +330,14 @@ namespace VkHook
         }
     } // anonymous namespace
 
-    std::vector<std::unique_ptr<EffectParam>> parseReshadeEffect(
+    std::vector<std::unique_ptr<EffectParam>> parametersFromModule(
+        const reshadefx::module& module,
         const std::string& effectName,
-        const std::string& effectPath,
         Config* config,
-        const ReshadePreprocessSetup& setup,
-        std::vector<std::string>* techniqueNames,
-        std::string* outError)
+        const std::string& legacyName)
     {
         std::vector<std::unique_ptr<EffectParam>> params;
-        if (outError)
-            outError->clear();
-
-        std::string source;
-        std::string error;
-        reshadefx::module module;
-        if (!preprocessReshadeFile(effectPath, setup, source, error) ||
-            !compileReshadeSource(std::move(source), ReshadeCodegenOptions{}, module, error))
-        {
-            Logger::err("reshade_parser: " + effectName + ": " + error);
-            if (outError)
-                *outError = error;
-            return params;
-        }
-
-        if (techniqueNames)
-        {
-            techniqueNames->clear();
-            for (const auto& technique : module.techniques)
-                techniqueNames->push_back(technique.name);
-        }
+        const ParamSource source{config, effectName, legacyName};
 
         // Uniforms stay in the uniform buffer (no specialization constants), so
         // every user-facing parameter is a module uniform.
@@ -348,9 +346,10 @@ namespace VkHook
             if (shouldSkipUniform(uniform))
                 continue;
 
-            auto param = convertUniform(uniform, effectName, config);
+            auto param = convertUniform(uniform, effectName, source);
             if (param)
             {
+                param->effectName = effectName;
                 param->noSave = hasAnnotation(uniform.annotations, "nosave");
                 params.push_back(std::move(param));
             }
@@ -552,24 +551,6 @@ namespace VkHook
         return result;
     }
 
-    // Built-in macros that should not be exposed to users
-    static const std::set<std::string> builtInMacros = {
-        "__RESHADE__",
-        "__RESHADE_PERFORMANCE_MODE__",
-        "__RENDERER__",
-        "BUFFER_WIDTH",
-        "BUFFER_HEIGHT",
-        "BUFFER_RCP_WIDTH",
-        "BUFFER_RCP_HEIGHT",
-        "BUFFER_COLOR_DEPTH",
-        "__FILE__",
-        "__LINE__",
-        "__DATE__",
-        "__TIME__",
-        "__VENDOR__",
-        "__APPLICATION__",
-    };
-
     std::vector<PreprocessorDefinition> extractPreprocessorDefinitions(
         const std::string& effectName,
         const std::string& effectPath,
@@ -588,12 +569,7 @@ namespace VkHook
 
         for (const auto& [name, value] : usedMacros)
         {
-            // Skip built-in macros
-            if (builtInMacros.count(name))
-                continue;
-
-            // Skip macros that start with underscore (internal/compiler)
-            if (!name.empty() && name[0] == '_')
+            if (!isUserVisibleMacro(name))
                 continue;
 
             PreprocessorDefinition def;

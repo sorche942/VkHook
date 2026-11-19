@@ -60,11 +60,12 @@ namespace VkHook
     // during construction; consumers retain their own references afterward.
     //
     // Sharing follows ReShade: effect files that declare a texture of the same
-    // name share it. Two instances of the SAME file (X and X.2) are not one
-    // effect, so each instance gets its own set of those textures, history
-    // included. An instance is identified by its ordinal among the instances of
-    // its file in this build: the first instance of every file shares with the
-    // first instance of every other, the second with the second, and so on.
+    // name share it. Two instances of the SAME file (EffectId ordinals 1 and 2)
+    // are not one effect, so each instance gets its own set of those textures,
+    // history included. All techniques of one file with the same ordinal belong
+    // to one instance and share that set. An instance group is identified by the
+    // EffectId ordinal: ordinal N of every file shares with ordinal N of every
+    // other file.
     class ReshadeTexturePool
     {
     public:
@@ -73,9 +74,11 @@ namespace VkHook
         ReshadeTexturePool(const ReshadeTexturePool&) = delete;
         ReshadeTexturePool& operator=(const ReshadeTexturePool&) = delete;
 
-        // Registers one more effect instance built from `effectFile` and returns
-        // its ordinal (0 for the first instance of that file in this build).
-        uint32_t beginEffect(const std::string& effectFile);
+        // Registers one effect (one technique) of `effectFile` with EffectId
+        // ordinal `ordinal` (1-based) and returns its instance group (ordinal - 1,
+        // so 0 for the first instance). Techniques of one file and ordinal get the
+        // same group, hence the same private textures.
+        uint32_t beginEffect(const std::string& effectFile, uint32_t ordinal);
 
         std::shared_ptr<ReshadeTexture> acquire(const std::string& uniqueName, const ReshadeTextureDesc& desc,
                                                 uint32_t instanceOrdinal = 0);
@@ -83,7 +86,6 @@ namespace VkHook
     private:
         LogicalDevice* logicalDevice;
         ReshadeRetireHook retireHook;
-        std::unordered_map<std::string, uint32_t> instanceCounts;
         std::unordered_map<std::string, std::shared_ptr<ReshadeTexture>> textures;
     };
 }

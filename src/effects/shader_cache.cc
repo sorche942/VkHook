@@ -298,12 +298,12 @@ namespace VkHook
         });
     }
 
-    ShaderCache& sharedShaderCache()
+    std::unique_ptr<ShaderCache> makeDefaultShaderCache()
     {
-        static ShaderCache cache(64, defaultShaderCacheDirectory(), kShaderCompilerTag + std::string("/") + std::to_string(sizeof(reshadefx::module)),
-                                 [](const std::string& path, std::function<bool()> job) {
-                                     PersistenceQueue::instance().other(path, std::move(job));
-                                 });
-        return cache;
+        return std::make_unique<ShaderCache>(
+            64, defaultShaderCacheDirectory(), kShaderCompilerTag + std::string("/") + std::to_string(sizeof(reshadefx::module)),
+            [](const std::string& path, std::function<bool()> job) {
+                PersistenceQueue::instance().other(path, std::move(job));
+            });
     }
 } // namespace VkHook

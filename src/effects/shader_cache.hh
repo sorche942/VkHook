@@ -90,9 +90,11 @@ namespace VkHook
         WriteScheduler                  m_schedule;
     };
 
-    // The cache the layer's effects share, wired to the default directory and
-    // the PersistenceQueue.
-    ShaderCache& sharedShaderCache();
+    // A cache wired to the default directory and the PersistenceQueue. Each
+    // EffectRegistry (one per device) owns one: the memory level holds compiled
+    // modules, which are immutable CPU data, and the disk level is shared by
+    // every cache on the machine through the content-addressed files.
+    std::unique_ptr<ShaderCache> makeDefaultShaderCache();
 }
 
 #endif // SHADER_CACHE_HPP_INCLUDED

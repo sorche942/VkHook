@@ -167,30 +167,18 @@ namespace VkHook
         // Snapshot the registry-derived data here: the write runs on the writer
         // thread and must not touch state the present thread mutates, and
         // EffectConfig owns unique_ptrs and cannot be copied.
-        std::map<std::string, std::string> effectPaths;
         EffectStack stack;
-        const auto& allEffects = effectRegistry->getAllEffects();
+        const std::vector<EffectConfig> allEffects = effectRegistry->getAllEffects();
         for (const std::string& name : effectRegistry->getSelectedEffects())
         {
-            const bool enabled = effectRegistry->isEffectEnabled(name);
-            EffectInstance instance;
-            instance.name = name;
-            instance.enabled = enabled;
-
-            const std::string path = effectRegistry->getEffectFilePath(name);
-            if (!path.empty())
-            {
-                effectPaths[name] = path;
-                const std::filesystem::path p(path);
-                instance.type = p.extension() == ".fx" ? p.filename().string() : path;
-            }
+            // an entry the registry does not know (yet) has no identity to save
             const auto config = std::find_if(allEffects.begin(), allEffects.end(),
                                              [&name](const EffectConfig& item) { return item.name == name; });
-            if (config != allEffects.end())
-            {
-                for (const auto& technique : config->techniqueNames)
-                    instance.techniques.push_back({technique, enabled});
-            }
+            if (config == allEffects.end())
+                continue;
+            EffectInstance instance;
+            instance.id = config->id;
+            instance.enabled = config->enabled;
             for (auto* param : effectRegistry->getParametersForEffect(name))
             {
                 if (param->noSave)
@@ -211,19 +199,14 @@ namespace VkHook
         // queued save bring the file back.
         const std::string queueKey = shaderPath.empty() ? profilePath : shaderPath;
         std::future<bool> saved = PersistenceQueue::instance().write(queueKey,
-            [profilePath, shaderPath, effectPaths, stack = std::move(stack)]() mutable {
+            [profilePath, shaderPath, stack = std::move(stack)]() mutable {
                 bool configSaved = true;
                 if (!profilePath.empty())
                 {
-                    // .conf carries the ReShade definitions only; values live in the
-                    // .ini so a sparse preset can't inherit stale ones.
-                    std::map<std::string, std::string> instancePaths = effectPaths;
-                    for (const auto& [name, path] : effectPaths)
-                    {
-                        if (std::filesystem::path(path).extension() == ".fx")
-                            instancePaths[name] = std::filesystem::path(path).filename().string();
-                    }
-                    configSaved = ConfigSerializer::saveToPath(profilePath, {}, {}, {}, instancePaths, {});
+                    // an entry is named by its EffectId, which resolves to its shader by
+                    // file name, so the .conf needs no `name = file.fx` definitions; the
+                    // chain and its values live in the preset
+                    configSaved = ConfigSerializer::saveToPath(profilePath, {}, {}, {}, {}, {});
                 }
 
                 bool shaderSaved = true;
@@ -255,7 +238,6 @@ namespace VkHook
         std::vector<std::string> effects = effectRegistry->getSelectedEffects();
         std::vector<std::string> disabledEffects;
         std::vector<ConfigParam> params;
-        std::map<std::string, std::string> effectPaths;
         std::vector<PreprocessorDefinition> allDefs;
         for (const auto& effectName : effects)
         {
@@ -268,17 +250,15 @@ namespace VkHook
                 for (const auto& [suffix, value] : p->serialize())
                     params.push_back({p->effectName, suffix.empty() ? p->name : suffix, value});
             }
-            const std::string path = effectRegistry->getEffectFilePath(effectName);
-            if (!path.empty())
-                effectPaths[effectName] = path;
             for (const auto& def : effectRegistry->getPreprocessorDefs(effectName))
                 allDefs.push_back(def);
         }
 
         const std::string path = ConfigSerializer::getConfigsDir() + "/" + name + ".conf";
         const bool saved = PersistenceQueue::instance().create(path,
-            [name, effects, disabledEffects, params, effectPaths, allDefs] {
-                return ConfigSerializer::saveConfig(name, effects, disabledEffects, params, effectPaths, allDefs);
+            [name, effects, disabledEffects, params, allDefs] {
+                // ids resolve to their shaders by file name: no `name = file.fx` definitions
+                return ConfigSerializer::saveConfig(name, effects, disabledEffects, params, {}, allDefs);
             }).get();
         if (!saved)
             pushToast(LogLevel::Error, "Could not save the config.");

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <filesystem>
+#include <functional>
 #include <set>
 #include <sstream>
 
@@ -17,16 +18,14 @@ namespace VkHook
 
     namespace
     {
-        std::string toLower(std::string value)
-        {
-            std::transform(value.begin(), value.end(), value.begin(),
-                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-            return value;
-        }
+        // Parameter sets kept alive after a replace, in generations. Readers
+        // (ReshadeEffect::updateFrame) re-resolve their pointers on the next
+        // frame after a bump; this is far more than one frame.
+        constexpr size_t kRetiredParameterSets = 32;
 
         bool hasFxExtension(const std::filesystem::path& path)
         {
-            return toLower(path.extension().string()) == ".fx";
+            return lowerAscii(path.extension().string()) == ".fx";
         }
 
         std::string tryResolveDirectEffectPath(const std::string& value)
@@ -53,141 +52,148 @@ namespace VkHook
             return "";
         }
 
-        // Search a list of directories for an effect file by name
-        std::string searchDirsForEffect(const std::string& name,
-                                        const std::vector<std::string>& dirs)
+        // "Clarity.2" -> ("Clarity", 2): the copy suffix old instance names used.
+        // Anything else -> (name, 1).
+        std::pair<std::string, uint32_t> splitLegacyOrdinal(const std::string& name)
         {
-            const std::filesystem::path queryPath(name);
-            const std::string queryFilenameLower = toLower(queryPath.filename().string());
-            const std::string queryStemLower = toLower(queryPath.stem().string());
-
-            for (const auto& dir : dirs)
+            const size_t dot = name.rfind('.');
+            if (dot == std::string::npos || dot == 0 || dot + 1 >= name.size() || name.size() - dot > 4)
+                return {name, 1};
+            uint32_t value = 0;
+            for (size_t i = dot + 1; i < name.size(); ++i)
             {
-                std::error_code ec;
-                std::filesystem::path base(dir);
-
-                std::filesystem::path path = base / name;
-                if (std::filesystem::exists(path, ec) && std::filesystem::is_regular_file(path, ec))
-                {
-                    if (hasFxExtension(path))
-                        return path.string();
-                }
-
-                if (!queryPath.has_extension())
-                {
-                    std::filesystem::path withFx = base / (name + ".fx");
-                    if (std::filesystem::exists(withFx, ec) && std::filesystem::is_regular_file(withFx, ec))
-                        return withFx.string();
-                }
-
-                if (!std::filesystem::exists(base, ec) || !std::filesystem::is_directory(base, ec))
-                    continue;
-
-                try
-                {
-                    for (const auto& entry : std::filesystem::recursive_directory_iterator(
-                             base, std::filesystem::directory_options::skip_permission_denied))
-                    {
-                        if (!entry.is_regular_file())
-                            continue;
-
-                        const auto& filePath = entry.path();
-                        if (!hasFxExtension(filePath))
-                            continue;
-
-                        const std::string filenameLower = toLower(filePath.filename().string());
-                        const std::string stemLower = toLower(filePath.stem().string());
-
-                        // Match either full filename (for "Foo.fx") or stem (for "Foo")
-                        if ((!queryFilenameLower.empty() && filenameLower == queryFilenameLower) ||
-                            (!queryStemLower.empty() && stemLower == queryStemLower))
-                        {
-                            return filePath.string();
-                        }
-                    }
-                }
-                catch (const std::filesystem::filesystem_error&)
-                {
-                    // Keep searching other paths if one directory is inaccessible
-                }
+                if (!std::isdigit(static_cast<unsigned char>(name[i])))
+                    return {name, 1};
+                value = value * 10 + static_cast<uint32_t>(name[i] - '0');
             }
-            return "";
+            return value >= 2 ? std::pair<std::string, uint32_t>{name.substr(0, dot), value}
+                              : std::pair<std::string, uint32_t>{name, 1};
         }
 
-        // Try to find effect file path
-        std::string findEffectPath(const std::string& name, Config* config)
+        template <typename P>
+        bool copyScalar(EffectParam& dst, const EffectParam& src)
         {
-            if (isDlss5Effect(name, config))
-                return "DLSS5";
-            // If caller already provides a path (absolute or relative), use it directly.
-            std::string directPath = tryResolveDirectEffectPath(name);
-            if (!directPath.empty())
-                return directPath;
+            auto* to = dynamic_cast<P*>(&dst);
+            const auto* from = dynamic_cast<const P*>(&src);
+            if (!to || !from)
+                return false;
+            to->value = from->value;
+            return true;
+        }
 
-            // First check if path is directly configured (e.g. "Vibrance = /path/to/Vibrance.fx")
-            std::string path = config->getOption<std::string>(name, "");
-            std::string resolvedConfiguredPath = tryResolveDirectEffectPath(path);
-            if (!resolvedConfiguredPath.empty())
-                return resolvedConfiguredPath;
+        template <typename P>
+        bool copyVector(EffectParam& dst, const EffectParam& src)
+        {
+            auto* to = dynamic_cast<P*>(&dst);
+            const auto* from = dynamic_cast<const P*>(&src);
+            if (!to || !from || to->componentCount != from->componentCount)
+                return false;
+            for (uint32_t i = 0; i < to->componentCount; ++i)
+                to->value[i] = from->value[i];
+            return true;
+        }
 
-            // Collect all search directories
-            std::vector<std::string> searchDirs;
+        // The user's current value of `src` onto the freshly parsed `dst`, when it is
+        // the same kind of parameter (a re-parse must not throw away their edits).
+        void carryValue(EffectParam& dst, const EffectParam& src)
+        {
+            if (dst.getType() != src.getType())
+                return;
+            copyScalar<FloatParam>(dst, src) || copyScalar<IntParam>(dst, src) || copyScalar<UintParam>(dst, src) ||
+                copyScalar<BoolParam>(dst, src) || copyVector<FloatVecParam>(dst, src) ||
+                copyVector<IntVecParam>(dst, src) || copyVector<UintVecParam>(dst, src);
+        }
 
-            // reshadeIncludePath from config (colon-separated)
-            std::string includePath = config->getOption<std::string>("reshadeIncludePath", "");
-            if (!includePath.empty())
-            {
-                std::stringstream ss(includePath);
-                std::string dir;
-                while (std::getline(ss, dir, ':'))
-                {
-                    if (!dir.empty())
-                        searchDirs.push_back(dir);
-                }
-            }
-
-            // Shader manager paths
-            ShaderManagerConfig shaderMgrConfig = ConfigSerializer::loadShaderManagerConfig();
-
-            // Discovered shader paths
-            for (const auto& p : shaderMgrConfig.discoveredShaderPaths)
-                searchDirs.push_back(p);
-
-            // Parent directories — scan for Shaders/ subdirectories and also
-            // search the parent dir itself (users may keep .fx files flat)
-            for (const auto& parentDir : shaderMgrConfig.parentDirectories)
-            {
-                searchDirs.push_back(parentDir);  // search directly
-                try
-                {
-                    for (const auto& entry : std::filesystem::recursive_directory_iterator(
-                             parentDir, std::filesystem::directory_options::skip_permission_denied))
+        void carryParameters(std::vector<std::unique_ptr<EffectParam>>& fresh,
+                             const std::vector<std::unique_ptr<EffectParam>>& old)
+        {
+            for (auto& param : fresh)
+                for (const auto& previous : old)
+                    if (previous->name == param->name)
                     {
-                        if (!entry.is_directory())
-                            continue;
-                        std::string dirName = entry.path().filename().string();
-                        std::transform(dirName.begin(), dirName.end(), dirName.begin(), ::tolower);
-                        if (dirName == "shaders")
-                            searchDirs.push_back(entry.path().string());
+                        carryValue(*param, *previous);
+                        break;
                     }
-                }
-                catch (const std::filesystem::filesystem_error&) {}
-            }
+        }
 
-            // Search all collected directories
-            path = searchDirsForEffect(name, searchDirs);
-            if (!path.empty())
-                return path;
-
-            return "";
+        // A macro's saved value: `<name>@<macro>`, else the same under the legacy name.
+        std::string savedMacroValue(Config* root, const std::string& name, const std::string& legacyName,
+                                    const std::string& macro)
+        {
+            if (!root)
+                return "";
+            std::string value = root->getOption<std::string>(name + "@" + macro, "");
+            if (value.empty() && !legacyName.empty())
+                value = root->getOption<std::string>(legacyName + "@" + macro, "");
+            return value;
         }
     } // anonymous namespace
+
+    EffectRegistry::EffectRegistry()
+        : cache(makeDefaultShaderCache()), worker(std::make_unique<EffectCompiler>(*cache))
+    {
+    }
+
+    EffectRegistry::~EffectRegistry()
+    {
+        // Join the worker before the members its callbacks use are destroyed.
+        worker.reset();
+    }
+
+    void EffectRegistry::refreshCatalogRoots(Config* config) const
+    {
+        std::vector<std::string> roots;
+        if (config)
+        {
+            std::stringstream ss(config->getOption<std::string>("reshadeIncludePath", ""));
+            std::string       dir;
+            while (std::getline(ss, dir, ':'))
+                if (!dir.empty())
+                    roots.push_back(dir);
+        }
+        // loadShaderManagerConfig is cached on the file's mtime: this is a stat
+        const ShaderManagerConfig shaderManager = ConfigSerializer::loadShaderManagerConfig();
+        roots.insert(roots.end(), shaderManager.discoveredShaderPaths.begin(), shaderManager.discoveredShaderPaths.end());
+        roots.insert(roots.end(), shaderManager.parentDirectories.begin(), shaderManager.parentDirectories.end());
+        shaderCatalog.setRoots(std::move(roots));
+    }
+
+    // A reference to a shader: the built-in's id, a path, a `name = path`
+    // definition, or a name looked up in the catalog.
+    std::string EffectRegistry::findEffectPath(const std::string& name, Config* config) const
+    {
+        if (isDlss5Effect(name, config))
+            return "DLSS5";
+        // If caller already provides a path (absolute or relative), use it directly.
+        std::string directPath = tryResolveDirectEffectPath(name);
+        if (!directPath.empty())
+            return directPath;
+
+        // First check if path is directly configured (e.g. "Vibrance = /path/to/Vibrance.fx")
+        const std::string configured = config->getOption<std::string>(name, "");
+        std::string resolvedConfiguredPath = tryResolveDirectEffectPath(configured);
+        if (!resolvedConfiguredPath.empty())
+            return resolvedConfiguredPath;
+
+        refreshCatalogRoots(config);
+        std::string path = shaderCatalog.find(name);
+        if (path.empty() && !configured.empty())
+            path = shaderCatalog.find(configured);
+        if (path.empty() && shaderCatalog.rescan())
+        {
+            // a shader copied in since the last scan; rescan() is rate limited
+            path = shaderCatalog.find(name);
+            if (path.empty() && !configured.empty())
+                path = shaderCatalog.find(configured);
+        }
+        return path;
+    }
 
     bool EffectRegistry::isLegacyBuiltInName(const std::string& name)
     {
         static const std::set<std::string> legacyNames = {"cas", "dls", "fxaa", "smaa", "deband", "lut"};
 
-        std::string base = toLower(name);
+        std::string base = lowerAscii(name);
         // strip a numbered-instance suffix ("cas.2"), not a filename extension
         const size_t dot = base.find('.');
         if (dot != std::string::npos)
@@ -200,12 +206,219 @@ namespace VkHook
         return legacyNames.count(base) != 0;
     }
 
-    std::string EffectRegistry::resolveEffectPath(const std::string& name, Config* config)
+    std::string EffectRegistry::resolveEffectPath(const std::string& name, Config* config) const
     {
         if (name.empty() || !config)
             return "";
+        if (const auto id = EffectId::parse(name))
+            return id->isBuiltin() ? std::string("DLSS5") : findEffectPath(id->canonicalPath, config);
         return findEffectPath(name, config);
     }
+
+    // --- lookup helpers (mutex held) --------------------------------------------
+
+    EffectEntry* EffectRegistry::findEntry(const std::string& effectName)
+    {
+        return const_cast<EffectEntry*>(std::as_const(*this).findEntry(effectName));
+    }
+
+    const EffectEntry* EffectRegistry::findEntry(const std::string& effectName) const
+    {
+        for (const auto& entry : entries)
+            if (entry.info.name == effectName)
+                return &entry;
+        const auto alias = aliases.find(effectName);
+        if (alias == aliases.end())
+            return nullptr;
+        for (const auto& entry : entries)
+            if (entry.info.name == alias->second)
+                return &entry;
+        return nullptr;
+    }
+
+    std::string EffectRegistry::canonicalLocked(const std::string& name) const
+    {
+        const EffectEntry* entry = findEntry(name);
+        return entry ? entry->info.name : name;
+    }
+
+    EffectParam* EffectRegistry::findParam(EffectEntry& effect, const std::string& paramName)
+    {
+        for (auto& param : effect.parameters)
+            if (param->name == paramName)
+                return param.get();
+        return nullptr;
+    }
+
+    const EffectParam* EffectRegistry::findParam(const EffectEntry& effect, const std::string& paramName)
+    {
+        for (const auto& param : effect.parameters)
+            if (param->name == paramName)
+                return param.get();
+        return nullptr;
+    }
+
+    uint32_t EffectRegistry::freeOrdinal(const EffectId& id, uint32_t wanted) const
+    {
+        uint32_t ordinal = std::max<uint32_t>(wanted, 1);
+        for (;; ++ordinal)
+        {
+            const EffectId candidate = id.withOrdinal(ordinal);
+            const std::string text = candidate.format();
+            const bool taken =
+                std::any_of(entries.begin(), entries.end(),
+                            [&](const EffectEntry& e) { return e.info.id == candidate; }) ||
+                std::any_of(aliases.begin(), aliases.end(), [&](const auto& a) { return a.second == text; });
+            if (!taken)
+                return ordinal;
+        }
+    }
+
+    void EffectRegistry::retireParameters(std::vector<std::unique_ptr<EffectParam>>&& params)
+    {
+        if (params.empty())
+            return;
+        retiredParameters.push_back(std::move(params));
+        while (retiredParameters.size() > kRetiredParameterSets)
+            retiredParameters.pop_front();
+    }
+
+    // --- building (no lock) --------------------------------------------------------
+
+    EffectEntry EffectRegistry::buildReshade(const EffectId& id, const std::string& legacyName,
+                                             const std::string& path, Config* root, uint32_t width,
+                                             uint32_t height) const
+    {
+        EffectEntry entry;
+        EffectConfig& info = entry.info;
+        info.id           = id;
+        info.name         = id.format();
+        info.legacyName   = legacyName;
+        info.filePath     = path;
+        info.type         = EffectType::ReShade;
+        info.enabled      = true;
+
+        // Record file modification time for change detection
+        std::error_code ec;
+        info.fileModTime = std::filesystem::last_write_time(path, ec);
+        info.effectType  = std::filesystem::path(path).stem().string();
+
+        // Discover the user-configurable macros first and apply the saved
+        // values, so the compile below sees the same macros the runtime compile
+        // will and macro-gated uniforms show up when their macro is set.
+        info.preprocessorDefs = extractPreprocessorDefinitions(info.name, path, preprocessSetup(width, height, 8, {}));
+        for (auto& def : info.preprocessorDefs)
+        {
+            const std::string savedValue = savedMacroValue(root, info.name, legacyName, def.name);
+            if (!savedValue.empty())
+            {
+                def.value = savedValue;
+                Logger::debug("EffectRegistry: loaded preprocessor def " + info.name + "@" + def.name + " = " + savedValue);
+            }
+        }
+
+        // The compile is also the compile check, and its module the source of the
+        // parameter list. The runtime build asks the same cache for the same key.
+        EffectCompileSpec spec;
+        spec.id    = id;
+        spec.path  = path;
+        spec.setup   = preprocessSetup(width, height, 8, info.preprocessorDefs);
+        spec.codegen = codegenOptions();
+        EffectCompileResult result = compileEffect(spec, *cache);
+
+        info.techniqueNames = result.techniqueNames;
+        if (info.id.technique.empty() && !info.techniqueNames.empty())
+        {
+            info.id.technique = info.techniqueNames.front();
+            info.name         = info.id.format();
+        }
+        if (result.module)
+        {
+            entry.parameters = parametersFromModule(*result.module, info.name, root, legacyName);
+        }
+        if (!result.error.empty())
+        {
+            info.compileError = result.error;
+            info.enabled      = false;  // Disable failed effects by default
+            Logger::err("EffectRegistry: failed to compile " + info.name + ": " + result.error);
+        }
+        else
+        {
+            Logger::debug("EffectRegistry: loaded ReShade effect " + info.name + " with " +
+                          std::to_string(entry.parameters.size()) + " parameters and " +
+                          std::to_string(info.preprocessorDefs.size()) + " preprocessor defs");
+        }
+        for (auto& def : info.preprocessorDefs)
+            def.effectName = info.name;
+        return entry;
+    }
+
+    std::optional<EffectEntry> EffectRegistry::buildEntry(const std::string& instanceName,
+                                                          const std::string& effectType, Config* root,
+                                                          uint32_t width, uint32_t height) const
+    {
+        const std::string type   = effectType.empty() ? instanceName : effectType;
+        const auto        parsed = EffectId::parse(instanceName);
+        // Values saved under a name that is not a resolved id (an old instance name,
+        // or a bare "file.fx" from a migrated preset) are read as a fallback.
+        const std::string legacy = (parsed && parsed->isResolved()) ? std::string() : instanceName;
+
+        // the native neural renderer
+        if (parsed ? parsed->isBuiltin() : (isDlss5Effect(type, root) || isDlss5Effect(instanceName, root)))
+        {
+            EffectId id;
+            id.canonicalPath = EffectId::kDlss5;
+            id.ordinal = parsed ? parsed->ordinal : splitLegacyOrdinal(instanceName).second;
+            return dlss5EffectEntry(id, legacy, root);
+        }
+
+        // An id names its file exactly; a legacy name resolves through its type
+        // hint, then its own text (definition, stem or file name).
+        const bool legacyBuiltIn = isLegacyBuiltInName(type) || isLegacyBuiltInName(instanceName);
+        std::string path;
+        if (parsed)
+        {
+            path = findEffectPath(parsed->canonicalPath, root);
+            if (path.empty() && !effectType.empty())
+                path = findEffectPath(effectType, root);
+        }
+        else
+        {
+            path = findEffectPath(type, root);
+            if (path.empty() && type != instanceName)
+                path = findEffectPath(instanceName, root);
+        }
+        if (path.empty() || !std::filesystem::exists(path))
+        {
+            // a legacy built-in has nothing to resolve, so dropping it silently
+            // keeps the ghost out of the log
+            bool first = false;
+            {
+                std::lock_guard<std::mutex> lock(warnMutex);
+                first = warnedMissing.insert(instanceName).second;
+            }
+            if (!legacyBuiltIn && first)
+                Logger::warn("EffectRegistry: could not find effect file for: " + instanceName);
+            return std::nullopt;
+        }
+        {
+            std::lock_guard<std::mutex> lock(warnMutex);
+            warnedMissing.erase(instanceName);
+        }
+
+        EffectId id;
+        id.canonicalPath = std::filesystem::path(path).filename().string();
+        if (parsed)
+        {
+            id.technique = parsed->technique;
+            id.ordinal   = parsed->ordinal;
+        }
+        else
+            id.ordinal = splitLegacyOrdinal(instanceName).second;
+        return buildReshade(id, legacy, path, root, width, height);
+    }
+
+    // --- initialization --------------------------------------------------------------
 
     void EffectRegistry::initialize(Config* config)
     {
@@ -217,104 +430,58 @@ namespace VkHook
             height = compileHeight;
         }
 
-        std::vector<std::string> effectNames = config->getOption<std::vector<std::string>>("effects");
-        std::vector<std::string> disabledEffects = config->getOption<std::vector<std::string>>("disabledEffects");
-
-        // Build set for quick lookup
-        std::set<std::string> disabledSet(disabledEffects.begin(), disabledEffects.end());
+        const std::vector<std::string> effectNames = config->getOption<std::vector<std::string>>("effects");
+        const std::vector<std::string> disabledEffects = config->getOption<std::vector<std::string>>("disabledEffects");
+        const std::set<std::string> disabledSet(disabledEffects.begin(), disabledEffects.end());
 
         // Every effect is parsed and compile-checked here, which reads files: no lock
         // is held, and the finished list replaces the old one in one step.
-        std::list<EffectConfig> built;
+        std::list<EffectEntry> built;
+        std::unordered_map<std::string, std::string> builtAliases;
+        auto taken = [&](const EffectId& id) {
+            return std::any_of(built.begin(), built.end(), [&](const EffectEntry& e) { return e.info.id == id; });
+        };
         for (const auto& name : effectNames)
         {
-            std::string effectPath = findEffectPath(name, config);
-            if (effectPath.empty())
-            {
-                // a legacy built-in has no .fx to find; drop it silently so the
-                // next auto-save rewrites the preset without it
-                const std::string storedValue = config->getOption<std::string>(name, "");
-                if (!isLegacyBuiltInName(name) && !isLegacyBuiltInName(storedValue))
-                    Logger::err("EffectRegistry: could not find effect file for: " + name);
+            auto entry = buildEntry(name, "", config, width, height);
+            if (!entry)
                 continue;
-            }
-            if (isDlss5Effect(name, config))
-                built.push_back(dlss5EffectConfig(name, config));
-            else
-                built.push_back(buildReshadeEffect(name, effectPath, config, width, height));
 
+            EffectId id = entry->info.id;
+            uint32_t ordinal = std::max<uint32_t>(id.ordinal, 1);
+            while (taken(id.withOrdinal(ordinal)))
+                ++ordinal;
+            if (ordinal != id.ordinal)
+            {
+                id.ordinal = ordinal;
+                entry->info.id = id;
+                entry->info.name = id.format();
+                for (auto& def : entry->info.preprocessorDefs)
+                    def.effectName = entry->info.name;
+                for (auto& param : entry->parameters)
+                    param->effectName = entry->info.name;
+            }
+            if (entry->info.name != name)
+                builtAliases[name] = entry->info.name;
             // Set enabled state based on disabledEffects list
-            if (disabledSet.count(name))
-                built.back().enabled = false;
+            if (disabledSet.count(name) || disabledSet.count(entry->info.name))
+                entry->info.enabled = false;
+            built.push_back(std::move(*entry));
         }
 
         {
             std::lock_guard<std::mutex> lock(mutex);
-            this->rootConfig = config;
-            effects.swap(built);
+            rootConfig.store(config, std::memory_order_release);
+            for (auto& old : entries)
+                retireParameters(std::move(old.parameters));
+            entries.swap(built);
+            aliases.swap(builtAliases);
+            pendingEnabled.clear();
+            for (auto& name : selectedEffects)
+                name = canonicalLocked(name);
             paramGeneration.fetch_add(1, std::memory_order_release);
-            Logger::debug("EffectRegistry: initialized " + std::to_string(effects.size()) + " effects");
+            Logger::debug("EffectRegistry: initialized " + std::to_string(entries.size()) + " effects");
         }
-    }
-
-    // Parses and compile-checks one ReShade effect. Reads files and runs the compiler,
-    // so the caller holds no lock; nothing here touches the registry's state.
-    EffectConfig EffectRegistry::buildReshadeEffect(const std::string& name, const std::string& path, Config* root,
-                                                    uint32_t width, uint32_t height) const
-    {
-        EffectConfig config;
-        config.name = name;
-        config.filePath = path;
-        config.type = EffectType::ReShade;
-        config.enabled = true;
-
-        // Record file modification time for change detection
-        std::error_code ec;
-        config.fileModTime = std::filesystem::last_write_time(path, ec);
-
-        // Extract effectType from filename (e.g., "/path/to/Clarity.fx" -> "Clarity")
-        std::filesystem::path p(path);
-        config.effectType = p.stem().string();
-
-        // Extract the user-configurable macros first and apply the saved values,
-        // so the parse below sees the same macros the runtime compile will and
-        // macro-gated uniforms show up when their macro is set.
-        // Config format: effectName@MACRO = value
-        config.preprocessorDefs =
-            extractPreprocessorDefinitions(name, path, preprocessSetup(width, height, 8, {}));
-        for (auto& def : config.preprocessorDefs)
-        {
-            std::string configKey = name + "@" + def.name;
-            std::string savedValue = root->getOption<std::string>(configKey, "");
-            if (!savedValue.empty())
-            {
-                def.value = savedValue;
-                Logger::debug("EffectRegistry: loaded preprocessor def " + configKey + " = " + savedValue);
-            }
-        }
-
-        // parseReshadeEffect runs the full preprocessor/parser/codegen pass, so it
-        // is already the compile check.
-        std::string parseError;
-        config.parameters = parseReshadeEffect(
-            name, path, root,
-            preprocessSetup(width, height, 8, config.preprocessorDefs),
-            &config.techniqueNames, &parseError);
-        if (!parseError.empty())
-        {
-            config.compileError = parseError;
-            config.enabled = false;  // Disable failed effects by default
-            config.preprocessorDefs.clear();
-            Logger::err("EffectRegistry: failed to compile " + name + ": " + parseError);
-        }
-        else
-        {
-            Logger::debug("EffectRegistry: loaded ReShade effect " + name + " with " +
-                          std::to_string(config.parameters.size()) + " parameters and " +
-                          std::to_string(config.preprocessorDefs.size()) + " preprocessor defs");
-        }
-
-        return config;
     }
 
     ReshadePreprocessSetup EffectRegistry::preprocessSetup(uint32_t bufferWidth,
@@ -332,6 +499,18 @@ namespace VkHook
         return setup;
     }
 
+    void EffectRegistry::setCodegenOptions(const ReshadeCodegenOptions& options)
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        codegen = options;
+    }
+
+    ReshadeCodegenOptions EffectRegistry::codegenOptions() const
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        return codegen;
+    }
+
     void EffectRegistry::setCompileExtent(uint32_t width, uint32_t height)
     {
         std::lock_guard<std::mutex> lock(mutex);
@@ -339,98 +518,70 @@ namespace VkHook
         compileHeight = height;
     }
 
+    // --- queries ----------------------------------------------------------------------
+
+    std::vector<EffectConfig> EffectRegistry::getAllEffects() const
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        std::vector<EffectConfig> snapshot;
+        snapshot.reserve(entries.size());
+        for (const auto& entry : entries)
+            snapshot.push_back(entry.info);
+        return snapshot;
+    }
+
     std::vector<std::unique_ptr<EffectParam>> EffectRegistry::getAllParameters() const
     {
         std::lock_guard<std::mutex> lock(mutex);
         std::vector<std::unique_ptr<EffectParam>> params;
 
-        for (const auto& effect : effects)
-        {
-            for (const auto& p : effect.parameters)
+        for (const auto& entry : entries)
+            for (const auto& p : entry.parameters)
                 params.push_back(p->clone());
-        }
 
         return params;
-    }
-
-    // Internal helper to find effect by name (assumes mutex is held)
-    std::optional<EffectConfig*> EffectRegistry::findEffect(const std::string& effectName)
-    {
-        for (auto& effect : effects)
-        {
-            if (effect.name == effectName)
-                return &effect;
-        }
-        return std::nullopt;
-    }
-
-    std::optional<const EffectConfig*> EffectRegistry::findEffect(const std::string& effectName) const
-    {
-        for (const auto& effect : effects)
-        {
-            if (effect.name == effectName)
-                return &effect;
-        }
-        return std::nullopt;
-    }
-
-    // Internal helper to find parameter within an effect (assumes mutex is held)
-    std::optional<EffectParam*> EffectRegistry::findParam(EffectConfig& effect, const std::string& paramName)
-    {
-        for (auto& param : effect.parameters)
-        {
-            if (param->name == paramName)
-                return param.get();
-        }
-        return std::nullopt;
-    }
-
-    std::optional<const EffectParam*> EffectRegistry::findParam(const EffectConfig& effect, const std::string& paramName) const
-    {
-        for (const auto& param : effect.parameters)
-        {
-            if (param->name == paramName)
-                return param.get();
-        }
-        return std::nullopt;
     }
 
     void EffectRegistry::setEffectEnabled(const std::string& effectName, bool enabled)
     {
         std::lock_guard<std::mutex> lock(mutex);
 
-        if (auto effect = findEffect(effectName))
-            (*effect)->enabled = enabled;
+        if (EffectEntry* entry = findEntry(effectName))
+            entry->info.enabled = enabled;
+        else
+            pendingEnabled[effectName] = enabled;
     }
 
     bool EffectRegistry::isEffectEnabled(const std::string& effectName) const
     {
         std::lock_guard<std::mutex> lock(mutex);
 
-        auto effect = findEffect(effectName);
-        return effect ? (*effect)->enabled : false;
+        const EffectEntry* entry = findEntry(effectName);
+        return entry ? entry->info.enabled : false;
     }
 
     std::optional<EffectParam*> EffectRegistry::getParameter(const std::string& effectName, const std::string& paramName)
     {
         std::lock_guard<std::mutex> lock(mutex);
 
-        auto effect = findEffect(effectName);
-        if (!effect)
+        EffectEntry* entry = findEntry(effectName);
+        if (!entry)
             return std::nullopt;
-
-        return findParam(**effect, paramName);
+        if (EffectParam* param = findParam(*entry, paramName))
+            return param;
+        return std::nullopt;
     }
 
     std::optional<const EffectParam*> EffectRegistry::getParameter(const std::string& effectName, const std::string& paramName) const
     {
         std::lock_guard<std::mutex> lock(mutex);
 
-        auto effect = findEffect(effectName);
-        if (!effect)
+        const EffectEntry* entry = findEntry(effectName);
+        if (!entry)
             return std::nullopt;
-
-        return findParam(**effect, paramName);
+        if (const EffectParam* param = findParam(*entry, paramName))
+            return param;
+        return std::nullopt;
     }
 
     std::vector<EffectParam*> EffectRegistry::getParametersForEffect(const std::string& effectName)
@@ -438,11 +589,11 @@ namespace VkHook
         std::lock_guard<std::mutex> lock(mutex);
         std::vector<EffectParam*> result;
 
-        auto effect = findEffect(effectName);
-        if (!effect)
+        EffectEntry* entry = findEntry(effectName);
+        if (!entry)
             return result;
 
-        for (auto& param : (*effect)->parameters)
+        for (auto& param : entry->parameters)
             result.push_back(param.get());
 
         return result;
@@ -451,103 +602,182 @@ namespace VkHook
     bool EffectRegistry::hasEffect(const std::string& name) const
     {
         std::lock_guard<std::mutex> lock(mutex);
-        return findEffect(name).has_value();
+        return findEntry(name) != nullptr;
+    }
+
+    std::string EffectRegistry::canonicalName(const std::string& name) const
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        return canonicalLocked(name);
     }
 
     std::string EffectRegistry::getEffectFilePath(const std::string& name) const
     {
         std::lock_guard<std::mutex> lock(mutex);
-        auto effect = findEffect(name);
-        return effect ? (*effect)->filePath : "";
+        const EffectEntry* entry = findEntry(name);
+        return entry ? entry->info.filePath : "";
     }
 
     std::string EffectRegistry::getEffectType(const std::string& name) const
     {
         std::lock_guard<std::mutex> lock(mutex);
-        auto effect = findEffect(name);
-        return effect ? (*effect)->effectType : "";
+        const EffectEntry* entry = findEntry(name);
+        return entry ? entry->info.effectType : "";
     }
 
     bool EffectRegistry::hasEffectFailed(const std::string& name) const
     {
         std::lock_guard<std::mutex> lock(mutex);
-        auto effect = findEffect(name);
-        return effect ? (*effect)->hasFailed() : false;
+        const EffectEntry* entry = findEntry(name);
+        return entry ? entry->info.hasFailed() : false;
     }
 
     std::string EffectRegistry::getEffectError(const std::string& name) const
     {
         std::lock_guard<std::mutex> lock(mutex);
-        auto effect = findEffect(name);
-        return effect ? (*effect)->compileError : "";
+        const EffectEntry* entry = findEntry(name);
+        return entry ? entry->info.compileError : "";
     }
 
     void EffectRegistry::setEffectError(const std::string& name, const std::string& error)
     {
         std::lock_guard<std::mutex> lock(mutex);
-        if (auto effect = findEffect(name))
+        if (EffectEntry* entry = findEntry(name))
         {
-            (*effect)->compileError = error;
-            (*effect)->enabled = false;  // Disable failed effects
+            entry->info.compileError = error;
+            entry->info.enabled = false;  // Disable failed effects
         }
+    }
+
+    // --- mutation --------------------------------------------------------------------
+
+    // Settles the name of a freshly built entry and puts it in the list: in place of
+    // the entry `requestedName` already names (a re-parse, which keeps that entry's
+    // enabled state, ordinal and current values), or as a new one.
+    void EffectRegistry::install(EffectEntry&& entry, const std::string& requestedName)
+    {
+        EffectConfig& info = entry.info;
+        EffectEntry*  existing = findEntry(requestedName);
+
+        if (existing)
+        {
+            const EffectConfig& old = existing->info;
+            // the entry keeps its own identity across a re-parse; a technique it
+            // could not resolve before may resolve now
+            EffectId id = old.id;
+            if (id.technique.empty() && !id.isBuiltin())
+                id.technique = info.id.technique;
+            if (!id.technique.empty() && !old.id.technique.empty() && !info.techniqueNames.empty() &&
+                std::find(info.techniqueNames.begin(), info.techniqueNames.end(), id.technique) == info.techniqueNames.end())
+                info.compileError = info.compileError.empty() ? "technique '" + id.technique + "' not found in " + info.filePath
+                                                              : info.compileError;
+            info.id      = id;
+            info.name    = id.format();
+            info.enabled = old.enabled;
+            if (info.legacyName.empty())
+                info.legacyName = old.legacyName;
+            carryParameters(entry.parameters, existing->parameters);
+            for (auto& def : info.preprocessorDefs)
+                for (const auto& previous : old.preprocessorDefs)
+                    if (previous.name == def.name)
+                        def.value = previous.value;
+            entry.macroVersion = existing->macroVersion + 1;
+        }
+        else
+        {
+            EffectId id = info.id;
+            // a name that already was an id keeps its ordinal; a migrated one takes
+            // the smallest free copy number at or after the number it carried
+            id.ordinal = freeOrdinal(id, id.ordinal);
+            info.id    = id;
+            info.name  = id.format();
+            if (auto pending = pendingEnabled.find(requestedName); pending != pendingEnabled.end())
+            {
+                info.enabled = pending->second;
+                pendingEnabled.erase(pending);
+            }
+            else if (auto byName = pendingEnabled.find(info.name); byName != pendingEnabled.end())
+            {
+                info.enabled = byName->second;
+                pendingEnabled.erase(byName);
+            }
+        }
+
+        for (auto& def : info.preprocessorDefs)
+            def.effectName = info.name;
+        for (auto& param : entry.parameters)
+            param->effectName = info.name;
+
+        const std::string finalName = info.name;
+        if (existing)
+        {
+            const std::string oldName = existing->info.name;
+            retireParameters(std::move(existing->parameters));
+            *existing = std::move(entry);
+            if (oldName != finalName)
+            {
+                for (auto& alias : aliases)
+                    if (alias.second == oldName)
+                        alias.second = finalName;
+                aliases[oldName] = finalName;
+                std::replace(selectedEffects.begin(), selectedEffects.end(), oldName, finalName);
+            }
+        }
+        else
+            entries.push_back(std::move(entry));
+
+        if (requestedName != finalName)
+        {
+            aliases[requestedName] = finalName;
+            std::replace(selectedEffects.begin(), selectedEffects.end(), requestedName, finalName);
+        }
+        paramGeneration.fetch_add(1, std::memory_order_release);
     }
 
     void EffectRegistry::ensureEffect(const std::string& instanceName, const std::string& effectType)
     {
-        // If effectType not provided, assume instanceName is the effect type
-        std::string type = effectType.empty() ? instanceName : effectType;
-        if (isDlss5Effect(type, rootConfig))
-        {
-            std::lock_guard<std::mutex> lock(mutex);
-            if (!findEffect(instanceName))
-            {
-                effects.push_back(dlss5EffectConfig(instanceName, rootConfig));
-                paramGeneration.fetch_add(1, std::memory_order_release);
-            }
+        Config* root = rootConfig.load(std::memory_order_acquire);
+        if (!root)
             return;
-        }
 
-        // Do path lookup outside mutex (filesystem I/O can be slow)
-        const bool legacy = isLegacyBuiltInName(type) || isLegacyBuiltInName(instanceName);
-        std::string path = findEffectPath(type, rootConfig);
-        if (path.empty() || !std::filesystem::exists(path))
-        {
-            // a legacy built-in has nothing to resolve, so dropping it silently
-            // keeps the ghost out of the log
-            if (!legacy)
-                Logger::warn("EffectRegistry::ensureEffect: could not find effect file for: " + type);
-            return;
-        }
+        // The shader's timestamp is read before the lock: it is I/O. A DLSS5 entry
+        // has no file; the first build is all it needs.
+        const auto parsed = EffectId::parse(instanceName);
+        const std::string type = effectType.empty() ? instanceName : effectType;
+        const bool builtin = parsed ? parsed->isBuiltin() : (isDlss5Effect(type, root) || isDlss5Effect(instanceName, root));
 
-        // The file's timestamp is read before the lock: it is I/O
+        std::string path;
         std::error_code ec;
-        const auto currentModTime = std::filesystem::last_write_time(path, ec);
+        std::filesystem::file_time_type currentModTime{};
+        if (!builtin)
+        {
+            path = parsed ? findEffectPath(parsed->canonicalPath, root) : findEffectPath(type, root);
+            if (!path.empty())
+                currentModTime = std::filesystem::last_write_time(path, ec);
+        }
 
         uint32_t width;
         uint32_t height;
-        Config*  root;
         {
             std::lock_guard<std::mutex> lock(mutex);
-            auto existing = findEffect(instanceName);
+            const EffectEntry* existing = findEntry(instanceName);
             // File unchanged, keep existing
-            if (existing && (ec || currentModTime == (*existing)->fileModTime))
+            if (existing && (builtin || path.empty() || ec || currentModTime == existing->info.fileModTime))
                 return;
             width  = compileWidth;
             height = compileHeight;
-            root   = rootConfig;
         }
 
         // Parse and compile-check with no lock held, then swap the result in. Two
-        // threads can both get here for one name; the later insert wins.
-        EffectConfig built = buildReshadeEffect(instanceName, path, root, width, height);
+        // threads can both get here for one name; the later install replaces.
+        std::optional<EffectEntry> built = buildEntry(instanceName, effectType, root, width, height);
+        if (!built)
+            return;
 
         std::lock_guard<std::mutex> lock(mutex);
-        if (findEffect(instanceName))
+        if (findEntry(instanceName))
             Logger::info("EffectRegistry: shader file changed on disk, re-parsed: " + instanceName);
-        // the replaced config frees its params; readers must rebuild
-        effects.remove_if([&](const EffectConfig& e) { return e.name == instanceName; });
-        effects.push_back(std::move(built));
-        paramGeneration.fetch_add(1, std::memory_order_release);
+        install(std::move(*built), instanceName);
     }
 
     void EffectRegistry::removeEffect(const std::string& name)
@@ -564,27 +794,30 @@ namespace VkHook
         {
             std::lock_guard<std::mutex> lock(mutex);
 
-            // Log before removal for debugging
             Logger::debug("EffectRegistry: removing effect '" + name + "'");
 
-            size_t sizeBefore = effects.size();
-            
-            effects.remove_if(
-                [&](const EffectConfig& e) { return e.name == name; });
+            const std::string canonical = canonicalLocked(name);
+            bool removed = false;
+            for (auto it = entries.begin(); it != entries.end(); ++it)
+            {
+                if (it->info.name != canonical)
+                    continue;
+                retireParameters(std::move(it->parameters));
+                entries.erase(it);
+                removed = true;
+                break;
+            }
+            for (auto it = aliases.begin(); it != aliases.end();)
+                it = (it->first == name || it->second == canonical) ? aliases.erase(it) : std::next(it);
+            pendingEnabled.erase(name);
+            pendingEnabled.erase(canonical);
 
             paramGeneration.fetch_add(1, std::memory_order_release);
 
-            size_t sizeAfter = effects.size();
-            
-            if (sizeBefore != sizeAfter)
-            {
-                Logger::info("EffectRegistry: removed effect '" + name + "' (" + 
-                            std::to_string(sizeBefore - sizeAfter) + " instance(s))");
-            }
+            if (removed)
+                Logger::info("EffectRegistry: removed effect '" + name + "'");
             else
-            {
                 Logger::debug("EffectRegistry: effect '" + name + "' not found for removal");
-            }
         }
         catch (const std::exception& e)
         {
@@ -596,43 +829,133 @@ namespace VkHook
         }
     }
 
-    // Per-instance empty vector for returning when effect not found (avoids shared mutable static)
-    std::vector<PreprocessorDefinition>& EffectRegistry::getPreprocessorDefs(const std::string& effectName)
+    std::vector<PreprocessorDefinition> EffectRegistry::getPreprocessorDefs(const std::string& effectName) const
     {
         std::lock_guard<std::mutex> lock(mutex);
-        auto effect = findEffect(effectName);
-        if (effect)
-            return (*effect)->preprocessorDefs;
-        static thread_local std::vector<PreprocessorDefinition> emptyDefs;
-        emptyDefs.clear();
-        return emptyDefs;
-    }
-
-    const std::vector<PreprocessorDefinition>& EffectRegistry::getPreprocessorDefs(const std::string& effectName) const
-    {
-        std::lock_guard<std::mutex> lock(mutex);
-        auto effect = findEffect(effectName);
-        if (effect)
-            return (*effect)->preprocessorDefs;
-        static thread_local const std::vector<PreprocessorDefinition> emptyDefs;
-        return emptyDefs;
+        const EffectEntry* entry = findEntry(effectName);
+        return entry ? entry->info.preprocessorDefs : std::vector<PreprocessorDefinition>{};
     }
 
     void EffectRegistry::setPreprocessorDefValue(const std::string& effectName, const std::string& macroName, const std::string& value)
     {
-        std::lock_guard<std::mutex> lock(mutex);
-        auto effect = findEffect(effectName);
-        if (!effect)
-            return;
-
-        for (auto& def : (*effect)->preprocessorDefs)
+        EffectCompileSpec spec;
+        std::string       name;
+        uint64_t          version = 0;
+        uint32_t          width = 0;
+        uint32_t          height = 0;
+        std::vector<PreprocessorDefinition> defs;
         {
-            if (def.name == macroName)
-            {
-                def.value = value;
+            std::lock_guard<std::mutex> lock(mutex);
+            EffectEntry* entry = findEntry(effectName);
+            if (!entry)
                 return;
-            }
+
+            auto def = std::find_if(entry->info.preprocessorDefs.begin(), entry->info.preprocessorDefs.end(),
+                                    [&](const PreprocessorDefinition& d) { return d.name == macroName; });
+            if (def == entry->info.preprocessorDefs.end() || def->value == value)
+                return;
+            def->value = value;
+            if (entry->info.type != EffectType::ReShade || entry->info.filePath.empty())
+                return;
+
+            name       = entry->info.name;
+            version    = ++entry->macroVersion;
+            spec.id    = entry->info.id;
+            spec.path  = entry->info.filePath;
+            defs       = entry->info.preprocessorDefs;
+            width      = compileWidth;
+            height     = compileHeight;
+            spec.codegen = codegen;
         }
+        // the setup reads the shader-manager config: not under the registry lock
+        spec.setup = preprocessSetup(width, height, 8, std::move(defs));
+
+        {
+            std::lock_guard<std::mutex> lock(parseMutex);
+            ++parsesPending;
+        }
+        ChainCompileSpec chain;
+        chain.effects.push_back(std::move(spec));
+        // one channel per effect: a newer edit supersedes this effect's older re-parse
+        // and nobody else's
+        chain.channel = (std::hash<std::string>{}(name) << 1) | 1;
+        worker->submit(std::move(chain), [this, name, version](const ChainCompileResult& result) {
+            if (!result.cancelled && !result.effects.empty())
+                applyReparse(name, version, result.effects.front());
+            std::lock_guard<std::mutex> lock(parseMutex);
+            if (--parsesPending == 0)
+                parseIdle.notify_all();
+        });
+    }
+
+    // Runs on the compile worker.
+    void EffectRegistry::applyReparse(const std::string& name, uint64_t version, const EffectCompileResult& result)
+    {
+        std::string legacy;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            const EffectEntry* entry = findEntry(name);
+            if (!entry || entry->macroVersion != version)
+                return;
+            legacy = entry->info.legacyName;
+        }
+
+        std::vector<std::unique_ptr<EffectParam>> fresh;
+        if (result.module)
+            fresh = parametersFromModule(*result.module, name, rootConfig.load(std::memory_order_acquire), legacy);
+
+        std::lock_guard<std::mutex> lock(mutex);
+        EffectEntry* entry = findEntry(name);
+        if (!entry || entry->macroVersion != version)
+            return;  // edited again, replaced or removed while this compiled
+
+        entry->info.compileError = result.error;
+        if (!result.module)
+            return;  // keep the parameters the entry has: the macro value is what is broken
+
+        carryParameters(fresh, entry->parameters);
+        for (auto& param : fresh)
+            param->effectName = entry->info.name;
+        retireParameters(std::move(entry->parameters));
+        entry->parameters = std::move(fresh);
+        if (!result.techniqueNames.empty())
+            entry->info.techniqueNames = result.techniqueNames;
+        // a macro the new setting reads that was not seen before becomes editable
+        for (const auto& [macro, defaultValue] : result.usedMacros)
+        {
+            const bool known = std::any_of(entry->info.preprocessorDefs.begin(), entry->info.preprocessorDefs.end(),
+                                           [&](const PreprocessorDefinition& d) { return d.name == macro; });
+            if (known)
+                continue;
+            PreprocessorDefinition def;
+            def.name         = macro;
+            def.effectName   = entry->info.name;
+            def.defaultValue = defaultValue.empty() ? "1" : defaultValue;
+            def.value        = savedMacroValue(rootConfig.load(std::memory_order_acquire), entry->info.name,
+                                               entry->info.legacyName, macro);
+            if (def.value.empty())
+                def.value = def.defaultValue;
+            entry->info.preprocessorDefs.push_back(std::move(def));
+        }
+        paramGeneration.fetch_add(1, std::memory_order_release);
+    }
+
+    bool EffectRegistry::waitForParses(std::chrono::milliseconds timeout)
+    {
+        std::unique_lock<std::mutex> lock(parseMutex);
+        return parseIdle.wait_for(lock, timeout, [this] { return parsesPending == 0; });
+    }
+
+    // --- selection ---------------------------------------------------------------------
+
+    std::vector<std::string> EffectRegistry::getSelectedEffects() const
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        std::vector<std::string> snapshot;
+        snapshot.reserve(selectedEffects.size());
+        for (const auto& name : selectedEffects)
+            snapshot.push_back(canonicalLocked(name));
+        return snapshot;
     }
 
     void EffectRegistry::setSelectedEffects(const std::vector<std::string>& effects)
@@ -649,22 +972,20 @@ namespace VkHook
 
     void EffectRegistry::initializeSelectedEffectsFromConfig()
     {
-        {
-            std::lock_guard<std::mutex> lock(mutex);
-            if (initializedFromConfig || !rootConfig)
-                return;
-        }
+        Config* root = rootConfig.load(std::memory_order_acquire);
+        if (initializedFromConfig.load(std::memory_order_acquire) || !root)
+            return;
 
         // Read effects list from config
-        std::vector<std::string> configEffects = rootConfig->getOption<std::vector<std::string>>("effects", {});
-        std::vector<std::string> disabledEffects = rootConfig->getOption<std::vector<std::string>>("disabledEffects", {});
+        std::vector<std::string> configEffects = root->getOption<std::vector<std::string>>("effects", {});
+        std::vector<std::string> disabledEffects = root->getOption<std::vector<std::string>>("disabledEffects", {});
 
         // drop the removed built-ins and anything with no installed .fx, so a
         // stale config never seeds a ghost instance in the selected list
         configEffects.erase(
             std::remove_if(configEffects.begin(), configEffects.end(),
-                           [this](const std::string& name) {
-                               return resolveEffectPath(name, rootConfig).empty();
+                           [&](const std::string& name) {
+                               return resolveEffectPath(name, root).empty();
                            }),
             configEffects.end());
 
@@ -683,12 +1004,16 @@ namespace VkHook
 
         // Set enabled states (disabled if in disabledEffects list)
         for (const auto& effectName : configEffects)
+            setEffectEnabled(effectName, disabledSet.find(effectName) == disabledSet.end());
+
         {
-            bool enabled = (disabledSet.find(effectName) == disabledSet.end());
-            setEffectEnabled(effectName, enabled);
+            // legacy names in the list become the ids they migrated to
+            std::lock_guard<std::mutex> lock(mutex);
+            for (auto& name : selectedEffects)
+                name = canonicalLocked(name);
         }
 
-        initializedFromConfig = true;
+        initializedFromConfig.store(true, std::memory_order_release);
         Logger::debug("EffectRegistry: initialized " + std::to_string(configEffects.size()) +
                       " effects from config (" + std::to_string(disabledEffects.size()) + " disabled)");
     }

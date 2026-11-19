@@ -1,4 +1,5 @@
 #include "overlay_ui.hh"
+#include "effect_names.hh"
 #include "config_serializer.hh"
 #include "params/field_editor.hh"
 #include "logger.hh"
@@ -370,12 +371,13 @@ namespace VkHook
         {
             const EffectView& effect = chain[effectIndex];
             const std::string& effectName = effect.name;
+            const std::string label = effectLabel(snapshot->effects, effect);
             ImGui::PushID(effectName.c_str());
             ImGui::Button("Drag");
             if (ImGui::BeginDragDropSource())
             {
                 ImGui::SetDragDropPayload(kEffectReorderPayload, effectName.c_str(), effectName.size() + 1);
-                ImGui::TextUnformatted(effectName.c_str());
+                ImGui::TextUnformatted(label.c_str());
                 ImGui::EndDragDropSource();
             }
             ImGui::SameLine();
@@ -391,14 +393,14 @@ namespace VkHook
             bool open = false;
             if (splitParams)
             {
-                if (ImGui::Selectable(effectName.c_str(), paramsActiveEffect == effectName))
+                if (ImGui::Selectable(label.c_str(), paramsActiveEffect == effectName))
                 {
                     paramsActiveEffect = effectName;
                     selectParamsTab = true;
                 }
             }
             else
-                open = ImGui::CollapsingHeader(effectName.c_str());
+                open = ImGui::CollapsingHeader(label.c_str());
             if (effect.failed && ImGui::IsItemHovered())
                 ImGui::SetTooltip("%s", effect.error.c_str());
             if (ImGui::BeginDragDropTarget())
@@ -475,7 +477,7 @@ namespace VkHook
                     {
                         const ImGuiTabItemFlags flags = selectParamsTab && paramsActiveEffect == effect.name
                             ? ImGuiTabItemFlags_SetSelected : ImGuiTabItemFlags_None;
-                        if (ImGui::BeginTabItem(effect.name.c_str(), nullptr, flags))
+                        if (ImGui::BeginTabItem((effectLabel(snapshot->effects, effect) + "###" + effect.name).c_str(), nullptr, flags))
                         {
                             paramsActiveEffect = effect.name;
                             ImGui::PushID(effect.name.c_str());

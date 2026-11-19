@@ -1,2 +1,2 @@
 [VKHOOK]
-Effects=qUINT_mxao@qUINT_mxao.fx, Vibrance@Vibrance.fx
+Effects=qUINT_mxao.fx|MXAO, Vibrance.fx|Vibrance

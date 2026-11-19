@@ -469,6 +469,45 @@ Entries are written by the persistence queue, never on the present thread; a
 truncated or corrupt file is ignored and overwritten. The directory keeps at most
 1024 entries (oldest written first). It is safe to delete at any time.
 
+## effect ids, techniques and the registry
+
+The unit of the effect chain is a **technique**, not a `.fx` file. A file with
+several techniques exposes each one as its own chain entry, and an entry runs
+exactly its technique. An entry is named by an `EffectId`
+(`src/effects/effect_id.hh`): the shader file name, the technique, and a copy
+number. There is one text form, `file.fx|Technique` for the first copy and
+`file.fx|Technique|2` for the second; the built-in is `DLSS5` / `DLSS5||2`.
+That text is the registry key, the entry of `effects =` / `disabledEffects =`,
+the prefix of `<id>.<param>` and `<id>@<macro>` config keys, and the name in the
+sidecar's `Effects=` list.
+
+* **Presets.** Saving writes a ReShade `.ini` whose `Techniques=` is exactly the
+  enabled entries (`technique@file.fx`) and `TechniqueSorting=` every entry in
+  chain order. The hidden sidecar carries the ordered id list and the values
+  the shared `[file.fx]` section cannot hold. Importing a ReShade preset that
+  enables the second technique of a file runs the second technique.
+* **Old files keep loading.** Instance names (`Clarity`, `Clarity.2`, a
+  `name = file.fx` definition, `name@file.fx` in a sidecar) are migrated to the
+  id of the file's first technique, the technique the old runtime ran. Values
+  saved under the old name (`name.Param`, `name@MACRO`) are read as a fallback
+  until the next save rewrites them under the id.
+* **Shader lookup.** The registry owns a catalog (`shader_catalog.hh`): an index
+  of file names and stems built from `reshadeIncludePath` and the Shader
+  Manager's directories, rescanned when those change or when a lookup misses
+  (at most every 2 s). A lookup is an index probe, not a directory walk.
+* **Per device.** The registry, the catalog, the compile cache's memory level and
+  the compile worker belong to one `EffectRegistry`, so to one device. The
+  DLSS5 model cache is keyed by `VkDevice` and released at `vkDestroyDevice`.
+* **Compile worker.** `EffectCompiler` (`compiler.hh`) preprocesses, compiles and
+  looks up the cache for a whole chain on one worker thread with no layer lock:
+  `submit(spec)` returns a `std::shared_future<ChainCompileResult>` holding every
+  effect's module and its technique reflection. A newer `submit` on the same
+  channel cancels the older request. Building Vulkan objects from the result stays
+  on the present path.
+* **Macros.** Changing a macro value in the overlay re-parses that effect's
+  parameter list on the worker, so macro-gated uniforms appear (and vanish)
+  without a restart; values of parameters that survive are kept.
+
 ## diagnostic shaders
 
 These effects are used as diagnostics. Install them into
@@ -863,7 +902,9 @@ Each test is a small `main()` that prints `N checks, M failures` and exits non-z
 
 **config store** (`src/tests/config_store_test.cc`). Exercises `ConfigStore`, the one owner of `VkHook.conf`: defaults come from the settings schema, every write clamps through the schema, a save is a read-modify-write that keeps unknown keys, comments and CRLF, immutable snapshots, and the `schemaVersion` migrations (legacy layouts merged once, in order, stopping at a failed step, stamped only after they ran). Tells you the settings file, the overlay's settings controls and the hot-path reads cannot drift apart.
 
-**preset model** (`src/tests/preset_model_test.cc`, fixtures in `src/tests/fixtures/presets/`). Exercises the pure `parse` / `serialize` over an `EffectStack`: golden `.ini` and sidecar files, round trips, foreign ReShade presets, legacy `VkHookEffects` keys, dropped unknown techniques. `VKHOOK_UPDATE_GOLDEN=1` regenerates the goldens. Tells you the preset format is stable without touching Config or the registry.
+**preset model** (`src/tests/preset_model_test.cc`, fixtures in `src/tests/fixtures/presets/`). Exercises the pure `parse` / `serialize` over an `EffectStack` of `EffectId` entries: golden `.ini` and sidecar files, round trips, foreign ReShade presets (an enabled second technique stays the second), copies, multi-technique files, legacy instance names and `VkHookEffects` keys migrating to ids, dropped unknown techniques. `VKHOOK_UPDATE_GOLDEN=1` regenerates the goldens. Tells you the preset format is stable without touching Config or the registry.
+
+**effect id** (`src/effects/effect_id_test.cc`). The one text form of an `EffectId`: format/parse round trips, legacy names rejected, ReShade keys. **shader catalog** (`src/effects/shader_catalog_test.cc`). The file-name/stem/relative-path index: precedence, case, rescans. **effect registry** (`src/effects/effect_registry_test.cc`). The registry on `fixtures/compile/MultiTechnique.fx`: legacy-name migration with their saved values, technique entries, enabled state surviving a re-parse, macro edits re-parsing parameters through the worker, snapshots, two registries sharing nothing. **effect compiler** (`src/effects/compiler_test.cc`). The worker's results match the synchronous compile, the selected technique, per-channel cancellation, shutdown. **technique scan** (`src/effects/technique_scan_test.cc`). The text scan behind the add-effects page.
 
 **overlay commands** (`src/tests/overlay_commands_test.cc`). Exercises the overlay's `CommandQueue` (push order, draining, concurrent producers) and the value copy `SetParam` relies on. Tells you what the UI emits reaches the layer whole and in order.
 

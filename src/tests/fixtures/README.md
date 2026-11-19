@@ -53,3 +53,7 @@ using depth would silently turn the smoke test back into a pass-through run.
 
 `compile/` holds small first-party fixtures for `vkhook-reshade-compile-tests`
 (macro-gated uniforms, extent-derived defaults, a shader that must fail).
+`compile/MultiTechnique.fx` has three techniques (`SinglePass`, `DoublePass`,
+`TriplePass` with 1, 2 and 3 passes) and one user macro, `MULTI_EXTRA`, that
+gates the uniform `ExtraGain` (`BaseGain` is always present). It is the fixture
+for technique-level effects: `vkhook-compiler-tests` and the registry tests use it.

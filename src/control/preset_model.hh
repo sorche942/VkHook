@@ -3,13 +3,23 @@
 // The shader-preset model: an ordered stack of effect instances and the pure
 // functions that read it from / write it to ReShade-compatible preset text.
 //
-// A preset is two files. The `.ini` is a ReShade preset (Techniques,
-// TechniqueSorting, one `[file.fx]` section per shader file). The hidden
-// sidecar carries what ReShade has no place for: the exact ordered instance
-// stack (`[VKHOOK] Effects=`, `*` marks a disabled instance, `name@type` names
-// the shader of a renamed/duplicated instance) and per-instance values for
-// instances the shared `.ini` section cannot describe (disabled instances and
-// several instances of one shader file).
+// An instance is one TECHNIQUE of a shader file (see effects/effect_id.hh), so
+// a file with three techniques contributes up to three instances.
+//
+// A preset is two files. The `.ini` is a ReShade preset: `Techniques=` is
+// exactly the enabled instances (`technique@file.fx`), `TechniqueSorting=`
+// every instance in stack order, and one `[file.fx]` section per shader file
+// (written from the file's last enabled instance). The hidden sidecar carries
+// what ReShade has no place for: the exact ordered stack (`[VKHOOK] Effects=`,
+// each item an EffectId text, `*` marks a disabled instance) and the values of
+// instances the shared `.ini` section cannot describe (disabled instances,
+// extra copies and instances that disagree with their file's section), under
+// `[<EffectId text>]`.
+//
+// Reading accepts three generations: an owned sidecar of EffectId items; a
+// sidecar (or `VkHookEffects=` key) of legacy instance names (`name`,
+// `name@file.fx`, `name.2`), which migrate to ids; and a foreign ReShade
+// preset, where each enabled technique becomes one instance.
 //
 // Nothing here touches Config, the filesystem or global state.
 
@@ -18,6 +28,8 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include "effects/effect_id.hh"
 
 namespace VkHook
 {
@@ -36,28 +48,20 @@ namespace VkHook
         bool operator==(const PresetParam&) const = default;
     };
 
-    struct PresetTechnique
-    {
-        std::string name;
-        bool enabled = true;
-        bool operator==(const PresetTechnique&) const = default;
-    };
-
     struct EffectInstance
     {
-        std::string name;  // VkHook instance name: "Bloom", "Bloom.2"
-        std::string type;  // shader filename ("bloom.fx") or built-in id ("DLSS5")
+        EffectId id;
         bool enabled = true;
-        // every technique of the shader file, in preset order. empty means the
-        // file's default technique (the file stem). built-in types have none.
-        std::vector<PresetTechnique> techniques;
         std::vector<PresetParam> params;
         std::vector<PresetMacro> macros;  // per-instance preprocessor definitions
+
+        // The registry / config key of this instance.
+        std::string name() const { return id.format(); }
 
         // Sets a value by its Config-style key: "Strength" or "Tint[1]" (one
         // component of a vector, which creates or grows the vector).
         void setParam(std::string_view key, std::string value);
-        void setMacro(std::string_view name, std::string value);
+        void setMacro(std::string_view macroName, std::string value);
 
         bool operator==(const EffectInstance&) const = default;
     };
@@ -83,8 +87,8 @@ namespace VkHook
         std::string sidecar;
     };
 
-    // Maps an instance name, shader filename or built-in id to the resolved
-    // effect path ("DLSS5" for the built-in). Empty means unknown.
+    // Maps a shader filename, legacy instance name or built-in id to the
+    // resolved effect path ("DLSS5" for the built-in). Empty means unknown.
     using PathResolver = std::function<std::string(std::string_view)>;
 
     // Everything parse() refused or rewrote, for the caller to log.
@@ -97,13 +101,9 @@ namespace VkHook
     {
         // instances beyond this many are dropped (the caller's clamp)
         size_t maxEffects = static_cast<size_t>(-1);
-        // names of the instances the caller already has for a shader file
-        // (argument: lowercase filename); lets a foreign preset's techniques
-        // land on the game's own instance names. optional.
-        std::function<std::vector<std::string>(std::string_view)> configuredNames;
     };
 
-    // Entries naming no known instance are dropped and reported, never kept.
+    // Entries naming no installed shader are dropped and reported, never kept.
     EffectStack parse(std::string_view iniText, std::string_view sidecarText, const PathResolver& resolve,
                       Diagnostics* diagnostics = nullptr, const ParseOptions& options = {});
 
