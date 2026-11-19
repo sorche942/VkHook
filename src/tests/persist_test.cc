@@ -135,6 +135,50 @@ namespace
         queue.shutdown();  // idempotent
     }
 
+    // formal/PersistenceQueue.lean `drainAtLastInstance` then `issue` (sat trace
+    // restart_after_drain): the last vkDestroyInstance drains with waitForIdle() and does not stop
+    // the writer, so a later instance's jobs are accepted and run.
+    void test_drain_then_submit_then_drain()
+    {
+        PersistenceQueue queue;
+        std::atomic<int> ran{0};
+        std::vector<std::string> order;
+        std::mutex orderMutex;
+        const auto note = [&](const char* tag) {
+            std::lock_guard<std::mutex> lock(orderMutex);
+            order.push_back(tag);
+            ran++;
+            return true;
+        };
+
+        // instance 1: queued work lands at its last vkDestroyInstance
+        auto a = queue.other("a", [&] { return note("a"); });
+        auto b = queue.write("w", [&] { return note("w1"); });
+        queue.waitForIdle();
+        expect(ran.load() == 2, "the drain ran every queued job");
+        expect(a.wait_for(std::chrono::seconds(0)) == std::future_status::ready && a.get(),
+               "a drained job's future is already resolved true");
+        expect(b.get(), "a drained write resolves true");
+
+        // instance 2: the queue accepts again
+        auto c = queue.other("c", [&] { return note("c"); });
+        auto d = queue.write("w", [&] { return note("w2"); });
+        queue.waitForIdle();
+        expect(c.get() && d.get(), "jobs submitted after a drain run and resolve true");
+        expect(ran.load() == 4, "nothing was dropped across drain, submit, drain");
+        expect((order == std::vector<std::string>{"a", "w1", "c", "w2"}), "order is kept across the drain");
+
+        // a drain with nothing queued returns and changes nothing
+        queue.waitForIdle();
+        auto e = queue.other("e", [&] { return note("e"); });
+        expect(e.get(), "still accepting after an empty drain");
+
+        // only shutdown() rejects, matching `shutdown` in the model
+        queue.shutdown();
+        auto late = queue.other("late", [&] { return note("late"); });
+        expect(!late.get() && ran.load() == 5, "shutdown, not drain, rejects submits");
+    }
+
     void test_idle_is_safe_without_any_job()
     {
         PersistenceQueue queue;
@@ -238,6 +282,7 @@ int main()
     test_writes_to_one_key_coalesce_to_the_latest();
     test_write_does_not_coalesce_across_a_remove();
     test_submit_after_shutdown_is_rejected_and_shutdown_drains();
+    test_drain_then_submit_then_drain();
     test_idle_is_safe_without_any_job();
     test_concurrent_submits_all_run();
     test_queued_autosave_cannot_resurrect_a_deleted_preset();

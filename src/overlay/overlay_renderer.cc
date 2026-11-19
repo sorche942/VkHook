@@ -199,9 +199,10 @@ namespace VkHook
                 out.push_back(fence);
     }
 
-    VkCommandBuffer OverlayRenderer::record(uint32_t imageIndex, VkImageView imageView, uint32_t width, uint32_t height)
+    VkCommandBuffer OverlayRenderer::record(uint32_t imageIndex, VkImageView imageView, uint32_t width, uint32_t height,
+                                            InputSession* input)
     {
-        if (!ui.beginFrameCheck(framebufferFormat, renderPass))
+        if (!ui.beginFrameCheck(input, framebufferFormat, renderPass))
             return VK_NULL_HANDLE;
 
         // A swapchain with more images than this renderer was built for must not
@@ -271,7 +272,7 @@ namespace VkHook
 
         // The UI frame comes first: it can fail without leaving a half-recorded
         // command buffer behind.
-        ImDrawData* drawData = ui.buildFrame(width, height);
+        ImDrawData* drawData = ui.buildFrame(width, height, input);
         if (!drawData)
             return VK_NULL_HANDLE;
 

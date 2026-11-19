@@ -5,14 +5,9 @@
 #include "logical_device.hh"
 #include "logger.hh"
 #include "util.hh"
-#include "mouse_input.hh"
-#include "keyboard_input.hh"
-#include "input_blocker.hh"
+#include "input_session.hh"
 #include "config_serializer.hh"
 #include "persist.hh"
-#include "wayland_display.hh"
-#include "x11_display.hh"
-#include "wayland_input_common.hh"
 
 #include <algorithm>
 #include <atomic>
@@ -257,7 +252,6 @@ namespace VkHook
         // Restore UI preferences from persistent state
         if (pPersistentState)
             visible = pPersistentState->visible;
-        setInputBlocked(visible);
 
         initialized = true;
         Logger::info("ImGui overlay initialized");
@@ -308,7 +302,6 @@ namespace VkHook
     {
         visible = !visible;
         Logger::debug(std::string("overlay toggled ") + (visible ? "on" : "off"));
-        setInputBlocked(visible);
 
         saveToPersistentState();
     }
@@ -550,7 +543,7 @@ namespace VkHook
         return static_cast<uint64_t>(std::clamp(avgFrameTimeMs * 4.0f, 2.0f, 50.0f) * 1'000'000.0f);
     }
 
-    bool OverlayUi::beginFrameCheck(VkFormat format, VkRenderPass renderPass)
+    bool OverlayUi::beginFrameCheck(InputSession* input, VkFormat format, VkRenderPass renderPass)
     {
         // Informational notifications remain visible without capturing input.
         const bool hasToasts = hasPendingToasts();
@@ -558,11 +551,14 @@ namespace VkHook
         {
             // drop last frame's hitboxes, or they keep swallowing input.
             frameInputRects.clear();
-            setInputRects(nullptr, 0);
-            setInputBlocked(false);
-            setInputInteractive(false);
-            setOverlayWantsKeyboard(false);
-            setWaylandInputSurfaceRects(nullptr, 0);
+            if (input)
+            {
+                input->setRects(nullptr, 0);
+                input->setBlocked(false);
+                input->setInteractive(false);
+                input->setWantsKeyboard(false);
+                input->setWaylandCaptureRects(nullptr, 0);
+            }
             return false;
         }
         return ensureBackend(format, renderPass, 0);
@@ -574,7 +570,7 @@ namespace VkHook
         ImGui_ImplVulkan_RenderDrawData(drawData, commandBuffer);
     }
 
-    ImDrawData* OverlayUi::buildFrame(uint32_t width, uint32_t height)
+    ImDrawData* OverlayUi::buildFrame(uint32_t width, uint32_t height, InputSession* input)
     {
         ContextScope contextScope(imguiContext);
         snapshot = snapshots->load();
@@ -582,10 +578,13 @@ namespace VkHook
         // Publish input ownership before sampling this frame's pointer.
         frameInputRects.clear();
         const bool captureInput = visible && settings().overlayBlockInput;
-        setInputBlocked(captureInput);
-        setInputInteractive(captureInput);
         const InputRect captureRect{0.0f, 0.0f, static_cast<float>(width), static_cast<float>(height)};
-        setWaylandInputSurfaceRects(captureInput ? &captureRect : nullptr, captureInput ? 1 : 0);
+        if (input)
+        {
+            input->setBlocked(captureInput);
+            input->setInteractive(captureInput);
+            input->setWaylandCaptureRects(captureInput ? &captureRect : nullptr, captureInput ? 1 : 0);
+        }
 
         // Current resolution, for the VRAM estimate in settings
         currentWidth = width;
@@ -627,7 +626,7 @@ namespace VkHook
         }
 
         // Mouse input for interactivity
-        const MouseState mouse = getMouseState();
+        const MouseState mouse = input ? input->mouseState() : MouseState();
         io.MousePos = ImVec2(static_cast<float>(mouse.x), static_cast<float>(mouse.y));
 
         io.MouseDown[0] = mouse.leftButton;
@@ -638,29 +637,32 @@ namespace VkHook
         // supplied by the input backend instead; X11 hides its native cursor
         // while the independent pointer grab is active.
         io.MouseDrawCursor = visible
-            && (getSurfaceKind() == SurfaceKind::Wayland
-                || (captureInput && isX11() && x11PointerGrabActive()));
+            && input
+            && (input->kind() == SurfaceKind::Wayland
+                || (captureInput && input->kind() == SurfaceKind::X11 && input->x11PointerGrabActive()));
 
         auto publishOverlayInput = [&]() {
+            if (!input)
+                return;
             const bool blocking = visible && settings().overlayBlockInput;
             if (blocking)
-                setInputRects(frameInputRects.data(), static_cast<int>(frameInputRects.size()));
+                input->setRects(frameInputRects.data(), static_cast<int>(frameInputRects.size()));
             else
-                setInputRects(nullptr, 0);
+                input->setRects(nullptr, 0);
 
             // The input backend owns capture for the full open session, including
             // a drag that leaves the panel. Text/popups additionally request keys.
-            setInputInteractive(blocking);
-            setOverlayWantsKeyboard(blocking
+            input->setInteractive(blocking);
+            input->setWantsKeyboard(blocking
                 && (io.WantTextInput || ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopup)));
-            updatePointerPosition(static_cast<float>(mouse.x), static_cast<float>(mouse.y));
-            setInputBlocked(blocking);
-            setWaylandInputSurfaceRects(blocking ? &captureRect : nullptr, blocking ? 1 : 0);
+            input->updatePointerPosition(static_cast<float>(mouse.x), static_cast<float>(mouse.y));
+            input->setBlocked(blocking);
+            input->setWaylandCaptureRects(blocking ? &captureRect : nullptr, blocking ? 1 : 0);
         };
 
         // Navigation keys arrive as one-shot presses, so each one is sent as a
         // press and a release. Text arrives as UTF-8 and goes in whole.
-        const KeyboardState keyboard = getKeyboardState();
+        const KeyboardState keyboard = input ? input->keyboardState() : KeyboardState();
         io.AddKeyEvent(ImGuiMod_Shift, keyboard.shift);
         io.AddKeyEvent(ImGuiMod_Ctrl, keyboard.ctrl);
         io.AddKeyEvent(ImGuiMod_Alt, keyboard.alt);
@@ -685,7 +687,8 @@ namespace VkHook
         {
             renderToasts();
             // main window is gone; only toasts remain, so free the pointer.
-            setWaylandInputSurfaceRects(nullptr, 0);
+            if (input)
+                input->setWaylandCaptureRects(nullptr, 0);
             publishOverlayInput();
             ImGui::Render();
             return ImGui::GetDrawData();
@@ -735,7 +738,7 @@ namespace VkHook
                         if (openSubView == SubView_DepthBuffers)
                             renderDepthBuffersView();
                         else if (openSubView == SubView_Diagnostics)
-                            renderDiagnosticsView();
+                            renderDiagnosticsView(input);
                         else if (tab == 0)
                         {
                             if (inSelectionMode) renderAddEffectsView();

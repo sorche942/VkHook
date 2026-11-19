@@ -66,8 +66,9 @@
       ],
       "sources": [
         {
-          "type": "dir",
-          "path": "../.."
+          "type": "git",
+          "path": "../..",
+          "branch": "main"
         }
       ]
     }

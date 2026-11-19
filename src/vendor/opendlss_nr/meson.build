@@ -1,4 +1,5 @@
 # OpenDLSS-NR host code and unchanged GPU kernels. No demo, volk globals, or CUDA SDK.
+fs = import('fs')
 opendlss_nr_python = import('python').find_installation('python3')
 opendlss_nr_glslang = find_program('glslang', 'glslangValidator')
 opendlss_nr_include = include_directories('.')
@@ -26,16 +27,21 @@ foreach shader : ['fused_block32', 'gemm_f16', 'gemm_fp8', 'gemm_mlp', 'gemm_red
     )
 endforeach
 
-foreach shader : ['dlss5_preprocess', 'dlss5_composite', 'dlss5_reproject', 'dlss5_luma']
-    opendlss_nr_assets += custom_target(shader,
-        input : '../../effects/shaders/glsl' / (shader + '.comp'),
-        output : shader + '.spv',
-        command : [opendlss_nr_glslang, '-V', '--target-env', 'vulkan1.3',
-            '-I' + (meson.current_source_dir() / 'shaders'), '@INPUT@', '-o', '@OUTPUT@'],
-        depend_files : opendlss_nr_shader_includes + files(
-            '../../effects/shaders/glsl/dlss5_common.glsl', '../../effects/shaders/glsl/dlss5_debug.glsl'),
-        build_by_default : true, install : true, install_dir : opendlss_nr_install_shader_dir)
-endforeach
+# First-party compute shaders that share this output directory (so the build tree
+# has one shader dir). The parent build file lists them in
+# `opendlss_nr_extra_shaders` and their include files in `opendlss_nr_extra_shader_deps`
+# before it calls subdir(); this file knows nothing about where they live.
+if is_variable('opendlss_nr_extra_shaders')
+    foreach shader : opendlss_nr_extra_shaders
+        opendlss_nr_assets += custom_target(fs.stem(shader),
+            input : shader,
+            output : fs.stem(shader) + '.spv',
+            command : [opendlss_nr_glslang, '-V', '--target-env', 'vulkan1.3',
+                '-I' + (meson.current_source_dir() / 'shaders'), '@INPUT@', '-o', '@OUTPUT@'],
+            depend_files : opendlss_nr_shader_includes + opendlss_nr_extra_shader_deps,
+            build_by_default : true, install : true, install_dir : opendlss_nr_install_shader_dir)
+    endforeach
+endif
 
 opendlss_nr_ptx_sources = files(
     'ptx/block32_e4m3.py', 'ptx/ffn_e4m3.py', 'ptx/gemm2_e4m3.py', 'ptx/gemmt_e4m3.py',

@@ -1,13 +1,13 @@
 #ifndef VKHOOK_OVERLAY_CORE_SNAPSHOT_HH_INCLUDED
 #define VKHOOK_OVERLAY_CORE_SNAPSHOT_HH_INCLUDED
 
-#include <atomic>
 #include <cstdint>
 #include <map>
 #include <memory>
 #include <string>
 #include <vector>
 
+#include "layer/cow_slot.hh"
 #include "effects/effect_config.hh"
 #include "settings_schema.hh"
 #include "vulkan_include.hh"
@@ -117,11 +117,13 @@ namespace VkHook
     class CoreSnapshotSlot
     {
     public:
-        CoreSnapshotPtr load() const { return current.load(std::memory_order_acquire); }
-        void publish(CoreSnapshotPtr snapshot) { current.store(std::move(snapshot), std::memory_order_release); }
+        CoreSnapshotSlot() { current.store(std::make_shared<const CoreSnapshot>()); }
+        CoreSnapshotPtr load() const { return current.load(); }
+        void publish(CoreSnapshotPtr snapshot) { current.store(std::move(snapshot)); }
 
     private:
-        std::atomic<CoreSnapshotPtr> current{std::make_shared<const CoreSnapshot>()};
+        // CowSlot rather than std::atomic<shared_ptr>: libc++ before 21 lacks the latter.
+        CowSlot<CoreSnapshot> current;
     };
 } // namespace VkHook
 

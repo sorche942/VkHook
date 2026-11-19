@@ -8,6 +8,7 @@
 #include <string>
 #include <string_view>
 
+#include "layer/cow_slot.hh"
 #include "settings_schema.hh"
 
 namespace VkHook
@@ -29,13 +30,15 @@ namespace VkHook
         // The process's store: there is one VkHook.conf. Lock-free to read.
         static ConfigStore& instance();
 
+        ConfigStore() { current.store(std::make_shared<const AppSettings>()); }
+
         // Runs pending migrations (migrate.hh) once, then loads VkHook.conf.
         void initialize();
 
         bool isInitialized() const { return initialized.load(std::memory_order_acquire); }
 
         using Snapshot = std::shared_ptr<const AppSettings>;
-        Snapshot snapshot() const { return current.load(std::memory_order_acquire); }
+        Snapshot snapshot() const { return current.load(); }
 
         // Stores one setting by schema key and publishes. False for an unknown
         // key or a value of the wrong type.
@@ -89,12 +92,13 @@ namespace VkHook
         static bool writeSchemaVersion(int version);
 
     private:
-        void publishLocked() { current.store(std::make_shared<const AppSettings>(settings), std::memory_order_release); }
+        void publishLocked() { current.store(std::make_shared<const AppSettings>(settings)); }
 
         std::once_flag initOnce;
         mutable std::mutex mutex;  // guards `settings` and publication order
         AppSettings settings;
-        std::atomic<std::shared_ptr<const AppSettings>> current{std::make_shared<const AppSettings>()};
+        // CowSlot rather than std::atomic<shared_ptr>: libc++ before 21 lacks the latter.
+        CowSlot<AppSettings> current;
         std::atomic<bool> initialized{false};
     };
 } // namespace VkHook

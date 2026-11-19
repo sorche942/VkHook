@@ -42,8 +42,12 @@ To build:
 - meson ≥ 1.3, ninja, a C++20 compiler (clang or gcc)
 - Vulkan headers and `vk.xml`, glslangValidator ≥ 16.6 (for DLSS5)
 - X11 (`libX11`, `libXi`, `libXtst`), Wayland and `xkbcommon` development
-  headers
+  headers; GIO (`glib-2.0`) is optional and enables the file-chooser portal
+- `spirv-val` (optional; enables the SPIR-V validity tests)
 - [just](https://github.com/casey/just) (optional; used for the recipes below)
+
+To run the GUI smoke tests headless: `vkcube` (`vulkan-tools`), `xvfb`, `xauth`
+and a software Vulkan driver (lavapipe, in `mesa-vulkan-drivers`).
 
 Dear ImGui, the ReShade FX compiler and OpenDLSS-NR are vendored under
 `src/vendor/`.
@@ -69,11 +73,31 @@ Meson's `-Ddlss5=` option controls the DLSS5 backend:
 - `enabled`: required; the build fails without it.
 - `disabled`: left out.
 
+Other options (`meson_options.txt`): `with_so` and `with_json` choose what to
+install, `append_libdir_vkhook` installs into `<libdir>/vkhook`, and
+`layer_library_path` chooses what `VkHook.json` names as the library (below).
+
+The version number lives only in the root `VERSION` file. Meson reads it for the
+project version, the library's own version string and the manifest's
+`implementation_version`, and the Nix flake reads it too.
+
 ### 32-bit build
 
-32-bit Proton games need an i686 layer installed alongside the x86-64 one. The
-cross files in `packaging/meson-config/` set up that build; see
-[docs/WORKFLOWS.md](docs/WORKFLOWS.md).
+32-bit Proton games need an i686 layer installed alongside the x86-64 one:
+
+```bash
+scripts/build-i686.sh build-i686
+```
+
+It cross-compiles with Zig; see [docs/WORKFLOWS.md](docs/WORKFLOWS.md#building-the-i686-layer)
+for the dependencies and what is machine-specific.
+
+Both architectures install the same `VkHook.json`. An absolute `library_path` can
+name only one of them, so for a system install that carries both configure each
+build with `-Dlayer_library_path=soname`. The manifest then names the bare
+`libvkhook.so`, which each process's dynamic loader resolves to its own
+architecture's library (both libdirs must be on its search path, as `/usr/lib`
+and `/usr/lib32` are on multilib distributions).
 
 ### Flatpak
 
@@ -86,7 +110,9 @@ just flatpak-build
 
 This builds `packaging/flatpak/org.freedesktop.Platform.VulkanLayer.VkHook.json`
 with `flatpak-builder` and installs it for the current user from a local
-repository. Then expose the layer to the application:
+repository. The source is the repository's committed `main` branch (a `git`
+source), so commit what you want packaged; build directories and logs in the
+working tree are not copied. Then expose the layer to the application:
 
 ```bash
 flatpak override --user --env=ENABLE_VKHOOK=1 com.valvesoftware.Steam
@@ -120,14 +146,44 @@ Configuration, profiles, shaders and logs are stored in
 
 ## Development
 
-[docs/WORKFLOWS.md](docs/WORKFLOWS.md) covers:
+[AGENTS.md](AGENTS.md) is the contract for changing the code: invariants, the
+module map and the rules for the formal models. Read it before editing.
 
-- vendor subtree maintenance
-- DLSS5 model extraction and setup
-- the test suites and the GPU regression scripts
+Layout, briefly: `src/layer` (entry points), `src/present` (swapchain and
+present), `src/depth`, `src/control` (hotkeys, commands, presets), `src/effects`,
+`src/overlay`, `src/input`, `src/core` (config, logger, util). The config,
+logger, util and preset-model sources build once as the `vkhook_core` static
+library, which the layer and the tests link.
+
+```bash
+meson setup build --buildtype=debugoptimized
+meson compile -C build
+meson test -C build --print-errorlogs          # unit tests, no GPU
+meson test -C build --suite threaded           # the lock-hammering tests only
+```
+
+Further checks, all described in [docs/WORKFLOWS.md](docs/WORKFLOWS.md):
+
+- **Smoke and pixel tests** run the layer under `vkcube` and a purpose-built
+  test app, headless on Xvfb or on a GPU display, with optional Khronos
+  validation. The pixel test proves that what the screen shows is the frame the
+  game rendered.
+- **Sanitizers:** `-Db_sanitize=address,undefined` for the whole suite;
+  `-Db_sanitize=thread` with `--suite threaded`.
+- **i686:** `scripts/build-i686.sh`.
+- **Shader corpus:** `src/tests/test_reshade_shaders.py` compiles every shader of
+  the packages in `assets/EffectPackages.ini` at pinned commits.
+- **Formal models:** `just formal` (`cd formal && lake build`) checks the Lean 4 +
+  Veil models of the concurrency and lifetime protocols in `formal/`. It needs a
+  built Veil checkout, so CI does not run it; run it before merging a change to
+  a modeled protocol.
+- **CI** (`.github/workflows/ci.yml`): clang and gcc builds with tests, the shader
+  corpus, ASan+UBSan, TSan on the threaded tests, a smoke run on lavapipe with
+  validation plus the pixel test, an i686 build, and a `-Ddlss5=enabled` compile.
 
 The `Justfile` has recipes for running a local build against `vkcube` without
-installing it.
+installing it. Vendor subtree maintenance and DLSS5 model extraction are in
+WORKFLOWS.md too.
 
 ## License and attribution
 
