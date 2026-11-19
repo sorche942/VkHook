@@ -79,7 +79,7 @@ int main(int argc, char** argv)
     SetBoolFn     setInputInteractive     = (SetBoolFn) dlsym(lib, "_ZN6VkHook19setInputInteractiveEb");
     SetBoolFn     setOverlayWantsKeyboard = (SetBoolFn) dlsym(lib, "_ZN6VkHook23setOverlayWantsKeyboardEb");
     SetPosFn      updatePointerPosition   = (SetPosFn) dlsym(lib, "_ZN6VkHook21updatePointerPositionEff");
-    GetMouseFn getMouseState = (GetMouseFn) dlsym(lib, "_ZN6VkHook16getMouseStateX11Ev");
+    GetMouseFn getMouseState = (GetMouseFn) dlsym(lib, "_ZN6VkHook13getMouseStateEv");
     if (!initInputBlocker || !setX11Window || !setInputRects || !setInputBlocked
         || !setInputInteractive || !setOverlayWantsKeyboard || !updatePointerPosition || !getMouseState)
     {

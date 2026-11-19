@@ -2,20 +2,15 @@
 
 #include <cstdint>
 #include <string>
-#include "keyboard_input.hh"
 
 namespace VkHook
 {
+    // Stateless: XKB keysym lookup by name needs no seat.
     uint32_t convertToKeySymWayland(std::string key);
-    bool     isKeyPressedWayland(uint32_t ks);
-    KeyboardState getKeyboardStateWayland();
 
-    // Drops accumulated hotkey edges (see isKeyPressed in keyboard_input.hh)
-    void discardWaylandKeyPresses();
-
-    // Initialize Wayland keyboard from a captured wl_display
-    bool initWaylandKeyboard();
-
-    // Cleanup
+    // Destroys the Wayland objects of the current session (keyboard, pointer,
+    // seat, queue, capture surface), in dependency order. The next poll creates
+    // them again. A session's destructor does this too; once every caller
+    // creates and destroys sessions with its surface these two are redundant.
     void cleanupWaylandKeyboard();
 } // namespace VkHook

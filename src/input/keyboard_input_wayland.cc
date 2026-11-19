@@ -1,57 +1,70 @@
 #include "keyboard_input_wayland.hh"
 
 #include "c_resource.hh"
-#include "wayland_input_common.hh"
-#include "wayland_interpose.hh"
-#include "wayland_display.hh"
 #include "logger.hh"
+#include "wayland_input.hh"
+#include "wayland_interpose.hh"
 
 #include <wayland-client.h>
 #include <xkbcommon/xkbcommon.h>
 
-#include <cstring>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
-#include <unistd.h>
 #include <sys/mman.h>
-#include <unordered_set>
-#include <vector>
+#include <unistd.h>
 
 namespace VkHook
 {
-    // Keyboard-specific state (seat/queue come from wayland_input_common)
-    static wl_keyboard* wlKeyboard = nullptr;
+    struct WaylandKeyboardListeners
+    {
+        static void keymap(void* data, wl_keyboard* /*keyboard*/, uint32_t format, int32_t fd, uint32_t size)
+        {
+            static_cast<WaylandInput*>(data)->onKeymap(fd, format, size);
+        }
 
-    // XKB state for key translation
-    static xkb_context* xkbCtx = nullptr;
-    static xkb_keymap* xkbKeymap = nullptr;
-    static xkb_state* xkbState = nullptr;
+        static void enter(void* data, wl_keyboard* /*keyboard*/, uint32_t /*serial*/, wl_surface* surface,
+                          wl_array* /*keys*/)
+        {
+            static_cast<WaylandInput*>(data)->onKeyboardEnter(surface);
+        }
 
-    // Guards everything below: the dispatch-thread callbacks mutate it while the
-    // overlay thread reads and clears it. Never held across init/dispatch, which
-    // run those callbacks and would self-deadlock on this non-recursive lock.
-    static std::mutex keyboardMutex;
+        static void leave(void* data, wl_keyboard* /*keyboard*/, uint32_t /*serial*/, wl_surface* /*surface*/)
+        {
+            static_cast<WaylandInput*>(data)->onKeyboardLeave();
+        }
 
-    // Tracking pressed keys (Wayland keycodes)
-    static std::unordered_set<uint32_t> pressedKeys;
+        static void key(void* data, wl_keyboard* /*keyboard*/, uint32_t /*serial*/, uint32_t /*time*/,
+                        uint32_t key, uint32_t state)
+        {
+            static_cast<WaylandInput*>(data)->processKey(key, state);
+        }
 
-    // Accumulated key press events (keysyms) — survives press+release within a single frame
-    // so that isKeyPressedWayland can detect rapid key taps even when the key is already
-    // released by the time the check runs.
-    static std::unordered_set<uint32_t> keyPressEvents;
+        static void modifiers(void* data, wl_keyboard* /*keyboard*/, uint32_t /*serial*/, uint32_t depressed,
+                              uint32_t latched, uint32_t locked, uint32_t group)
+        {
+            static_cast<WaylandInput*>(data)->onModifiers(depressed, latched, locked, group);
+        }
 
-    // Accumulated state between getKeyboardState calls
-    static std::string typedCharsAccumulator;
-    static std::string lastKeyNameAccumulator;
-    static std::vector<NavKey> navAccumulator;
+        static void repeatInfo(void* /*data*/, wl_keyboard* /*keyboard*/, int32_t /*rate*/, int32_t /*delay*/)
+        {
+        }
 
-    static bool initialized = false;
+        static constexpr wl_keyboard_listener listener = {
+            .keymap = keymap,
+            .enter = enter,
+            .leave = leave,
+            .key = key,
+            .modifiers = modifiers,
+            .repeat_info = repeatInfo,
+        };
+    };
 
     // Process a key press event
-    static void processWaylandKey(uint32_t keycode, uint32_t state)
+    void WaylandInput::processKey(uint32_t keycode, uint32_t state)
     {
-        std::lock_guard<std::mutex> lock(keyboardMutex);
-        if (!xkbState)
+        std::lock_guard<std::mutex> lock(m_keyboardMutex);
+        if (!m_xkbState)
             return;
 
         // Wayland keycodes are evdev codes, XKB expects evdev + 8
@@ -59,19 +72,19 @@ namespace VkHook
 
         if (state == WL_KEYBOARD_KEY_STATE_RELEASED)
         {
-            pressedKeys.erase(keycode);
-            xkb_state_update_key(xkbState, xkbKeycode, XKB_KEY_UP);
+            m_pressedKeys.erase(keycode);
+            xkb_state_update_key(m_xkbState, xkbKeycode, XKB_KEY_UP);
             return;
         }
 
         // Key press
-        pressedKeys.insert(keycode);
-        xkb_state_update_key(xkbState, xkbKeycode, XKB_KEY_DOWN);
+        m_pressedKeys.insert(keycode);
+        xkb_state_update_key(m_xkbState, xkbKeycode, XKB_KEY_DOWN);
 
-        xkb_keysym_t keysym = xkb_state_key_get_one_sym(xkbState, xkbKeycode);
+        xkb_keysym_t keysym = xkb_state_key_get_one_sym(m_xkbState, xkbKeycode);
 
         // Track press event for edge detection (survives same-frame release)
-        keyPressEvents.insert((uint32_t)keysym);
+        m_keyPressEvents.insert((uint32_t)keysym);
 
         // Capture key name for keybind editor (skip modifiers)
         if (keysym != XKB_KEY_Shift_L && keysym != XKB_KEY_Shift_R &&
@@ -81,7 +94,7 @@ namespace VkHook
         {
             char nameBuf[64];
             if (xkb_keysym_get_name(keysym, nameBuf, sizeof(nameBuf)) > 0)
-                lastKeyNameAccumulator = nameBuf;
+                m_lastKeyName = nameBuf;
         }
 
         // Navigation and editing keys
@@ -105,32 +118,27 @@ namespace VkHook
         }
         if (nav != NavKey::Count)
         {
-            if (navAccumulator.size() < kMaxNavPresses)
-                navAccumulator.push_back(nav);
+            if (m_navPresses.size() < kMaxNavPresses)
+                m_navPresses.push_back(nav);
             return;
         }
 
         // Ctrl/Alt/Super chords are shortcuts, not text
-        if (xkb_state_mod_name_is_active(xkbState, XKB_MOD_NAME_CTRL, XKB_STATE_MODS_EFFECTIVE) > 0 ||
-            xkb_state_mod_name_is_active(xkbState, XKB_MOD_NAME_ALT, XKB_STATE_MODS_EFFECTIVE) > 0 ||
-            xkb_state_mod_name_is_active(xkbState, XKB_MOD_NAME_LOGO, XKB_STATE_MODS_EFFECTIVE) > 0)
+        if (xkb_state_mod_name_is_active(m_xkbState, XKB_MOD_NAME_CTRL, XKB_STATE_MODS_EFFECTIVE) > 0 ||
+            xkb_state_mod_name_is_active(m_xkbState, XKB_MOD_NAME_ALT, XKB_STATE_MODS_EFFECTIVE) > 0 ||
+            xkb_state_mod_name_is_active(m_xkbState, XKB_MOD_NAME_LOGO, XKB_STATE_MODS_EFFECTIVE) > 0)
             return;
 
-        const uint32_t cp = xkb_state_key_get_utf32(xkbState, xkbKeycode);
+        const uint32_t cp = xkb_state_key_get_utf32(m_xkbState, xkbKeycode);
         if (cp >= 0x20 && cp != 0x7F)
-            appendUtf8(typedCharsAccumulator, cp);
+            appendUtf8(m_typedChars, cp);
     }
 
-    // Wayland keyboard listener callbacks
-    static void keyboardKeymap(void* /*data*/, wl_keyboard* /*keyboard*/,
-                               uint32_t format, int32_t rawFd, uint32_t size)
+    void WaylandInput::onKeymap(int32_t rawFd, uint32_t format, uint32_t size)
     {
         // The compositor hands us ownership of this descriptor, and the protocol
         // requires us to close it on every path out of this callback. Owning it
-        // from the first statement means that holds by construction: the three
-        // manual close() calls this replaces each sat next to an early return,
-        // so any return added later would leak a descriptor straight out of the
-        // compositor's hands with nothing left to notice.
+        // from the first statement means that holds by construction.
         UniqueFd fd(rawFd);
 
         if (format != WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1)
@@ -144,166 +152,132 @@ namespace VkHook
         }
 
         // Clean up old keymap/state
-        std::lock_guard<std::mutex> lock(keyboardMutex);
-        if (xkbState)
+        std::lock_guard<std::mutex> lock(m_keyboardMutex);
+        if (m_xkbState)
         {
-            xkb_state_unref(xkbState);
-            xkbState = nullptr;
+            xkb_state_unref(m_xkbState);
+            m_xkbState = nullptr;
         }
-        if (xkbKeymap)
+        if (m_xkbKeymap)
         {
-            xkb_keymap_unref(xkbKeymap);
-            xkbKeymap = nullptr;
+            xkb_keymap_unref(m_xkbKeymap);
+            m_xkbKeymap = nullptr;
         }
 
-        xkbKeymap = xkb_keymap_new_from_string(xkbCtx, mapStr,
+        m_xkbKeymap = xkb_keymap_new_from_string(m_xkbContext, mapStr,
                                                  XKB_KEYMAP_FORMAT_TEXT_V1,
                                                  XKB_KEYMAP_COMPILE_NO_FLAGS);
         munmap(mapStr, size);
 
-        if (!xkbKeymap)
+        if (!m_xkbKeymap)
         {
             Logger::err("Wayland: failed to compile keymap");
             return;
         }
 
-        xkbState = xkb_state_new(xkbKeymap);
-        if (!xkbState)
+        m_xkbState = xkb_state_new(m_xkbKeymap);
+        if (!m_xkbState)
             Logger::err("Wayland: failed to create XKB state");
 
         Logger::debug("Wayland: keymap loaded");
     }
 
-    static void keyboardEnter(void* /*data*/, wl_keyboard* /*keyboard*/,
-                              uint32_t /*serial*/, wl_surface* /*surface*/,
-                              wl_array* /*keys*/)
+    void WaylandInput::onKeyboardEnter(wl_surface* surface)
     {
+        const uintptr_t parent = m_parentAtomic.load(std::memory_order_acquire);
+        m_keyboardFocus.store(reinterpret_cast<uintptr_t>(surface) == parent || surface == m_inputSurface,
+                              std::memory_order_release);
     }
 
-    static void keyboardLeave(void* /*data*/, wl_keyboard* /*keyboard*/,
-                              uint32_t /*serial*/, wl_surface* /*surface*/)
+    void WaylandInput::onKeyboardLeave()
     {
-        std::lock_guard<std::mutex> lock(keyboardMutex);
-        pressedKeys.clear();
-        keyPressEvents.clear();  // Prevent stale keysyms surviving focus loss
-        navAccumulator.clear();
+        m_keyboardFocus.store(false, std::memory_order_release);
+        std::lock_guard<std::mutex> lock(m_keyboardMutex);
+        m_pressedKeys.clear();
+        m_keyPressEvents.clear();  // Prevent stale keysyms surviving focus loss
+        m_navPresses.clear();
     }
 
-    static void keyboardKey(void* /*data*/, wl_keyboard* /*keyboard*/,
-                            uint32_t /*serial*/, uint32_t /*time*/,
-                            uint32_t key, uint32_t state)
+    void WaylandInput::onModifiers(uint32_t depressed, uint32_t latched, uint32_t locked, uint32_t group)
     {
-        processWaylandKey(key, state);
+        std::lock_guard<std::mutex> lock(m_keyboardMutex);
+        if (m_xkbState)
+            xkb_state_update_mask(m_xkbState, depressed, latched, locked, 0, 0, group);
     }
 
-    static void keyboardModifiers(void* /*data*/, wl_keyboard* /*keyboard*/,
-                                  uint32_t /*serial*/, uint32_t modsDepressed,
-                                  uint32_t modsLatched, uint32_t modsLocked,
-                                  uint32_t group)
+    // Called with the seat's keyboard capability available
+    void WaylandInput::bindKeyboard()
     {
-        std::lock_guard<std::mutex> lock(keyboardMutex);
-        if (xkbState)
-            xkb_state_update_mask(xkbState, modsDepressed, modsLatched, modsLocked, 0, 0, group);
-    }
-
-    static void keyboardRepeatInfo(void* /*data*/, wl_keyboard* /*keyboard*/,
-                                   int32_t /*rate*/, int32_t /*delay*/)
-    {
-    }
-
-    static const wl_keyboard_listener keyboardListener = {
-        .keymap = keyboardKeymap,
-        .enter = keyboardEnter,
-        .leave = keyboardLeave,
-        .key = keyboardKey,
-        .modifiers = keyboardModifiers,
-        .repeat_info = keyboardRepeatInfo,
-    };
-
-    // Called by shared seat listener when keyboard capability is available
-    static void bindKeyboard(wl_seat* seat)
-    {
-        if (wlKeyboard)
+        if (m_keyboard)
             return;
 
-        wlKeyboard = wl_seat_get_keyboard(seat);
+        m_keyboard = wl_seat_get_keyboard(m_seat);
+        m_releases.push([this] {
+            unregisterOverlayProxy(reinterpret_cast<wl_proxy*>(m_keyboard));
+            wl_keyboard_destroy(m_keyboard);
+            m_keyboard = nullptr;
+        });
         // Register as overlay proxy BEFORE add_listener so the interposition
         // layer passes this through without wrapping
-        registerOverlayProxy((wl_proxy*)wlKeyboard);
-        wl_keyboard_add_listener(wlKeyboard, &keyboardListener, nullptr);
+        registerOverlayProxy(reinterpret_cast<wl_proxy*>(m_keyboard));
+        wl_keyboard_add_listener(m_keyboard, &WaylandKeyboardListeners::listener, this);
         Logger::debug("Wayland: keyboard bound from shared seat");
     }
 
-    bool initWaylandKeyboard()
+    bool WaylandInput::initKeyboard()
     {
-        if (initialized)
-            return wlKeyboard != nullptr;
+        if (m_keyboard)
+            return true;
 
         // Create XKB context once and reuse across retries.
-        if (!xkbCtx)
+        if (!m_xkbContext)
         {
-            xkbCtx = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
-            if (!xkbCtx)
+            m_xkbContext = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+            if (!m_xkbContext)
             {
                 Logger::err("Wayland: failed to create XKB context");
                 return false;
             }
         }
 
-        // Register our callback before initializing shared resources
-        setKeyboardBindCallback(bindKeyboard);
-
         // Initialize shared seat/queue/registry (triggers seat capability callbacks)
-        if (!initWaylandInputCommon())
+        if (!ensureCommon(true, false))
             return false;
 
-        if (wlKeyboard)
-        {
-            initialized = true;
+        if (m_keyboard)
             Logger::info("Wayland keyboard input initialized");
-        }
         else
             Logger::warn("Wayland: no keyboard found on seat");
 
-        return wlKeyboard != nullptr;
+        return m_keyboard != nullptr;
     }
 
-    void cleanupWaylandKeyboard()
+    // The keyboard proxy itself is destroyed by the release stack; this drops
+    // the xkb state and everything accumulated from it.
+    void WaylandInput::releaseKeyboard()
     {
-        if (wlKeyboard)
+        std::lock_guard<std::mutex> lock(m_keyboardMutex);
+        if (m_xkbState)
         {
-            unregisterOverlayProxy((wl_proxy*)wlKeyboard);
-            wl_keyboard_destroy(wlKeyboard);
-            wlKeyboard = nullptr;
+            xkb_state_unref(m_xkbState);
+            m_xkbState = nullptr;
         }
+        if (m_xkbKeymap)
         {
-            std::lock_guard<std::mutex> lock(keyboardMutex);
-            if (xkbState)
-            {
-                xkb_state_unref(xkbState);
-                xkbState = nullptr;
-            }
-            if (xkbKeymap)
-            {
-                xkb_keymap_unref(xkbKeymap);
-                xkbKeymap = nullptr;
-            }
-            if (xkbCtx)
-            {
-                xkb_context_unref(xkbCtx);
-                xkbCtx = nullptr;
-            }
-
-            pressedKeys.clear();
-            keyPressEvents.clear();
-            typedCharsAccumulator.clear();
-            lastKeyNameAccumulator.clear();
-            navAccumulator.clear();
-            initialized = false;
+            xkb_keymap_unref(m_xkbKeymap);
+            m_xkbKeymap = nullptr;
+        }
+        if (m_xkbContext)
+        {
+            xkb_context_unref(m_xkbContext);
+            m_xkbContext = nullptr;
         }
 
-        // Clean up shared resources (idempotent)
-        cleanupWaylandInputCommon();
+        m_pressedKeys.clear();
+        m_keyPressEvents.clear();
+        m_typedChars.clear();
+        m_lastKeyName.clear();
+        m_navPresses.clear();
     }
 
     uint32_t convertToKeySymWayland(std::string key)
@@ -321,61 +295,63 @@ namespace VkHook
         return (uint32_t)sym;
     }
 
-    bool isKeyPressedWayland(uint32_t ks)
+    bool WaylandInput::isKeyPressed(uint32_t ks)
     {
-        if (!initWaylandKeyboard())
+        std::lock_guard<std::mutex> lifecycle(m_lifecycle);
+        if (!initKeyboard())
             return false;
 
-        dispatchWaylandInputEvents();
+        dispatchPending();
 
-        std::lock_guard<std::mutex> lock(keyboardMutex);
+        std::lock_guard<std::mutex> lock(m_keyboardMutex);
 
         // Check accumulated press events first — catches rapid taps where
         // press+release both arrive in the same dispatch cycle
-        if (keyPressEvents.count(ks))
+        if (m_keyPressEvents.count(ks))
         {
-            keyPressEvents.erase(ks);
+            m_keyPressEvents.erase(ks);
             return true;
         }
 
         // Check if any currently-held key maps to this keysym
-        if (!xkbKeymap)
+        if (!m_xkbKeymap)
             return false;
 
-        for (uint32_t keycode : pressedKeys)
+        for (uint32_t keycode : m_pressedKeys)
         {
             uint32_t xkbKeycode = keycode + 8;
-            xkb_keysym_t sym = xkb_state_key_get_one_sym(xkbState, xkbKeycode);
+            xkb_keysym_t sym = xkb_state_key_get_one_sym(m_xkbState, xkbKeycode);
             if ((uint32_t)sym == ks)
                 return true;
         }
         return false;
     }
 
-    void discardWaylandKeyPresses()
+    void WaylandInput::discardKeyPresses()
     {
-        std::lock_guard<std::mutex> lock(keyboardMutex);
-        keyPressEvents.clear();
+        std::lock_guard<std::mutex> lock(m_keyboardMutex);
+        m_keyPressEvents.clear();
     }
 
-    KeyboardState getKeyboardStateWayland()
+    KeyboardState WaylandInput::keyboardState()
     {
         KeyboardState state;
 
-        if (!initWaylandKeyboard())
+        std::lock_guard<std::mutex> lifecycle(m_lifecycle);
+        if (!initKeyboard())
             return state;
 
-        dispatchWaylandInputEvents();
+        dispatchPending();
 
-        std::lock_guard<std::mutex> lock(keyboardMutex);
+        std::lock_guard<std::mutex> lock(m_keyboardMutex);
 
-        state.typedChars = std::move(typedCharsAccumulator);
-        state.lastKeyName = std::move(lastKeyNameAccumulator);
-        state.navPresses = std::move(navAccumulator);
-        if (xkbState)
+        state.typedChars = std::move(m_typedChars);
+        state.lastKeyName = std::move(m_lastKeyName);
+        state.navPresses = std::move(m_navPresses);
+        if (m_xkbState)
         {
-            auto active = [](const char* name) {
-                return xkb_state_mod_name_is_active(xkbState, name, XKB_STATE_MODS_EFFECTIVE) > 0;
+            auto active = [this](const char* name) {
+                return xkb_state_mod_name_is_active(m_xkbState, name, XKB_STATE_MODS_EFFECTIVE) > 0;
             };
             state.shift = active(XKB_MOD_NAME_SHIFT);
             state.ctrl = active(XKB_MOD_NAME_CTRL);
@@ -383,9 +359,9 @@ namespace VkHook
             state.super = active(XKB_MOD_NAME_LOGO);
         }
 
-        typedCharsAccumulator.clear();
-        lastKeyNameAccumulator.clear();
-        navAccumulator.clear();
+        m_typedChars.clear();
+        m_lastKeyName.clear();
+        m_navPresses.clear();
 
         return state;
     }

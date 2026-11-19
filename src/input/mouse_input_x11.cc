@@ -1,49 +1,36 @@
-#include "mouse_input_x11.hh"
-
-#include "x11_display.hh"
+#include "x11_input.hh"
 
 #include <X11/Xlib.h>
 
 namespace VkHook
 {
-    static float scrollAccumulator = 0.0f;
-
-    static void onRawButton(uint32_t button, bool pressed)
+    void X11Input::onRawButton(uint32_t button, bool pressed)
     {
         if (!pressed)
             return;
         if (button == 4)
-            scrollAccumulator += 1.0f;   // wheel up
+            m_rawScroll += 1.0f;   // wheel up
         else if (button == 5)
-            scrollAccumulator -= 1.0f;   // wheel down
+            m_rawScroll -= 1.0f;   // wheel down
     }
 
-    static void ensureRegistered()
+    MouseState X11Input::mouseState()
     {
-        static bool done = false;
-        if (done)
-            return;
-        done = true;
-        setX11ButtonCallback(onRawButton);
-    }
-
-    MouseState getMouseStateX11()
-    {
+        std::lock_guard<std::recursive_mutex> lock(m_mutex);
         MouseState state;
-        Display* display = x11Display();
+        Display* display = connection();
         if (!display)
             return state;
 
-        ensureRegistered();
-        pumpX11Input();
-        if (x11CapturedMouseState(state))
+        pumpLocked();
+        if (capturedMouseState(state))
         {
-            scrollAccumulator = 0.0f;
+            m_rawScroll = 0.0f;
             return state;
         }
-        if (!x11GameFocused())
+        if (!gameFocusedLocked(m_window))
         {
-            scrollAccumulator = 0.0f;
+            m_rawScroll = 0.0f;
             return state;
         }
 
@@ -58,11 +45,11 @@ namespace VkHook
         // coordinates rather than root ones.
         int x = rootX;
         int y = rootY;
-        if (const unsigned long gameWindow = x11GameWindow())
+        if (m_window)
         {
             Window child = 0;
             int wx = 0, wy = 0;
-            if (XTranslateCoordinates(display, root, (Window)gameWindow, rootX, rootY, &wx, &wy, &child))
+            if (XTranslateCoordinates(display, root, (Window)m_window, rootX, rootY, &wx, &wy, &child))
             {
                 x = wx;
                 y = wy;
@@ -74,8 +61,8 @@ namespace VkHook
         state.leftButton = (mask & Button1Mask) != 0;
         state.middleButton = (mask & Button2Mask) != 0;
         state.rightButton = (mask & Button3Mask) != 0;
-        state.scrollDelta = scrollAccumulator;
-        scrollAccumulator = 0.0f;
+        state.scrollDelta = m_rawScroll;
+        m_rawScroll = 0.0f;
         return state;
     }
 } // namespace VkHook
