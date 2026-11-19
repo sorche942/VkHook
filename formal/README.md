@@ -27,7 +27,7 @@ statements see earlier assignments, so read a pre-state value into a `let` first
 | `PresentModes` | inv. 5 | `present/present` | C2: bypass presents the never-rendered real image; present with zero wait semaphores |
 | `ChainRebuild` | inv. 4, 6 | `present/swapchain`, `effects/graph`, `depth/tracker` | C4: layer objects recorded into app command buffers outlive their generation |
 | `SyncobjGate` | Wayland commit/present exclusion | `input/wayland_syncobj_gate` | H24: check-then-act; wait-budget escape |
-| `PersistenceQueue` | inv. 12 | `config/persist` | H18: sync delete resurrected by queued autosave; H16: own write seen as external |
+| `PersistenceQueue` | inv. 12; drain at the last `vkDestroyInstance` (queued jobs all run, writer not shut down) and restart (a new instance's jobs are accepted again) | `config/persist`, `layer/instance` | H18: sync delete resurrected by queued autosave; H16: own write seen as external |
 
 Each file's header comment maps every model action to the C++ function that performs it.
 
