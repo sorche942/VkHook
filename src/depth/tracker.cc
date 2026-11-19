@@ -949,7 +949,9 @@ namespace VkHook
         // the fused pass also reads the intermediate as an input attachment.
         VkImageUsageFlags resolveUsage = useShaderResolve
             ? (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT)
-            : (VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+            // the copy path writes the app's depth into this image (vkCmdCopyImage dst)
+            : (VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+               | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
         if (useMsaaTransform)
             resolveUsage |= VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
 
