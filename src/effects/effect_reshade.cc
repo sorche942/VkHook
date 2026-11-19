@@ -24,7 +24,8 @@
 #include "format.hh"
 #include "config_serializer.hh"
 #include "settings_manager.hh"
-#include "reshade/reshade_depth_macros.hh"
+#include "reshade_compile.hh"
+#include "texture_convert.hh"
 #include "compile_cache.hh"
 
 #include "util.hh"
@@ -53,18 +54,9 @@ namespace VkHook
 
         using StbiImage = std::unique_ptr<stbi_uc, StbiDeleter>;
 
-        bool hasFatalCompilerDiagnostics(const std::string& diagnostics)
-        {
-            return diagnostics.find(" error ") != std::string::npos ||
-                   diagnostics.find(": error ") != std::string::npos ||
-                   diagnostics.find("error X") != std::string::npos ||
-                   diagnostics.find("preprocessor error:") != std::string::npos;
-        }
-
         struct RuntimeCodegenPolicy
         {
             bool useLocalSizeId = true;
-            bool useUniformSpecConstants = true;
             bool emitDebugInfo = true;
             bool disableComputePipelineOptimization = false;
         };
@@ -91,7 +83,6 @@ namespace VkHook
         {
             RuntimeCodegenPolicy policy;
             const bool isNvidiaGpu = (logicalDevice != nullptr) && logicalDevice->isNvidiaGpu;
-            policy.useUniformSpecConstants = !isNvidiaGpu;
             policy.emitDebugInfo = !isNvidiaGpu;
             policy.disableComputePipelineOptimization = isNvidiaGpu;
 
@@ -100,185 +91,6 @@ namespace VkHook
             return policy;
         }
 
-        bool hasSourceAnnotation(const reshadefx::uniform_info& uniform)
-        {
-            return std::any_of(uniform.annotations.begin(), uniform.annotations.end(), [](const auto& a) {
-                return a.name == "source";
-            });
-        }
-
-        bool isReshadeUniformLogEnabled()
-        {
-            const char* value = std::getenv("VKHOOK_DEBUG_LOG_RESHADE_UI_UNIFORMS");
-            if (value == nullptr || *value == '\0')
-                return false;
-            return value[0] != '0';
-        }
-
-        bool shouldLogReshadeUiUniform(const std::string& effectName, const std::string& uniformName)
-        {
-            if (!isReshadeUniformLogEnabled() || effectName != "DisplayDepth")
-                return false;
-
-            return uniformName == "fUIFarPlane"
-                || uniformName == "iUIUpsideDown"
-                || uniformName == "iUIReversed"
-                || uniformName == "iUILogarithmic"
-                || uniformName == "iUIPresentType"
-                || uniformName == "bUIUsePreprocessorDefs";
-        }
-
-        std::string describeReshadeUiUniformValue(const EffectParam& param)
-        {
-            if (const auto* p = dynamic_cast<const FloatParam*>(&param))
-                return std::to_string(p->value);
-            if (const auto* p = dynamic_cast<const IntParam*>(&param))
-                return std::to_string(p->value);
-            if (const auto* p = dynamic_cast<const BoolParam*>(&param))
-                return p->value ? "true" : "false";
-            if (const auto* p = dynamic_cast<const FloatVecParam*>(&param))
-            {
-                std::string value = "[";
-                for (uint32_t i = 0; i < p->componentCount; ++i)
-                {
-                    if (i != 0)
-                        value += ", ";
-                    value += std::to_string(p->value[i]);
-                }
-                value += "]";
-                return value;
-            }
-            if (const auto* p = dynamic_cast<const IntVecParam*>(&param))
-            {
-                std::string value = "[";
-                for (uint32_t i = 0; i < p->componentCount; ++i)
-                {
-                    if (i != 0)
-                        value += ", ";
-                    value += std::to_string(p->value[i]);
-                }
-                value += "]";
-                return value;
-            }
-            if (const auto* p = dynamic_cast<const UintParam*>(&param))
-                return std::to_string(p->value);
-            if (const auto* p = dynamic_cast<const UintVecParam*>(&param))
-            {
-                std::string value = "[";
-                for (uint32_t i = 0; i < p->componentCount; ++i)
-                {
-                    if (i != 0)
-                        value += ", ";
-                    value += std::to_string(p->value[i]);
-                }
-                value += "]";
-                return value;
-            }
-            return "<unsupported>";
-        }
-
-        void maybeLogReshadeUiUniformWrite(const std::string& effectName, const std::string& uniformName, const EffectParam& param)
-        {
-            if (!shouldLogReshadeUiUniform(effectName, uniformName))
-                return;
-
-            static std::unordered_map<std::string, std::string> lastValues;
-            const std::string key = effectName + "::" + uniformName;
-            const std::string value = describeReshadeUiUniformValue(param);
-
-            auto it = lastValues.find(key);
-            if (it != lastValues.end() && it->second == value)
-                return;
-
-            lastValues[key] = value;
-            VKHOOK_LOG_DEBUG([&](std::string& s) {
-                s = "reshade ui uniform write: effect=" + effectName + " uniform=" + uniformName + " value=" + value;
-            });
-        }
-
-        void writeDefaultUniformValue(void* mappedBuffer, const reshadefx::uniform_info& uniform)
-        {
-            if (!mappedBuffer || uniform.offset == 0xFFFFFFFFu || !uniform.has_initializer_value)
-                return;
-
-            const uint32_t componentCount = std::min<uint32_t>(uniform.type.components(), 16u);
-            if (componentCount == 0)
-                return;
-
-            uint8_t* dst = static_cast<uint8_t*>(mappedBuffer) + uniform.offset;
-            switch (uniform.type.base)
-            {
-                case reshadefx::type::t_float:
-                    std::memcpy(dst, uniform.initializer_value.as_float, componentCount * sizeof(float));
-                    break;
-                case reshadefx::type::t_bool:
-                {
-                    VkBool32 values[16] = {};
-                    for (uint32_t i = 0; i < componentCount; ++i)
-                        values[i] = uniform.initializer_value.as_uint[i] != 0 ? VK_TRUE : VK_FALSE;
-                    std::memcpy(dst, values, componentCount * sizeof(VkBool32));
-                    break;
-                }
-                case reshadefx::type::t_int:
-                    std::memcpy(dst, uniform.initializer_value.as_int, componentCount * sizeof(int32_t));
-                    break;
-                case reshadefx::type::t_uint:
-                    std::memcpy(dst, uniform.initializer_value.as_uint, componentCount * sizeof(uint32_t));
-                    break;
-                default:
-                    break;
-            }
-        }
-
-        void writeConfiguredUniformValue(void* mappedBuffer, const reshadefx::uniform_info& uniform, const EffectParam* param)
-        {
-            if (!mappedBuffer || uniform.offset == 0xFFFFFFFFu || param == nullptr)
-                return;
-
-            uint8_t* dst = static_cast<uint8_t*>(mappedBuffer) + uniform.offset;
-
-            if (const auto* p = dynamic_cast<const FloatParam*>(param))
-            {
-                std::memcpy(dst, &p->value, sizeof(float));
-                return;
-            }
-            if (const auto* p = dynamic_cast<const FloatVecParam*>(param))
-            {
-                const uint32_t count = std::min<uint32_t>(p->componentCount, std::min<uint32_t>(uniform.type.components(), 4u));
-                std::memcpy(dst, p->value, count * sizeof(float));
-                return;
-            }
-            if (const auto* p = dynamic_cast<const IntParam*>(param))
-            {
-                const int32_t value = p->value;
-                std::memcpy(dst, &value, sizeof(int32_t));
-                return;
-            }
-            if (const auto* p = dynamic_cast<const IntVecParam*>(param))
-            {
-                const uint32_t count = std::min<uint32_t>(p->componentCount, std::min<uint32_t>(uniform.type.components(), 4u));
-                std::memcpy(dst, p->value, count * sizeof(int32_t));
-                return;
-            }
-            if (const auto* p = dynamic_cast<const UintParam*>(param))
-            {
-                const uint32_t value = p->value;
-                std::memcpy(dst, &value, sizeof(uint32_t));
-                return;
-            }
-            if (const auto* p = dynamic_cast<const UintVecParam*>(param))
-            {
-                const uint32_t count = std::min<uint32_t>(p->componentCount, std::min<uint32_t>(uniform.type.components(), 4u));
-                std::memcpy(dst, p->value, count * sizeof(uint32_t));
-                return;
-            }
-            if (const auto* p = dynamic_cast<const BoolParam*>(param))
-            {
-                const VkBool32 value = p->value ? VK_TRUE : VK_FALSE;
-                std::memcpy(dst, &value, sizeof(VkBool32));
-                return;
-            }
-        }
     }
 
     // One cache per device, shared by every effect so a chain reload reuses the
@@ -302,7 +114,41 @@ namespace VkHook
         return logicalDevice->pipelineCache;
     }
 
+    void ReshadeEffect::requireDescriptorSets(const std::vector<VkDescriptorSet>& sets, const char* what) const
+    {
+        if (sets.size() != inputImages.size() ||
+            std::any_of(sets.begin(), sets.end(), [](VkDescriptorSet set) { return set == VK_NULL_HANDLE; }))
+        {
+            throw EffectBuildError(std::string("descriptor set allocation failed (") + what + ") for effect '" + effectName + "'");
+        }
+    }
+
     ReshadeEffect::ReshadeEffect(LogicalDevice*       logicalDevice,
+                                 VkFormat             format,
+                                 VkExtent2D           imageExtent,
+                                 std::vector<VkImage> inputImages,
+                                 std::vector<VkImage> outputImages,
+                                 EffectRegistry*      effectRegistry,
+                                 ReshadeTexturePool& texturePool,
+                                 std::string          effectName,
+                                 std::string          effectPath,
+                                 std::vector<PreprocessorDefinition> customDefs)
+    {
+        try
+        {
+            build(logicalDevice, format, imageExtent, std::move(inputImages), std::move(outputImages), effectRegistry,
+                  texturePool, std::move(effectName), std::move(effectPath), std::move(customDefs));
+        }
+        catch (...)
+        {
+            // A throwing constructor never runs the destructor, so everything
+            // build() created before failing is released here instead.
+            releaseResources();
+            throw;
+        }
+    }
+
+    void ReshadeEffect::build(LogicalDevice*       logicalDevice,
                                  VkFormat             format,
                                  VkExtent2D           imageExtent,
                                  std::vector<VkImage> inputImages,
@@ -332,15 +178,26 @@ namespace VkHook
         Logger::debug("created input ImageViews");
         outputImageViewsSRGB  = createImageViews(logicalDevice, inputOutputFormatSRGB, outputImages);
         outputImageViewsUNORM = createImageViews(logicalDevice, inputOutputFormatUNORM, outputImages);
+        if (inputImageViewsSRGB.empty() || inputImageViewsUNORM.empty() || outputImageViewsSRGB.empty() || outputImageViewsUNORM.empty())
+            throw EffectBuildError("swapchain image view creation failed for effect '" + effectName + "'");
         Logger::debug("created ImageViews");
 
         createReshadeModule();
 
-        enumerateReshadeUniforms(module);
-
-        uniforms = createReshadeUniforms(module);
-
-        buildUiParamCache();
+        std::vector<std::string> zeroedSources;
+        uniforms = createReshadeUniforms(module, &zeroedSources);
+        for (auto& uniform : uniforms)
+        {
+            if (auto* depthUniform = dynamic_cast<DepthUniform*>(uniform.get()))
+                depthUniforms.push_back(depthUniform);
+        }
+        if (!zeroedSources.empty())
+        {
+            std::string list;
+            for (const auto& source : zeroedSources)
+                list += (list.empty() ? "" : ", ") + source;
+            Logger::warn("effect '" + effectName + "': uniform sources without live data are written as zeros: " + list);
+        }
 
         bufferSize = module.total_uniform_size;
         if (bufferSize)
@@ -351,13 +208,19 @@ namespace VkHook
                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                          stagingBuffer,
                          stagingBufferMemory);
+            if (stagingBuffer == VK_NULL_HANDLE || stagingBufferMemory == VK_NULL_HANDLE)
+                throw EffectBuildError("uniform buffer creation failed for effect '" + effectName + "'");
             // Persistent map — HOST_COHERENT means no flush needed, just write directly
             VkResult mapResult = logicalDevice->vkd.MapMemory(logicalDevice->device, stagingBufferMemory, 0, bufferSize, 0, &stagingBufferMapped);
             if (mapResult != VK_SUCCESS)
             {
-                Logger::err("MapMemory failed for effect " + effectName + ": " + std::to_string(mapResult));
                 stagingBufferMapped = nullptr;
+                throw EffectBuildError("MapMemory failed for effect '" + effectName + "': " + std::to_string(mapResult));
             }
+            // Fresh device memory holds whatever was there before; no uniform may
+            // read it, including ones nothing below writes.
+            std::memset(stagingBufferMapped, 0, bufferSize);
+            buildBindings();
         }
 
         stencilFormat = getStencilFormat(logicalDevice);
@@ -369,14 +232,22 @@ namespace VkHook
                                     VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
                                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
                                     textureMemory.back());
+        if (stencilImage == VK_NULL_HANDLE)
+            throw EffectBuildError("stencil image creation failed for effect '" + effectName + "'");
 
         stencilImageView = createSingleImageView(
             logicalDevice, stencilFormat, stencilImage, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
+        if (stencilImageView == VK_NULL_HANDLE)
+            throw EffectBuildError("stencil view creation failed for effect '" + effectName + "'");
 
         std::vector<std::vector<VkImageView>> imageViewVector;
 
         // Cache shader manager config once for all texture lookups (avoids re-reading per texture)
         ShaderManagerConfig cachedShaderMgrConfig = ConfigSerializer::loadShaderManagerConfig();
+
+        // Private textures belong to this instance of the effect file. Another
+        // file that declares the same name still shares it (ReShade semantics).
+        const uint32_t instanceOrdinal = texturePool.beginEffect(this->effectPath);
 
         for (size_t i = 0; i < module.textures.size(); i++)
         {
@@ -416,7 +287,7 @@ namespace VkHook
             {
                 const auto& info = module.textures[i];
                 auto texture = texturePool.acquire(info.unique_name, {
-                    textureExtent, convertReshadeFormat(info.format), info.levels, textureViewType});
+                    textureExtent, convertReshadeFormat(info.format), info.levels, textureViewType}, instanceOrdinal);
                 const std::string& name = info.unique_name;
                 textureImages[name] = {texture->image};
                 textureImageViewsUNORM[name].assign(inputImages.size(), texture->unormView);
@@ -442,6 +313,8 @@ namespace VkHook
                                  textureMemory.back(),
                                  module.textures[i].levels);
 
+                if (images.empty())
+                    throw EffectBuildError("image creation failed for texture '" + module.textures[i].unique_name + "' in effect '" + effectName + "'");
                 textureImages[module.textures[i].unique_name] = images;
 
                 std::vector<VkImageView> imageViews = createImageViews(logicalDevice,
@@ -451,6 +324,8 @@ namespace VkHook
                                                                        VK_IMAGE_ASPECT_COLOR_BIT,
                                                                        module.textures[i].levels);
 
+                if (imageViews.empty())
+                    throw EffectBuildError("view creation failed for texture '" + module.textures[i].unique_name + "' in effect '" + effectName + "'");
                 std::vector<VkImageView> imageViewsUNORM = std::vector<VkImageView>(inputImages.size(), imageViews[0]);
 
                 // File textures may have storage-capable UNORM views, but sRGB
@@ -463,6 +338,8 @@ namespace VkHook
                                               module.textures[i].levels,
                                               VK_IMAGE_USAGE_SAMPLED_BIT);
 
+                if (imageViews.empty())
+                    throw EffectBuildError("sRGB view creation failed for texture '" + module.textures[i].unique_name + "' in effect '" + effectName + "'");
                 std::vector<VkImageView> imageViewsSRGB = std::vector<VkImageView>(inputImages.size(), imageViews[0]);
 
                 textureImageViewsUNORM[module.textures[i].unique_name] = imageViewsUNORM;
@@ -474,23 +351,28 @@ namespace VkHook
                 textureFormatsUNORM[module.textures[i].unique_name] = convertToUNORM(convertReshadeFormat(module.textures[i].format));
                 textureFormatsSRGB[module.textures[i].unique_name]  = convertToSRGB(convertReshadeFormat(module.textures[i].format));
 
-                int desiredChannels;
-                switch (textureFormatsUNORM[module.textures[i].unique_name])
+                // Image files load only into formats with a decode path; anything
+                // else is rejected rather than uploaded from an under-sized buffer.
+                // A texture that cannot be loaded is cleared, never left undefined.
+                const std::string textureName = source->value.string_data;
+                auto leaveBlank = [&]() { changeImageLayout(logicalDevice, images, module.textures[i].levels); };
+                const auto fileLayout = textureFileLayout(textureFormatsUNORM[module.textures[i].unique_name]);
+                if (!fileLayout)
                 {
-                    case VK_FORMAT_R8_UNORM: desiredChannels = STBI_grey; break;
-                    case VK_FORMAT_R8G8_UNORM:
-                        desiredChannels = STBI_rgb_alpha; // TODO why doesn't STBI_grey_alpha work?
-                        break;
-                    case VK_FORMAT_R8G8B8A8_UNORM: desiredChannels = STBI_rgb_alpha; break;
-                    case VK_FORMAT_R8G8B8A8_SRGB: desiredChannels = STBI_rgb_alpha; break;
-                    default:
-                        Logger::err("unsupported texture upload format" + std::to_string(textureFormatsUNORM[module.textures[i].unique_name]));
-                        desiredChannels = 4;
-                        break;
+                    Logger::err("texture " + textureName + " cannot be loaded: no decode path for texture format " +
+                                std::to_string(textureFormatsUNORM[module.textures[i].unique_name]));
+                    leaveBlank();
+                    continue;
+                }
+                if (textureExtent.depth != 1)
+                {
+                    Logger::err("texture " + textureName + " cannot be loaded: image files fill 2D textures only");
+                    leaveBlank();
+                    continue;
                 }
 
+
                 // Search for texture in discovered paths from shader manager
-                std::string textureName = source->value.string_data;
                 std::string filePath;
                 UniqueCFile file;
 
@@ -542,61 +424,48 @@ namespace VkHook
                     }
                 }
 
-                StbiImage            pixels;
-                std::vector<stbi_uc> resizedPixels;
-                uint32_t             size;
-                int                  width  = 0;
-                int                  height = 0;
-
-                size = textureExtent.width * textureExtent.height * textureExtent.depth * desiredChannels;
-
                 if (!file)
                 {
                     Logger::err("couldn't open texture: " + textureName + " (searched " +
                         std::to_string(cachedShaderMgrConfig.discoveredTexturePaths.size()) + " directories, including recursive fallback)");
+                    leaveBlank();
                     continue;
                 }
 
+                StbiImage pixels;
+                int       width  = 0;
+                int       height = 0;
                 {
                     int channels = 0;
                     if (stbi_dds_test_file(file.get()))
-                        pixels.reset(stbi_dds_load_from_file(file.get(), &width, &height, &channels, desiredChannels));
+                        pixels.reset(stbi_dds_load_from_file(file.get(), &width, &height, &channels, fileLayout->decodeChannels));
                     else
-                        pixels.reset(stbi_load_from_file(file.get(), &width, &height, &channels, desiredChannels));
+                        pixels.reset(stbi_load_from_file(file.get(), &width, &height, &channels, fileLayout->decodeChannels));
                 }
 
-                if (!pixels)
+                if (!pixels || width <= 0 || height <= 0)
                 {
                     Logger::err("failed to decode texture: " + textureName + " from " + filePath);
+                    leaveBlank();
                     continue;
                 }
 
-                // change RGBA to RG
-                if (textureFormatsUNORM[module.textures[i].unique_name] == VK_FORMAT_R8G8_UNORM)
+                // Every size below comes from the format's real texel size and the
+                // extent actually uploaded, not from the file's size.
+                std::vector<uint8_t> upload;
+                std::string          convertError;
+                if (!convertDecodedTexture(pixels.get(), static_cast<uint32_t>(width), static_cast<uint32_t>(height),
+                                           *fileLayout, textureExtent.width, textureExtent.height, upload, convertError))
                 {
-                    // unique_ptr has no subscript operator, and the squeeze walks
-                    // the buffer in place, so the owned pointer is borrowed here
-                    stbi_uc* pixelData = pixels.get();
-                    uint32_t  pos      = 0;
-                    for (uint32_t j = 0; j < size; j += 4)
-                    {
-                        pixelData[pos] = pixelData[j];
-                        pos++;
-                        pixelData[pos] = pixelData[j + 1];
-                        pos++;
-                    }
-                    size /= 2;
-                    desiredChannels /= 2;
+                    Logger::err("cannot use texture " + textureName + " (" + std::to_string(width) + "x" +
+                                std::to_string(height) + ") as " + std::to_string(textureExtent.width) + "x" +
+                                std::to_string(textureExtent.height) + ": " + convertError);
+                    leaveBlank();
+                    continue;
                 }
 
-                if (static_cast<uint32_t>(width) != textureExtent.width || static_cast<uint32_t>(height) != textureExtent.height)
-                {
-                    resizedPixels.resize(size);
-                    stbir_resize_uint8(pixels.get(), width, height, 0, resizedPixels.data(), textureExtent.width, textureExtent.height, 0, desiredChannels);
-                }
-
-                uploadToImage(
-                    logicalDevice, images[0], textureExtent, size, resizedPixels.size() ? resizedPixels.data() : pixels.get(), module.textures[i].levels);
+                uploadToImage(logicalDevice, images[0], textureExtent, static_cast<uint32_t>(upload.size()), upload.data(),
+                              module.textures[i].levels);
             }
         }
 
@@ -617,6 +486,8 @@ namespace VkHook
             samplerFilters.push_back(info.filter);
 
             VkSampler sampler = createReshadeSampler(logicalDevice, info);
+            if (sampler == VK_NULL_HANDLE)
+                throw EffectBuildError("sampler creation failed for '" + info.unique_name + "' in effect '" + effectName + "'");
 
             samplers.push_back(sampler);
 
@@ -646,6 +517,8 @@ namespace VkHook
 
         imageSamplerDescriptorSetLayout = createImageSamplerDescriptorSetLayout(logicalDevice, samplerBindingTypes);
         uniformDescriptorSetLayout      = createUniformBufferDescriptorSetLayout(logicalDevice);
+        if (imageSamplerDescriptorSetLayout == VK_NULL_HANDLE || uniformDescriptorSetLayout == VK_NULL_HANDLE)
+            throw EffectBuildError("descriptor set layout creation failed for effect '" + effectName + "'");
         Logger::debug("created descriptorSetLayouts");
 
         VkDescriptorPoolSize sampledImagePoolSize;
@@ -667,11 +540,15 @@ namespace VkHook
             poolSizes.push_back(storageImagePoolSize);
 
         descriptorPool = createDescriptorPool(logicalDevice, poolSizes);
+        if (descriptorPool == VK_NULL_HANDLE)
+            throw EffectBuildError("descriptor pool creation failed for effect '" + effectName + "'");
         Logger::debug("created descriptorPool");
 
         std::vector<VkDescriptorSetLayout> descriptorSetLayouts = {uniformDescriptorSetLayout, imageSamplerDescriptorSetLayout};
 
         pipelineLayout = createGraphicsPipelineLayout(logicalDevice, descriptorSetLayouts);
+        if (pipelineLayout == VK_NULL_HANDLE)
+            throw EffectBuildError("pipeline layout creation failed for effect '" + effectName + "'");
 
         Logger::debug("created Pipeline layout");
 
@@ -688,11 +565,14 @@ namespace VkHook
         if (bufferSize)
         {
             bufferDescriptorSet = writeBufferDescriptorSet(logicalDevice, descriptorPool, uniformDescriptorSetLayout, stagingBuffer);
+            if (bufferDescriptorSet == VK_NULL_HANDLE)
+                throw EffectBuildError("uniform descriptor set allocation failed for effect '" + effectName + "'");
         }
 
         inputDescriptorSets =
             allocateAndWriteImageSamplerDescriptorSets(
                 logicalDevice, descriptorPool, imageSamplerDescriptorSetLayout, samplers, imageViewVector, samplerBindingTypes);
+        requireDescriptorSets(inputDescriptorSets, "input");
 
         // if there is only one outputWrite, we can directly write to outputImages
         if (outputWrites > 1)
@@ -705,16 +585,21 @@ namespace VkHook
                                             VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                                             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
                                             textureMemory.back());
+            if (backBufferImages.empty())
+                throw EffectBuildError("back buffer image creation failed for effect '" + effectName + "'");
             changeImageLayout(logicalDevice, backBufferImages, 1);
 
             backBufferImageViewsSRGB  = createImageViews(logicalDevice, inputOutputFormatSRGB, backBufferImages);
             backBufferImageViewsUNORM = createImageViews(logicalDevice, inputOutputFormatUNORM, backBufferImages);
+            if (backBufferImageViewsSRGB.empty() || backBufferImageViewsUNORM.empty())
+                throw EffectBuildError("back buffer view creation failed for effect '" + effectName + "'");
 
             std::replace(imageViewVector.begin(), imageViewVector.end(), inputImageViewsSRGB, backBufferImageViewsSRGB);
             std::replace(imageViewVector.begin(), imageViewVector.end(), inputImageViewsUNORM, backBufferImageViewsUNORM);
 
             backBufferDescriptorSets = allocateAndWriteImageSamplerDescriptorSets(
                 logicalDevice, descriptorPool, imageSamplerDescriptorSetLayout, samplers, imageViewVector, samplerBindingTypes);
+            requireDescriptorSets(backBufferDescriptorSets, "back buffer");
         }
         if (outputWrites > 2)
         {
@@ -722,124 +607,12 @@ namespace VkHook
             std::replace(imageViewVector.begin(), imageViewVector.end(), backBufferImageViewsUNORM, outputImageViewsUNORM);
             outputDescriptorSets = allocateAndWriteImageSamplerDescriptorSets(
                 logicalDevice, descriptorPool, imageSamplerDescriptorSetLayout, samplers, imageViewVector, samplerBindingTypes);
+            requireDescriptorSets(outputDescriptorSets, "output");
         }
 
         Logger::debug("after writing ImageSamplerDescriptorSets");
 
         bool firstTimeStencilAccess = true; // Used to clear the sttencil attachment on the first time
-
-        auto buildSpecializationData = [&]() {
-            std::vector<VkSpecializationMapEntry> specMapEntrys;
-            std::vector<char>                     specData;
-            const auto appendSpecValue = [&](uint32_t specId, const auto &value) {
-                const uint32_t offset = static_cast<uint32_t>(specData.size());
-                using ValueType = std::decay_t<decltype(value)>;
-                specData.resize(offset + sizeof(ValueType));
-                std::memcpy(specData.data() + offset, &value, sizeof(ValueType));
-                specMapEntrys.push_back({specId, offset, sizeof(ValueType)});
-            };
-
-            // Track vector component index (for float2/float3/float4 which are split into multiple spec constants)
-            std::string prevSpecName;
-            int vectorComponentIndex = 0;
-
-            for (uint32_t specId = 0; auto &opt : module.spec_constants)
-            {
-                if (!opt.name.empty())
-                {
-                    // Track which component of a vector this is (consecutive same-named spec constants = vector components)
-                    if (opt.name == prevSpecName)
-                    {
-                        vectorComponentIndex++;
-                    }
-                    else
-                    {
-                        vectorComponentIndex = 0;
-                        prevSpecName = opt.name;
-                    }
-
-                    // Get parameter from EffectRegistry (the single source of truth)
-                    auto paramOpt = effectRegistry->getParameter(effectName, opt.name);
-                    if (!paramOpt)
-                    {
-                        specId++;
-                        continue;
-                    }
-                    // unwrapped once: the switch below dynamic_casts it in every
-                    // branch, and the registry call keeps the optional at the edge
-                    EffectParam* param = *paramOpt;
-
-                    switch (opt.type.base)
-                    {
-                        case reshadefx::type::t_bool:
-                            if (auto* bp = dynamic_cast<BoolParam*>(param))
-                            {
-                                const VkBool32 value = bp->value ? VK_TRUE : VK_FALSE;
-                                appendSpecValue(specId, value);
-                            }
-                            break;
-                        case reshadefx::type::t_int:
-                            // Could be IntParam or IntVecParam (vector component)
-                            if (auto* ivp = dynamic_cast<IntVecParam*>(param))
-                            {
-                                if (vectorComponentIndex < static_cast<int>(ivp->componentCount))
-                                {
-                                    const int32_t value = ivp->value[vectorComponentIndex];
-                                    appendSpecValue(specId, value);
-                                }
-                            }
-                            else if (auto* ip = dynamic_cast<IntParam*>(param))
-                            {
-                                const int32_t value = ip->value;
-                                appendSpecValue(specId, value);
-                            }
-                            break;
-                        case reshadefx::type::t_uint:
-                            // Could be UintParam or UintVecParam (vector component)
-                            if (auto* uvp = dynamic_cast<UintVecParam*>(param))
-                            {
-                                if (vectorComponentIndex < static_cast<int>(uvp->componentCount))
-                                {
-                                    const uint32_t value = uvp->value[vectorComponentIndex];
-                                    appendSpecValue(specId, value);
-                                }
-                            }
-                            else if (auto* up = dynamic_cast<UintParam*>(param))
-                            {
-                                const uint32_t value = up->value;
-                                appendSpecValue(specId, value);
-                            }
-                            else if (auto* ip = dynamic_cast<IntParam*>(param))
-                            {
-                                const uint32_t value = static_cast<uint32_t>(ip->value);
-                                appendSpecValue(specId, value);
-                            }
-                            break;
-                        case reshadefx::type::t_float:
-                            // Could be FloatParam or FloatVecParam (vector component)
-                            if (auto* fvp = dynamic_cast<FloatVecParam*>(param))
-                            {
-                                if (vectorComponentIndex < static_cast<int>(fvp->componentCount))
-                                {
-                                    const float value = fvp->value[vectorComponentIndex];
-                                    appendSpecValue(specId, value);
-                                }
-                            }
-                            else if (auto* fp = dynamic_cast<FloatParam*>(param))
-                            {
-                                const float value = fp->value;
-                                appendSpecValue(specId, value);
-                            }
-                            break;
-                        default:
-                            break;
-                    }
-                }
-                specId++;
-            }
-
-            return std::make_pair(std::move(specMapEntrys), std::move(specData));
-        };
 
         for (bool outputToBackBuffer = outputWrites % 2 == 0; auto& pass : module.techniques[0].passes)
         {
@@ -849,22 +622,15 @@ namespace VkHook
                 std::string error = "unsupported pass type in effect '" + effectName +
                                     "': graphics pass requires vertex and fragment entry points";
                 Logger::err(error);
-                throw std::runtime_error(error);
-            }
-
-            auto [specMapEntrys, specData] = buildSpecializationData();
-            VkSpecializationInfo specializationInfo = {};
-            if (!specMapEntrys.empty())
-            {
-                specializationInfo = {.mapEntryCount = static_cast<uint32_t>(specMapEntrys.size()),
-                                      .pMapEntries   = specMapEntrys.data(),
-                                      .dataSize      = specData.size(),
-                                      .pData         = specData.data()};
+                throw EffectBuildError(error);
             }
 
             if (isComputePass)
             {
-                PassRuntime runtime = {};
+                // Registered before its pipeline exists, so a failure below
+                // still releases whatever this pass already created.
+                passRuntimes.emplace_back();
+                PassRuntime& runtime = passRuntimes.back();
                 runtime.isCompute = true;
                 runtime.dispatchSizeX = std::max(pass.dispatch_size_x, 1u);
                 runtime.dispatchSizeY = std::max(pass.dispatch_size_y, 1u);
@@ -875,7 +641,6 @@ namespace VkHook
                 shaderStageCreateInfoCompute.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
                 shaderStageCreateInfoCompute.module = shaderModule;
                 shaderStageCreateInfoCompute.pName  = pass.cs_entry_point.c_str();
-                shaderStageCreateInfoCompute.pSpecializationInfo = specMapEntrys.empty() ? nullptr : &specializationInfo;
 
                 VkComputePipelineCreateInfo computePipelineCreateInfo = {};
                 computePipelineCreateInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
@@ -893,14 +658,13 @@ namespace VkHook
                                         "', pass CS='" + pass.cs_entry_point +
                                         "', VkResult=" + std::to_string(computeResult);
                     Logger::err(error);
-                    throw std::runtime_error(error);
+                    throw EffectBuildError(error);
                 }
 
                 Logger::debug("compute  entry: " + pass.cs_entry_point +
                               " dispatch(" + std::to_string(runtime.dispatchSizeX) + ", " +
                               std::to_string(runtime.dispatchSizeY) + ", " +
                               std::to_string(runtime.dispatchSizeZ) + ")");
-                passRuntimes.push_back(std::move(runtime));
                 continue;
             }
 
@@ -1067,12 +831,22 @@ namespace VkHook
             renderPassCreateInfo.dependencyCount = 2;
             renderPassCreateInfo.pDependencies   = subpassDependencies;
 
-            PassRuntime runtime = {};
+            // Registered before any of its objects exist, so a failure below
+            // still releases whatever this pass already created.
+            passRuntimes.emplace_back();
+            PassRuntime& runtime = passRuntimes.back();
             runtime.renderTargets = std::move(currentRenderTargets);
             runtime.vertexCount = pass.num_vertices == 0 ? 3 : pass.num_vertices;
 
             VkResult result = logicalDevice->vkd.CreateRenderPass(logicalDevice->device, &renderPassCreateInfo, nullptr, &runtime.renderPass);
-            ASSERT_VULKAN(result);
+            if (result != VK_SUCCESS)
+            {
+                runtime.renderPass = VK_NULL_HANDLE;
+                const std::string error = "CreateRenderPass failed for effect '" + effectName +
+                                          "', VkResult=" + std::to_string(result);
+                Logger::err(error);
+                throw EffectBuildError(error);
+            }
 
             runtime.renderArea = scissor;
             runtime.clearValueCount = std::min<uint32_t>(attachmentDescriptions.size(), runtime.clearValues.size());
@@ -1094,20 +868,20 @@ namespace VkHook
                 runtime.framebuffers = createFramebuffers(logicalDevice, runtime.renderPass, scissor.extent, attachmentImageViews);
                 runtime.switchSamplers = false;
             }
+            if (runtime.framebuffers.empty())
+                throw EffectBuildError("framebuffer creation failed for effect '" + effectName + "'");
 
             VkPipelineShaderStageCreateInfo shaderStageCreateInfoVert = {};
             shaderStageCreateInfoVert.sType               = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
             shaderStageCreateInfoVert.stage               = VK_SHADER_STAGE_VERTEX_BIT;
             shaderStageCreateInfoVert.module              = shaderModule;
             shaderStageCreateInfoVert.pName               = pass.vs_entry_point.c_str();
-            shaderStageCreateInfoVert.pSpecializationInfo = specMapEntrys.empty() ? nullptr : &specializationInfo;
 
             VkPipelineShaderStageCreateInfo shaderStageCreateInfoFrag = {};
             shaderStageCreateInfoFrag.sType               = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
             shaderStageCreateInfoFrag.stage               = VK_SHADER_STAGE_FRAGMENT_BIT;
             shaderStageCreateInfoFrag.module              = shaderModule;
             shaderStageCreateInfoFrag.pName               = pass.ps_entry_point.c_str();
-            shaderStageCreateInfoFrag.pSpecializationInfo = specMapEntrys.empty() ? nullptr : &specializationInfo;
 
             VkPipelineShaderStageCreateInfo shaderStages[] = {shaderStageCreateInfoVert, shaderStageCreateInfoFrag};
 
@@ -1211,12 +985,11 @@ namespace VkHook
                                     "', pass VS='" + pass.vs_entry_point + "', PS='" + pass.ps_entry_point +
                                     "', VkResult=" + std::to_string(result);
                 Logger::err(error);
-                throw std::runtime_error(error);
+                throw EffectBuildError(error);
             }
 
             Logger::debug("vertex   entry: " + pass.vs_entry_point);
             Logger::debug("fragment entry: " + pass.ps_entry_point);
-            passRuntimes.push_back(std::move(runtime));
         }
         // Info, not debug, and deliberately here rather than in the destructor:
         // this line is how the smoke test proves an effect was really built
@@ -1232,52 +1005,32 @@ namespace VkHook
 
     // Resolving the registry param per frame meant taking the registry mutex and
     // scanning effect then parameter name lists for every uniform of every
-    // enabled effect. the registry bumps its generation when a reparse frees
-    // params, so cache once here and rebuild when that generation moves.
-    void ReshadeEffect::buildUiParamCache()
+    // enabled effect. The registry bumps its generation when a reparse frees
+    // params, so resolve once here and rebuild when that generation moves.
+    void ReshadeEffect::buildBindings()
     {
-        uiParamCache.clear();
-        for (const auto& uniform : module.uniforms)
-        {
-            if (uniform.name.empty())
-                continue;
-            auto paramOpt = effectRegistry->getParameter(effectName, uniform.name);
-            uiParamCache[uniform.name] = paramOpt ? *paramOpt : nullptr;
-        }
-        uiParamCacheGeneration = effectRegistry->parameterGeneration();
+        // Read the generation first: a bump that races this rebuild is then seen
+        // by the next update and rebuilds again.
+        bindingsGeneration = effectRegistry->parameterGeneration();
+        uniformBindings = buildUniformBindings(
+            module, bufferSize, stagingBufferMapped, [this](const std::string& uniformName) -> const EffectParam* {
+                auto paramOpt = effectRegistry->getParameter(effectName, uniformName);
+                return paramOpt ? *paramOpt : nullptr;
+            });
     }
 
     void ReshadeEffect::updateEffect()
     {
-        if (effectRegistry->parameterGeneration() != uiParamCacheGeneration)
-            buildUiParamCache();
+        if (!stagingBufferMapped)
+            return;
 
-        if (stagingBufferMapped)
-        {
-            for (const auto& uniform : module.uniforms)
-            {
-                if (hasSourceAnnotation(uniform))
-                    continue;
-                if (uniform.name.empty())
-                    continue;
+        if (effectRegistry->parameterGeneration() != bindingsGeneration)
+            buildBindings();
 
-                EffectParam* registryParam = nullptr;
-                if (auto it = uiParamCache.find(uniform.name); it != uiParamCache.end())
-                    registryParam = it->second;
-
-                if (registryParam)
-                {
-                    maybeLogReshadeUiUniformWrite(effectName, uniform.name, *registryParam);
-                    writeConfiguredUniformValue(stagingBufferMapped, uniform, registryParam);
-                }
-                else
-                    writeDefaultUniformValue(stagingBufferMapped, uniform);
-            }
-
-            for (auto& uniform : uniforms)
-                uniform->update(stagingBufferMapped);
-            // HOST_COHERENT: no flush needed, GPU sees writes automatically
-        }
+        applyUniformBindings(uniformBindings, stagingBufferMapped);
+        for (auto& uniform : uniforms)
+            uniform->update(stagingBufferMapped);
+        // HOST_COHERENT: no flush needed, GPU sees writes automatically
     }
 
     void ReshadeEffect::useDepthImage(uint32_t imageIndex, VkImageView depthImageView, VkImageLayout depthImageLayout)
@@ -1286,13 +1039,9 @@ namespace VkHook
             return;
 
         // Update DepthUniforms so bufready_depth reports correctly
-        bool hasDepth = (depthImageView != VK_NULL_HANDLE);
-        for (auto& uniform : uniforms)
-        {
-            auto* depthUniform = dynamic_cast<DepthUniform*>(uniform.get());
-            if (depthUniform)
-                depthUniform->setDepthAvailable(hasDepth);
-        }
+        const bool hasDepth = (depthImageView != VK_NULL_HANDLE);
+        for (DepthUniform* depthUniform : depthUniforms)
+            depthUniform->setDepthAvailable(hasDepth);
 
         std::vector<std::string> depthTextureNames;
 
@@ -1603,156 +1352,6 @@ namespace VkHook
         logicalDevice->vkd.CmdPipelineBarrier(commandBuffer, shaderStages, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &secondBarrier);
     }
 
-    std::vector<std::unique_ptr<EffectParam>> ReshadeEffect::getParameters() const
-    {
-        std::vector<std::unique_ptr<EffectParam>> params;
-
-        // Helper lambdas
-        auto findAnnotation = [](const auto& annotations, const std::string& name) {
-            return std::find_if(annotations.begin(), annotations.end(),
-                [&name](const auto& a) { return a.name == name; });
-        };
-
-        auto getAnnotationFloat = [](const auto& annotation) {
-            return annotation.type.is_floating_point()
-                ? annotation.value.as_float[0]
-                : static_cast<float>(annotation.value.as_int[0]);
-        };
-
-        auto getAnnotationInt = [](const auto& annotation) {
-            return annotation.type.is_integral()
-                ? annotation.value.as_int[0]
-                : static_cast<int>(annotation.value.as_float[0]);
-        };
-
-        auto parseNullSeparatedString = [](const std::string& str) {
-            std::vector<std::string> items;
-            size_t start = 0;
-            for (size_t i = 0; i <= str.size(); i++)
-            {
-                if (i == str.size() || str[i] == '\0')
-                {
-                    if (i > start)
-                        items.push_back(str.substr(start, i - start));
-                    start = i + 1;
-                }
-            }
-            return items;
-        };
-
-        for (const auto& spec : module.spec_constants)
-        {
-            // Skip uniforms with "source" annotation (auto-updated like frametime)
-            if (findAnnotation(spec.annotations, "source") != spec.annotations.end())
-                continue;
-
-            // Skip if no name (can't be configured)
-            if (spec.name.empty())
-                continue;
-            // Skip VkHook-internal runtime specialization constants.
-            if (spec.name.rfind("__vkhook_", 0) == 0)
-                continue;
-
-            // Get common annotations
-            auto labelIt = findAnnotation(spec.annotations, "ui_label");
-            std::string label = (labelIt != spec.annotations.end()) ? labelIt->value.string_data : spec.name;
-
-            auto tooltipIt = findAnnotation(spec.annotations, "ui_tooltip");
-            std::string tooltip = (tooltipIt != spec.annotations.end()) ? tooltipIt->value.string_data : "";
-
-            auto typeIt = findAnnotation(spec.annotations, "ui_type");
-            std::string uiType = (typeIt != spec.annotations.end()) ? typeIt->value.string_data : "";
-
-            // Get current value from EffectRegistry (the single source of truth)
-            // unwrapped once here because the branches below dynamic_cast it
-            // repeatedly; the registry call itself still returns an optional, so
-            // "no such parameter" stays in the type at the boundary
-            auto registryParamOpt = effectRegistry->getParameter(effectName, spec.name);
-            EffectParam* registryParam = registryParamOpt ? *registryParamOpt : nullptr;
-
-            // Create appropriate subclass based on spec type
-            if (spec.type.is_floating_point())
-            {
-                auto p = std::make_unique<FloatParam>();
-                p->effectName = effectName;
-                p->name = spec.name;
-                p->label = label;
-                p->tooltip = tooltip;
-                p->uiType = uiType;
-                p->defaultValue = spec.initializer_value.as_float[0];
-                // Get value from registry if available
-                if (auto* rp = dynamic_cast<FloatParam*>(registryParam))
-                    p->value = rp->value;
-                else
-                    p->value = p->defaultValue;
-
-                auto minIt = findAnnotation(spec.annotations, "ui_min");
-                auto maxIt = findAnnotation(spec.annotations, "ui_max");
-                if (minIt != spec.annotations.end())
-                    p->minValue = getAnnotationFloat(*minIt);
-                if (maxIt != spec.annotations.end())
-                    p->maxValue = getAnnotationFloat(*maxIt);
-
-                auto stepIt = findAnnotation(spec.annotations, "ui_step");
-                if (stepIt != spec.annotations.end())
-                    p->step = getAnnotationFloat(*stepIt);
-
-                params.push_back(std::move(p));
-            }
-            else if (spec.type.is_boolean())
-            {
-                auto p = std::make_unique<BoolParam>();
-                p->effectName = effectName;
-                p->name = spec.name;
-                p->label = label;
-                p->tooltip = tooltip;
-                p->uiType = uiType;
-                p->defaultValue = (spec.initializer_value.as_uint[0] != 0);
-                // Get value from registry if available
-                if (auto* rp = dynamic_cast<BoolParam*>(registryParam))
-                    p->value = rp->value;
-                else
-                    p->value = p->defaultValue;
-
-                params.push_back(std::move(p));
-            }
-            else if (spec.type.is_integral())
-            {
-                auto p = std::make_unique<IntParam>();
-                p->effectName = effectName;
-                p->name = spec.name;
-                p->label = label;
-                p->tooltip = tooltip;
-                p->uiType = uiType;
-                p->defaultValue = spec.initializer_value.as_int[0];
-                // Get value from registry if available
-                if (auto* rp = dynamic_cast<IntParam*>(registryParam))
-                    p->value = rp->value;
-                else
-                    p->value = p->defaultValue;
-
-                auto minIt = findAnnotation(spec.annotations, "ui_min");
-                auto maxIt = findAnnotation(spec.annotations, "ui_max");
-                if (minIt != spec.annotations.end())
-                    p->minValue = getAnnotationInt(*minIt);
-                if (maxIt != spec.annotations.end())
-                    p->maxValue = getAnnotationInt(*maxIt);
-
-                auto stepIt = findAnnotation(spec.annotations, "ui_step");
-                if (stepIt != spec.annotations.end())
-                    p->step = getAnnotationFloat(*stepIt);
-
-                auto itemsIt = findAnnotation(spec.annotations, "ui_items");
-                if (itemsIt != spec.annotations.end())
-                    p->items = parseNullSeparatedString(itemsIt->value.string_data);
-
-                params.push_back(std::move(p));
-            }
-        }
-
-        return params;
-    }
-
     // Registration order within a phase is the reverse of release order, because
     // the queue releases equal phases newest-first. So a dependent object has to be
     // registered AFTER the thing it depends on: images before their views, memory
@@ -1927,117 +1526,13 @@ namespace VkHook
 
     void ReshadeEffect::createReshadeModule()
     {
-        reshadefx::preprocessor preprocessor;
-        preprocessor.add_macro_definition("__RESHADE__", std::to_string(INT_MAX));
-        preprocessor.add_macro_definition("__RESHADE_PERFORMANCE_MODE__", "1");
-        preprocessor.add_macro_definition("__RENDERER__", "0x20000");
-        // TODO add more macros
-
-        preprocessor.add_macro_definition("BUFFER_WIDTH", std::to_string(imageExtent.width));
-        preprocessor.add_macro_definition("BUFFER_HEIGHT", std::to_string(imageExtent.height));
-        preprocessor.add_macro_definition("BUFFER_RCP_WIDTH", "(1.0 / BUFFER_WIDTH)");
-        preprocessor.add_macro_definition("BUFFER_RCP_HEIGHT", "(1.0 / BUFFER_HEIGHT)");
-        preprocessor.add_macro_definition("BUFFER_COLOR_DEPTH", (inputOutputFormatUNORM == VK_FORMAT_A2R10G10B10_UNORM_PACK32) ? "10" : "8");
-        preprocessor.add_macro_definition("BUFFER_COLOR_BIT_DEPTH", "BUFFER_COLOR_DEPTH");
-        
-        // Pass the static source encoding to ReShade so effects interpret the
-        // resolved depth correctly. The user's invert/flip/flop transforms are
-        // runtime resolve push constants and must not be baked in as macros:
-        // doing both meant a chain reload recompiled the effects and cancelled
-        // the transform that was already applied to the depth image.
-        const int depthMode = settingsManager.getDepthSourceChannel();
-        addReshadeDepthMacros(preprocessor, depthMode);
-
-        // Keep runtime compilation behavior aligned with reshade_parser compatibility shims.
-        preprocessor.append_string(
-            "#define tex2DgatherR(s, coords) tex2Dgather(s, coords, 0)\n"
-            "#define tex2DgatherG(s, coords) tex2Dgather(s, coords, 1)\n"
-            "#define tex2DgatherB(s, coords) tex2Dgather(s, coords, 2)\n"
-            "#define tex2DgatherA(s, coords) tex2Dgather(s, coords, 3)\n"
-            "#define storage1D storage\n"
-            "#define f32tof16 _vkhook_f32tof16\n"
-            "#define f16tof32 _vkhook_f16tof32\n"
-            "uint _vkhook_f32tof16(float v) {\n"
-            "  uint x = asuint(v);\n"
-            "  uint sign = (x >> 16) & 0x8000u;\n"
-            "  uint exp = (x >> 23) & 0xFFu;\n"
-            "  uint mant = x & 0x7FFFFFu;\n"
-            "  if (exp == 0xFFu) {\n"
-            "    if (mant == 0u) return sign | 0x7C00u;\n"
-            "    uint nanMant = mant >> 13;\n"
-            "    if (nanMant == 0u) nanMant = 1u;\n"
-            "    return sign | 0x7C00u | (nanMant & 0x03FFu);\n"
-            "  }\n"
-            "  int newExp = int(exp) - 127 + 15;\n"
-            "  if (newExp >= 31) return sign | 0x7C00u;\n"
-            "  if (newExp <= 0) {\n"
-            "    if (newExp < -10) return sign;\n"
-            "    mant |= 0x800000u;\n"
-            "    uint shift = uint(14 - newExp);\n"
-            "    uint halfMant = mant >> shift;\n"
-            "    uint roundMask = (1u << shift) - 1u;\n"
-            "    uint roundBits = mant & roundMask;\n"
-            "    uint halfway = 1u << (shift - 1u);\n"
-            "    if (roundBits > halfway || (roundBits == halfway && (halfMant & 1u) != 0u))\n"
-            "      halfMant += 1u;\n"
-            "    return sign | (halfMant & 0x03FFu);\n"
-            "  }\n"
-            "  uint halfExp = uint(newExp) << 10;\n"
-            "  uint halfMant = mant >> 13;\n"
-            "  uint roundBits = mant & 0x1FFFu;\n"
-            "  if (roundBits > 0x1000u || (roundBits == 0x1000u && (halfMant & 1u) != 0u)) {\n"
-            "    halfMant += 1u;\n"
-            "    if (halfMant == 0x0400u) {\n"
-            "      halfMant = 0u;\n"
-            "      halfExp += 0x0400u;\n"
-            "      if (halfExp >= 0x7C00u) halfExp = 0x7C00u;\n"
-            "    }\n"
-            "  }\n"
-            "  return sign | halfExp | (halfMant & 0x03FFu);\n"
-            "}\n"
-            "uint2 _vkhook_f32tof16(float2 v) { return uint2(_vkhook_f32tof16(v.x), _vkhook_f32tof16(v.y)); }\n"
-            "uint3 _vkhook_f32tof16(float3 v) { return uint3(_vkhook_f32tof16(v.x), _vkhook_f32tof16(v.y), _vkhook_f32tof16(v.z)); }\n"
-            "uint4 _vkhook_f32tof16(float4 v) { return uint4(_vkhook_f32tof16(v.x), _vkhook_f32tof16(v.y), _vkhook_f32tof16(v.z), _vkhook_f32tof16(v.w)); }\n"
-            "float _vkhook_f16tof32(uint h) {\n"
-            "  uint sign = (h & 0x8000u) << 16;\n"
-            "  uint exp = (h >> 10) & 0x1Fu;\n"
-            "  uint mant = h & 0x03FFu;\n"
-            "  if (exp == 0u) {\n"
-            "    if (mant == 0u) return asfloat(sign);\n"
-            "    int shift = 0;\n"
-            "    while ((mant & 0x0400u) == 0u) { mant <<= 1; shift++; }\n"
-            "    mant &= 0x03FFu;\n"
-            "    uint fullExp = uint(127 - 15 - shift);\n"
-            "    return asfloat(sign | (fullExp << 23) | (mant << 13));\n"
-            "  }\n"
-            "  if (exp == 0x1Fu) return asfloat(sign | 0x7F800000u | (mant << 13));\n"
-            "  return asfloat(sign | ((exp + 112u) << 23) | (mant << 13));\n"
-            "}\n"
-            "float2 _vkhook_f16tof32(uint2 h) { return float2(_vkhook_f16tof32(h.x), _vkhook_f16tof32(h.y)); }\n"
-            "float3 _vkhook_f16tof32(uint3 h) { return float3(_vkhook_f16tof32(h.x), _vkhook_f16tof32(h.y), _vkhook_f16tof32(h.z)); }\n"
-            "float4 _vkhook_f16tof32(uint4 h) { return float4(_vkhook_f16tof32(h.x), _vkhook_f16tof32(h.y), _vkhook_f16tof32(h.z), _vkhook_f16tof32(h.w)); }\n"
-            "#define float2x3 matrix<float, 2, 3>\n"
-            "#define float2x4 matrix<float, 2, 4>\n"
-            "#define float3x2 matrix<float, 3, 2>\n"
-            "#define float3x4 matrix<float, 3, 4>\n"
-            "#define float4x2 matrix<float, 4, 2>\n"
-            "#define float4x3 matrix<float, 4, 3>\n"
-            "#define ddx_fine(x) ddx(x)\n"
-            "#define ddy_fine(x) ddy(x)\n"
-            "#define ddx_coarse(x) ddx(x)\n"
-            "#define ddy_coarse(x) ddy(x)\n");
-
-        // Add custom preprocessor definitions (user-configurable macros)
+        // One preprocess setup shared with the registry parse: same prelude,
+        // depth macros, user macros and include paths, with the real extent.
+        const uint32_t colorBitDepth = (inputOutputFormatUNORM == VK_FORMAT_A2R10G10B10_UNORM_PACK32) ? 10 : 8;
+        const ReshadePreprocessSetup setup = effectRegistry->preprocessSetup(
+            imageExtent.width, imageExtent.height, colorBitDepth, customPreprocessorDefs);
         for (const auto& def : customPreprocessorDefs)
-        {
-            preprocessor.add_macro_definition(def.name, def.value);
             Logger::debug("  custom macro: " + def.name + " = " + def.value);
-        }
-
-        // Add all discovered shader paths from shader manager
-        ShaderManagerConfig shaderMgrConfig = ConfigSerializer::loadShaderManagerConfig();
-        for (const auto& path : ConfigSerializer::expandShaderIncludePaths(shaderMgrConfig.discoveredShaderPaths))
-            preprocessor.add_include_path(path);
 
         // Use provided effectPath, or try to find it in discovered shader paths
         std::string shaderPath = this->effectPath;
@@ -2047,7 +1542,7 @@ namespace VkHook
             if (shaderPath.empty())
             {
                 // Search discovered shader paths for the effect
-                for (const auto& searchPath : shaderMgrConfig.discoveredShaderPaths)
+                for (const auto& searchPath : setup.includePaths)
                 {
                     std::string candidate = searchPath + "/" + effectName + ".fx";
                     if (std::filesystem::exists(candidate))
@@ -2064,24 +1559,20 @@ namespace VkHook
                 }
             }
         }
+        // The resolved path identifies the effect file to the texture pool.
+        this->effectPath = shaderPath;
 
-        if (shaderPath.empty() || !preprocessor.append_file(shaderPath))
+        std::string preprocessedSource;
+        std::string error;
+        if (!preprocessReshadeFile(shaderPath, setup, preprocessedSource, error))
         {
-            Logger::err("failed to load shader file: " + shaderPath);
-            Logger::err("Does the filepath exist and does it not include spaces?");
-            throw std::runtime_error("failed to load shader: " + effectName);
+            Logger::err("failed to load shader '" + effectName + "': " + error);
+            throw EffectBuildError("failed to load shader: " + effectName + ": " + error);
         }
-
-        reshadefx::parser parser;
-
-        std::string errors = preprocessor.errors();
-        if (!errors.empty())
-            Logger::err(errors);
 
         const RuntimeCodegenPolicy runtimePolicy = selectRuntimeCodegenPolicy(logicalDevice);
         disableComputePipelineOptimization = runtimePolicy.disableComputePipelineOptimization;
         Logger::debug("runtime codegen policy: local_size_id=" + std::to_string(runtimePolicy.useLocalSizeId ? 1 : 0) +
-                      " uniform_spec_constants=" + std::to_string(runtimePolicy.useUniformSpecConstants ? 1 : 0) +
                       " debug_info=" + std::to_string(runtimePolicy.emitDebugInfo ? 1 : 0) +
                       " disable_compute_opt=" + std::to_string(runtimePolicy.disableComputePipelineOptimization ? 1 : 0));
 
@@ -2089,11 +1580,9 @@ namespace VkHook
         // hash is a complete cache key: an edited include or a changed macro
         // misses and recompiles, an unchanged effect is reused across reloads.
         // That reuse is what keeps a chain rebuild from re-parsing every effect.
-        std::string preprocessedSource = std::move(preprocessor.output());
         const uint64_t sourceHash = hashBytes(preprocessedSource.data(), preprocessedSource.size());
         const uint32_t codegenFlags =
             (runtimePolicy.useLocalSizeId ? 1u : 0u) |
-            (runtimePolicy.useUniformSpecConstants ? 2u : 0u) |
             (runtimePolicy.emitDebugInfo ? 4u : 0u);
 
         static CompileCache<reshadefx::module> s_moduleCache(64);
@@ -2105,47 +1594,25 @@ namespace VkHook
         }
         else
         {
-            std::unique_ptr<reshadefx::codegen> codegen(reshadefx::create_codegen_spirv(
-                true /* vulkan semantics */,
-                runtimePolicy.emitDebugInfo,
-                runtimePolicy.useUniformSpecConstants,
-                true /* flip vertex shader */,
-                runtimePolicy.useLocalSizeId));
-
-            if (!parser.parse(std::move(preprocessedSource), codegen.get()))
+            const ReshadeCodegenOptions options{runtimePolicy.emitDebugInfo, runtimePolicy.useLocalSizeId};
+            if (!compileReshadeSource(std::move(preprocessedSource), options, module, error))
             {
-                errors = parser.errors();
-                if (!errors.empty())
-                    Logger::err(errors);
-                throw std::runtime_error("failed to compile shader: " + effectName);
+                Logger::err("failed to compile shader '" + effectName + "': " + error);
+                throw EffectBuildError("failed to compile shader: " + effectName + ": " + error);
             }
-
-            errors = parser.errors();
-            if (!errors.empty())
-            {
-                if (hasFatalCompilerDiagnostics(errors))
-                {
-                    Logger::err(errors);
-                    throw std::runtime_error("failed to compile shader: " + effectName);
-                }
-
-                Logger::warn(errors);
-            }
-
-            codegen->write_result(module);
             s_moduleCache.store(cacheKey, module);
         }
 
         if (module.techniques.empty())
         {
             Logger::err("shader has no techniques: " + effectName);
-            throw std::runtime_error("shader has no techniques: " + effectName);
+            throw EffectBuildError("shader has no techniques: " + effectName);
         }
 
         if (module.spirv.empty())
         {
             Logger::err("shader produced empty SPIR-V: " + effectName);
-            throw std::runtime_error("shader produced empty SPIR-V: " + effectName);
+            throw EffectBuildError("shader produced empty SPIR-V: " + effectName);
         }
 
         VkShaderModuleCreateInfo shaderCreateInfo;
@@ -2158,8 +1625,9 @@ namespace VkHook
         VkResult result = logicalDevice->vkd.CreateShaderModule(logicalDevice->device, &shaderCreateInfo, nullptr, &shaderModule);
         if (result != VK_SUCCESS)
         {
+            shaderModule = VK_NULL_HANDLE;
             Logger::err("failed to create shader module for: " + effectName);
-            throw std::runtime_error("VkCreateShaderModule failed for: " + effectName);
+            throw EffectBuildError("VkCreateShaderModule failed for: " + effectName);
         }
 
         Logger::debug("created reshade shaderModule");

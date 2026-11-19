@@ -43,7 +43,6 @@ namespace VkHook
         void virtual applyEffect(uint32_t imageIndex, VkCommandBuffer commandBuffer) override;
         void virtual updateEffect() override;
         void virtual useDepthImage(uint32_t imageIndex, VkImageView depthImageView, VkImageLayout depthImageLayout) override;
-        std::vector<std::unique_ptr<EffectParam>> getParameters() const override;
         int getOutputWrites() const { return outputWrites; }
         virtual ~ReshadeEffect();
 
@@ -61,7 +60,23 @@ namespace VkHook
         std::set<VkImage>     collectOwnedImages() const;
 
     private:
-        LogicalDevice*           logicalDevice;
+        // The constructor body. Split out so the constructor can release what a
+        // failed build already created (a throwing constructor runs no destructor).
+        void build(LogicalDevice*       logicalDevice,
+                   VkFormat             format,
+                   VkExtent2D           imageExtent,
+                   std::vector<VkImage> inputImages,
+                   std::vector<VkImage> outputImages,
+                   EffectRegistry*      effectRegistry,
+                   ReshadeTexturePool& texturePool,
+                   std::string          effectName,
+                   std::string          effectPath,
+                   std::vector<PreprocessorDefinition> customDefs);
+
+        // Throws EffectBuildError unless `sets` holds one descriptor set per swapchain image.
+        void requireDescriptorSets(const std::vector<VkDescriptorSet>& sets, const char* what) const;
+
+        LogicalDevice*           logicalDevice = nullptr;
         std::vector<VkImage>     inputImages;
         std::vector<VkImage>     outputImages;
         std::vector<VkImageView> inputImageViewsSRGB;
@@ -104,25 +119,25 @@ namespace VkHook
         };
         std::vector<PassRuntime> passRuntimes;
 
-        VkDescriptorSetLayout                 uniformDescriptorSetLayout;
-        VkDescriptorSetLayout                 imageSamplerDescriptorSetLayout;
-        VkShaderModule                        shaderModule;
-        VkDescriptorPool                      descriptorPool;
-        VkPipelineLayout                      pipelineLayout;
+        VkDescriptorSetLayout                 uniformDescriptorSetLayout = VK_NULL_HANDLE;
+        VkDescriptorSetLayout                 imageSamplerDescriptorSetLayout = VK_NULL_HANDLE;
+        VkShaderModule                        shaderModule = VK_NULL_HANDLE;
+        VkDescriptorPool                      descriptorPool = VK_NULL_HANDLE;
+        VkPipelineLayout                      pipelineLayout = VK_NULL_HANDLE;
         VkExtent2D                            imageExtent;
         std::vector<VkSampler>                samplers;
-        EffectRegistry*                       effectRegistry;
+        EffectRegistry*                       effectRegistry = nullptr;
         std::string                           effectName;
         std::string                           effectPath;  // Path to .fx file (may differ from effectName)
         std::vector<PreprocessorDefinition>   customPreprocessorDefs;  // User-defined macros
         reshadefx::module                     module;
         std::vector<VkDeviceMemory>           textureMemory;
 
-        VkFormat    inputOutputFormatUNORM;
-        VkFormat    inputOutputFormatSRGB;
-        VkFormat    stencilFormat;
-        VkImage     stencilImage;
-        VkImageView stencilImageView;
+        VkFormat    inputOutputFormatUNORM = VK_FORMAT_UNDEFINED;
+        VkFormat    inputOutputFormatSRGB = VK_FORMAT_UNDEFINED;
+        VkFormat    stencilFormat = VK_FORMAT_UNDEFINED;
+        VkImage     stencilImage = VK_NULL_HANDLE;
+        VkImageView stencilImageView = VK_NULL_HANDLE;
         // how often the shader writes to the reshade back buffer
         // we need to flip the "backbuffer" after each write if there is a next one
         int                      outputWrites = 0;
@@ -133,18 +148,20 @@ namespace VkHook
         // Effects without uniforms never allocate this buffer.
         VkBuffer                 stagingBuffer = VK_NULL_HANDLE;
         VkDeviceMemory           stagingBufferMemory = VK_NULL_HANDLE;
-        uint32_t                 bufferSize;
+        uint32_t                 bufferSize = 0;
         void*                    stagingBufferMapped = nullptr;  // Persistent map (HOST_COHERENT)
-        VkDescriptorSet          bufferDescriptorSet;
+        VkDescriptorSet          bufferDescriptorSet = VK_NULL_HANDLE;
         bool                     disableComputePipelineOptimization = false;
 
         std::vector<std::shared_ptr<ReshadeUniform>> uniforms;
-        // registry params resolved at build time; valid only while the registry
-        // generation is unchanged, since a reparse frees the old param vector
-        std::unordered_map<std::string, EffectParam*> uiParamCache;
-        uint64_t uiParamCacheGeneration = 0;
+        // Non-owning views into `uniforms` for the bufready_depth sources.
+        std::vector<DepthUniform*> depthUniforms;
+        // User-editable uniforms resolved to parameter storage; valid only while
+        // the registry generation is unchanged, since a reparse frees the params.
+        std::vector<UniformBinding> uniformBindings;
+        uint64_t bindingsGeneration = 0;
 
-        void          buildUiParamCache();
+        void          buildBindings();
         void          createReshadeModule();
         VkFormat      convertReshadeFormat(reshadefx::texture_format texFormat);
         VkCompareOp   convertReshadeCompareOp(reshadefx::pass_stencil_func compareOp);

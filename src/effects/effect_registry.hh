@@ -13,6 +13,7 @@
 #include <filesystem>
 
 #include "effect_config.hh"
+#include "reshade_compile.hh"
 #include "config.hh"
 
 namespace VkHook
@@ -35,9 +36,6 @@ namespace VkHook
             return effects;
         }
 
-        // Get only enabled effects (for rendering) - returns pointers to avoid copying
-        std::vector<const EffectConfig*> getEnabledEffects() const;
-
         // Get all parameters from all effects (for UI)
         std::vector<std::unique_ptr<EffectParam>> getAllParameters() const;
 
@@ -47,13 +45,16 @@ namespace VkHook
         // Get enabled state for a specific effect
         bool isEffectEnabled(const std::string& effectName) const;
 
-        // Get all effect enabled states as a map
-        std::map<std::string, bool> getEffectEnabledStates() const;
+        // The one preprocess setup shared by the parameter parse and the runtime
+        // compile: same prelude, depth macros, include paths and user macros.
+        ReshadePreprocessSetup preprocessSetup(uint32_t bufferWidth,
+                                               uint32_t bufferHeight,
+                                               uint32_t colorBitDepth,
+                                               std::vector<PreprocessorDefinition> userDefs) const;
 
-        // Update a parameter value (UI -> registry)
-        void setParameterValue(const std::string& effectName, const std::string& paramName, float value);
-        void setParameterValue(const std::string& effectName, const std::string& paramName, int value);
-        void setParameterValue(const std::string& effectName, const std::string& paramName, bool value);
+        // Extent used for BUFFER_WIDTH/HEIGHT when effect parameters are parsed
+        // (before any swapchain's real extent is known). Defaults to 1920x1080.
+        void setCompileExtent(uint32_t width, uint32_t height);
 
         // Get parameter by name
         std::optional<EffectParam*>       getParameter(const std::string& effectName, const std::string& paramName);
@@ -131,6 +132,8 @@ namespace VkHook
         // the parsed VkHook.conf. The old pConfig prefix was doing the job a
         // name has to do, which is to say which of two same-ish things this is.
         Config* rootConfig = nullptr;
+        uint32_t compileWidth = 1920;
+        uint32_t compileHeight = 1080;
         mutable std::mutex mutex;
         std::atomic<uint64_t> paramGeneration{0};
 

@@ -224,6 +224,35 @@ namespace
         finish(12, 3);
     }
 
+    // Instances X and X.2 of one effect file must not share private textures
+    // (history included), while the first instance of another file that declares
+    // the same name still shares with the first, as ReShade does across files.
+    void instancesOfSameEffect(LogicalDevice& device)
+    {
+        reset();
+        {
+            ReshadeTexturePool pool(&device);
+            const uint32_t first = pool.beginEffect("Temporal.fx");
+            const uint32_t second = pool.beginEffect("Temporal.fx");
+            const uint32_t otherFile = pool.beginEffect("Other.fx");
+            expect(first == 0 && second == 1 && otherFile == 0, "instance ordinals count per effect file");
+
+            auto firstHistory = pool.acquire("VHistory", standard, first);
+            auto secondHistory = pool.acquire("VHistory", standard, second);
+            expect(firstHistory != secondHistory && firstHistory->image != secondHistory->image,
+                   "two instances of one file get separate private textures");
+            expect(imageCalls == 2, "each instance allocates its own image");
+            expect(pool.acquire("VHistory", standard, first) == firstHistory
+                       && pool.acquire("VHistory", standard, second) == secondHistory,
+                   "an instance keeps getting its own texture");
+
+            auto consumer = pool.acquire("VHistory", standard, otherFile);
+            expect(consumer == firstHistory, "another file's first instance shares by name with the first instance");
+            expect(imageCalls == 2, "cross-file sharing allocates nothing");
+        }
+        finish(8, 2);
+    }
+
     void deduplicateViews(LogicalDevice& device)
     {
         for (const VkFormat format : {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R16G16_SFLOAT})
@@ -327,6 +356,7 @@ int main()
 
     aliasAndLifetime(device);
     mismatchAndScope(device);
+    instancesOfSameEffect(device);
     deduplicateViews(device);
     constructionFailures(device);
     std::printf("ReShade texture pool: %d checks, %d failures\n", checks, failures);

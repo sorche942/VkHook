@@ -101,12 +101,13 @@ VkHook_src = [
     'core/config/config_serializer_profile.cc',
     'core/config/settings_manager.cc',
     'render/descriptor_set.cc',
-    'effects/effect.cc',
     'effects/effect_registry.cc',
     'effects/effect_reshade.cc',
     'effects/reshade_texture_pool.cc',
     'effects/effect_transfer.cc',
     'effects/reshade_parser.cc',
+    'effects/reshade_compile.cc',
+    'effects/texture_convert.cc',
     'render/fake_swapchain.cc',
     'render/format.cc',
     'render/framebuffer.cc',
@@ -269,6 +270,7 @@ vkhook_lib = shared_library('vkhook',
 shader_check = executable('vkhook-shader-check',
     'effects/shader_check.cc',
     'effects/reshade_parser.cc',
+    'effects/reshade_compile.cc',
     'vendor/reshade/effect_codegen_spirv.cc',
     'vendor/reshade/effect_expression.cc',
     'vendor/reshade/effect_lexer.cc',
@@ -406,6 +408,41 @@ wayland_interpose_patch_tests = executable('vkhook-wayland-interpose-patch-tests
     dependencies : [threads_dep, wayland_client_dep],
     include_directories : [core_inc, input_inc, source_inc])
 test('wayland interpose patch', wayland_interpose_patch_tests)
+
+# The parameter parse and the runtime compile share one preprocess setup. This
+# drives the parse with extents, user macros and a failing shader to check that
+# macro-gated uniforms follow their macro and that compiler failures come back
+# as errors.
+reshade_compile_tests = executable('vkhook-reshade-compile-tests',
+    'effects/reshade_compile_test.cc',
+    'effects/reshade_parser.cc',
+    'effects/reshade_compile.cc',
+    'vendor/reshade/effect_codegen_spirv.cc',
+    'vendor/reshade/effect_expression.cc',
+    'vendor/reshade/effect_lexer.cc',
+    'vendor/reshade/effect_parser.cc',
+    'vendor/reshade/effect_preprocessor.cc',
+    'vendor/reshade/effect_symbol_table.cc',
+    'render/vk_handle.cc',
+    'core/config/config.cc',
+    'core/config/config_serializer.cc',
+    'core/config/config_serializer_profile.cc',
+    'core/logger.cc',
+    'core/util.cc',
+    include_directories : [VkHook_include_path, imgui_inc, overlay_inc, effects_inc, effects_params_inc, core_inc, input_inc, render_inc, vendor_inc, include_directories('vendor/reshade'), stb_inc, source_inc],
+    dependencies : [reshade_dep])
+test('reshade compile setup', reshade_compile_tests,
+    args : [meson.current_source_dir() / 'tests/fixtures'],
+    env : ['VKHOOK_LOG_LEVEL=none'])
+
+# Texture files reach the GPU through this conversion; its sizes decide how
+# many bytes the upload reads, so overflows are checked here without a device.
+texture_convert_tests = executable('vkhook-texture-convert-tests',
+    'effects/texture_convert_test.cc',
+    'effects/texture_convert.cc',
+    'vendor/stb/stb_image_resize.c',
+    include_directories : [render_inc, effects_inc, stb_inc, source_inc])
+test('texture convert', texture_convert_tests)
 
 compile_cache_tests = executable('vkhook-compile-cache-tests',
     'effects/compile_cache_test.cc',

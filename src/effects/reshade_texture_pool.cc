@@ -129,22 +129,30 @@ namespace VkHook
             });
     }
 
-    std::shared_ptr<ReshadeTexture> ReshadeTexturePool::acquire(const std::string& uniqueName, const ReshadeTextureDesc& desc)
+    uint32_t ReshadeTexturePool::beginEffect(const std::string& effectFile)
     {
-        const auto found = textures.find(uniqueName);
+        return instanceCounts[effectFile]++;
+    }
+
+    std::shared_ptr<ReshadeTexture> ReshadeTexturePool::acquire(const std::string& uniqueName, const ReshadeTextureDesc& desc,
+                                                                uint32_t instanceOrdinal)
+    {
+        // '#' cannot occur in a ReShade identifier, so the key is unambiguous.
+        const std::string key = uniqueName + '#' + std::to_string(instanceOrdinal);
+        const auto found = textures.find(key);
         if (found != textures.end())
         {
             if (!(found->second->desc == desc))
                 throw std::runtime_error("Incompatible shared ReShade texture '" + uniqueName + "': existing "
                                          + describe(found->second->desc) + ", requested " + describe(desc));
-            Logger::debug("[reshade-texture-pool] reuse name=" + uniqueName
+            Logger::debug("[reshade-texture-pool] reuse name=" + key
                           + " image=" + convertToString(found->second->image));
             return found->second;
         }
 
         auto texture = std::make_shared<ReshadeTexture>(logicalDevice, desc);
-        textures.emplace(uniqueName, texture);
-        Logger::debug("[reshade-texture-pool] create name=" + uniqueName + " image=" + convertToString(texture->image));
+        textures.emplace(key, texture);
+        Logger::debug("[reshade-texture-pool] create name=" + key + " image=" + convertToString(texture->image));
         return texture;
     }
 }
