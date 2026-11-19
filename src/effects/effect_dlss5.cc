@@ -264,7 +264,7 @@ namespace VkHook
         allocation.commandPool = s.commandPool;
         allocation.level = VK_COMMAND_BUFFER_LEVEL_SECONDARY;
         allocation.commandBufferCount = 1;
-        VK_CHECK(device->vkd.AllocateCommandBuffers(device->device, &allocation, &s.network));
+        VK_CHECK(allocateLayerCommandBuffers(device, &allocation, &s.network));
         initializeDispatchTable(s.network, device->device);
         VkCommandBufferInheritanceInfo inheritance{VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO};
         VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};

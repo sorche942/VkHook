@@ -36,7 +36,7 @@ namespace VkHook
             allocInfo.commandPool        = commands.pool;
             allocInfo.commandBufferCount = 1;
 
-            const VkResult result = logicalDevice->vkd.AllocateCommandBuffers(logicalDevice->device, &allocInfo, &commands.buffer);
+            const VkResult result = allocateLayerCommandBuffers(logicalDevice, &allocInfo, &commands.buffer);
             if (result != VK_SUCCESS || commands.buffer == VK_NULL_HANDLE)
             {
                 Logger::err(std::string(what) + ": vkAllocateCommandBuffers failed: " + std::to_string(result));

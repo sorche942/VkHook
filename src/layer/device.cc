@@ -40,6 +40,7 @@ namespace
         PFN_vkGetInstanceProcAddr  gipa;
         PFN_vkGetDeviceProcAddr    gdpa;
         bool                       gpuCrashDiagnosticsRequested;
+        VkResult (VKAPI_PTR*       setLoaderData)(VkDevice, void*);
     };
 
     // The layer's per-device state, built after the real device exists. May throw;
@@ -67,6 +68,7 @@ namespace
         logicalDevice->supportsDeviceFaultExt = plan.enableDeviceFault && plan.enableDeviceFaultFeature;
         logicalDevice->downstreamGIPA = build.gipa;
         logicalDevice->downstreamGDPA = build.gdpa;
+        logicalDevice->setLoaderData  = build.setLoaderData;
         logicalDevice->dlss5Supported = plan.dlss5Supported;
         logicalDevice->dlss5UnavailableReason = plan.dlss5UnavailableReason;
 
@@ -241,6 +243,18 @@ namespace
 
         PFN_vkCreateDevice createFunc = (PFN_vkCreateDevice) gipa(VK_NULL_HANDLE, "vkCreateDevice");
 
+        // The loader's callback for dispatchable handles the layer creates itself
+        PFN_vkSetDeviceLoaderData setLoaderData = nullptr;
+        for (auto* info = (const VkLayerDeviceCreateInfo*) pCreateInfo->pNext; info;
+             info = (const VkLayerDeviceCreateInfo*) info->pNext)
+        {
+            if (info->sType == VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO && info->function == VK_LOADER_DATA_CALLBACK)
+            {
+                setLoaderData = info->u.pfnSetDeviceLoaderData;
+                break;
+            }
+        }
+
         // Vulkan queries live here; planDeviceCreate is pure (AGENTS.md invariant 9)
         DeviceCaps caps;
         {
@@ -318,7 +332,7 @@ namespace
 
         try
         {
-            DeviceBuild build{physicalDevice, *pDevice, instSnap, *plan, caps, pCreateInfo, gipa, gdpa, gpuCrashDiagnosticsRequested};
+            DeviceBuild build{physicalDevice, *pDevice, instSnap, *plan, caps, pCreateInfo, gipa, gdpa, gpuCrashDiagnosticsRequested, setLoaderData};
             registerDevice(GetKey(*pDevice), buildLogicalDevice(build));
             return VK_SUCCESS;
         }

@@ -132,7 +132,7 @@ namespace VkHook
         allocInfo.commandPool = commandPool;
         allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
         allocInfo.commandBufferCount = imageCount;
-        vr = vkd.AllocateCommandBuffers(device, &allocInfo, commandBuffers.data());
+        vr = allocateLayerCommandBuffers(logicalDevice, &allocInfo, commandBuffers.data());
         if (vr != VK_SUCCESS)
         {
             Logger::err("Failed to allocate overlay command buffers: " + std::to_string(vr));

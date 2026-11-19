@@ -1422,7 +1422,7 @@ namespace VkHook
 
     ReshadeEffect::~ReshadeEffect()
     {
-        // Everything is handed to the deferred queue rather than released here.
+        // Everything is handed to the device RetireQueue rather than released here.
         // The device guard moved into releaseResources() with the rest of the
         // logic; keeping it in one place is the point, since a null device is a
         // real case here: the VkDevice can be destroyed before every

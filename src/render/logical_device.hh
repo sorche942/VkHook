@@ -97,6 +97,9 @@ namespace VkHook
         VkPipelineCache          pipelineCache = VK_NULL_HANDLE;
         PFN_vkGetInstanceProcAddr downstreamGIPA = nullptr;
         PFN_vkGetDeviceProcAddr downstreamGDPA = nullptr;
+        // The loader's callback that gives a layer-created dispatchable handle its
+        // dispatch table pointer (VK_LOADER_DATA_CALLBACK). Null only in tests.
+        VkResult (VKAPI_PTR* setLoaderData)(VkDevice, void*) = nullptr;
         bool dlss5Supported = false;
         std::string dlss5UnavailableReason;
         VkQueue dlss5OpticalFlowQueue = VK_NULL_HANDLE;
@@ -246,6 +249,28 @@ namespace VkHook
         // set by panicLayer() when the driver reported VK_ERROR_DEVICE_LOST
         std::atomic<bool> deviceLost{false};
     };
+
+    // vkAllocateCommandBuffers for the layer's own buffers. A command buffer the
+    // layer allocates never passed through the loader trampoline, so it must be
+    // handed its loader data here; without it a layer below (validation) cannot
+    // find the buffer's dispatch table and aborts.
+    inline VkResult allocateLayerCommandBuffers(LogicalDevice* logicalDevice, const VkCommandBufferAllocateInfo* info,
+                                                VkCommandBuffer* buffers)
+    {
+        const VkResult result = logicalDevice->vkd.AllocateCommandBuffers(logicalDevice->device, info, buffers);
+        if (result != VK_SUCCESS || !logicalDevice->setLoaderData)
+            return result;
+        for (uint32_t i = 0; i < info->commandBufferCount; ++i)
+        {
+            const VkResult loaderResult = logicalDevice->setLoaderData(logicalDevice->device, buffers[i]);
+            if (loaderResult != VK_SUCCESS)
+            {
+                logicalDevice->vkd.FreeCommandBuffers(logicalDevice->device, info->commandPool, info->commandBufferCount, buffers);
+                return loaderResult;
+            }
+        }
+        return VK_SUCCESS;
+    }
 } // namespace VkHook
 
 #endif // LOGICAL_DEVICE_HPP_INCLUDED

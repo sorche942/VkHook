@@ -405,7 +405,7 @@ namespace VkHook
         allocInfo.commandPool        = pool;
         allocInfo.commandBufferCount = count;
 
-        VkResult result = logicalDevice->vkd.AllocateCommandBuffers(logicalDevice->device, &allocInfo, commandBuffers.data());
+        VkResult result = allocateLayerCommandBuffers(logicalDevice, &allocInfo, commandBuffers.data());
         if (result != VK_SUCCESS)
         {
             Logger::err("ASSERT_VULKAN failed in " + std::string(__FILE__) + " : " + std::to_string(__LINE__) + "; " + std::to_string(result));

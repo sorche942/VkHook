@@ -156,7 +156,7 @@ namespace VkHook
         allocInfo.commandBufferCount = 1;
 
         VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
-        vr = logicalDevice->vkd.AllocateCommandBuffers(logicalDevice->device, &allocInfo, &commandBuffer);
+        vr = allocateLayerCommandBuffers(logicalDevice, &allocInfo, &commandBuffer);
         ASSERT_VULKAN(vr);
         initializeDispatchTable(commandBuffer, logicalDevice->device);
 

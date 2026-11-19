@@ -151,7 +151,7 @@ namespace
                 cbai.commandPool = pool;
                 cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
                 cbai.commandBufferCount = DepthCopyState::RING_SIZE;
-                VkResult cbResult = logicalDevice->vkd.AllocateCommandBuffers(logicalDevice->device, &cbai, buffers.data());
+                VkResult cbResult = allocateLayerCommandBuffers(logicalDevice, &cbai, buffers.data());
                 if (cbResult != VK_SUCCESS)
                 {
                     Logger::err("QueueSubmit v3: could not allocate depth copy command buffers (" + std::to_string(cbResult) + ")");

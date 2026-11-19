@@ -183,7 +183,7 @@ namespace VkHook
         allocate.commandPool = pool;
         allocate.commandBufferCount = 1;
         VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
-        result = logicalDevice->vkd.AllocateCommandBuffers(logicalDevice->device, &allocate, &commandBuffer);
+        result = allocateLayerCommandBuffers(logicalDevice, &allocate, &commandBuffer);
         if (result != VK_SUCCESS || commandBuffer == VK_NULL_HANDLE)
         {
             Logger::err("texture upload: vkAllocateCommandBuffers failed: " + std::to_string(result));

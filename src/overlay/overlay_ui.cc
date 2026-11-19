@@ -34,6 +34,17 @@ namespace VkHook
     // ImGui's LoadFunctions treats nullptr returns as failures, so we need a valid pointer.
     static void VKAPI_CALL dummyVulkanFunc() {}
 
+    // The ImGui backend allocates its own upload command buffers. They need the
+    // loader data every layer-created dispatchable handle needs.
+    static VkResult VKAPI_CALL imguiAllocateCommandBuffers(VkDevice device, const VkCommandBufferAllocateInfo* info,
+                                                           VkCommandBuffer* buffers)
+    {
+        const std::shared_ptr<LogicalDevice> logicalDevice = findDevice(GetKey(device));
+        if (!logicalDevice)
+            return VK_ERROR_DEVICE_LOST;
+        return allocateLayerCommandBuffers(logicalDevice.get(), info, buffers);
+    }
+
     // Function loader using VkHook's dispatch tables
     static PFN_vkVoidFunction imguiVulkanLoaderDummy(const char* function_name, void* user_data)
     {
@@ -42,7 +53,8 @@ namespace VkHook
         // Device functions from VkHook's dispatch table
         #define CHECK_FUNC(name) if (strcmp(function_name, "vk" #name) == 0) return (PFN_vkVoidFunction)device->vkd.name
 
-        CHECK_FUNC(AllocateCommandBuffers);
+        if (strcmp(function_name, "vkAllocateCommandBuffers") == 0)
+            return (PFN_vkVoidFunction)imguiAllocateCommandBuffers;
         CHECK_FUNC(AllocateDescriptorSets);
         CHECK_FUNC(AllocateMemory);
         CHECK_FUNC(BeginCommandBuffer);
