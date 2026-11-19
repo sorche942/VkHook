@@ -14,9 +14,9 @@ vec3 dlss5DebugColor(uvec2 id, bool frameAccepted, vec4 previous, float weight) 
     if (id.y < 8u) return status;
     if (!valid) return status * ((((id.x / 16u) ^ (id.y / 16u)) & 1u) != 0u ? 0.25 : 0.5);
     if (p.debugView == 1u) {
-        uvec2 cell = min(id / 4u, uvec2(p.flowWidth - 1u, p.flowHeight - 1u));
+        uvec2 cell = min(id / (4u * p.flowScale), uvec2(p.flowWidth - 1u, p.flowHeight - 1u));
         uint packed = debugFlow.vectors[cell.y * p.flowWidth + cell.x];
-        vec2 motion = vec2(int(packed << 16u) >> 16, int(packed) >> 16) / 32.0;
+        vec2 motion = vec2(int(packed << 16u) >> 16, int(packed) >> 16) * (float(p.flowScale) / 32.0);
         float magnitude = length(motion);
         if (magnitude == 0.0) return vec3(0.0);
         // Current -> previous displacement: right red, down yellow-green,

@@ -36,7 +36,9 @@ namespace VkHook
         VkDevice device;
         VkQueue opticalQueue = VK_NULL_HANDLE;
         uint32_t opticalFamily = 0;
-        VkExtent2D extent{}, flowExtent{};
+        // `extent` is the source image; the engine sees it reduced by `downscale` per axis.
+        VkExtent2D extent{}, lumaExtent{}, flowExtent{};
+        uint32_t downscale = 1;
         uint32_t lumaGroupsX = 0, lumaGroupsY = 0;
         VkPhysicalDeviceMemoryProperties memoryProperties{};
 
@@ -325,7 +327,8 @@ namespace VkHook
             dispatch.vkCmdDispatch(frame.prepass, lumaGroupsX, lumaGroupsY, 1);
             barrier(frame.prepass, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
                 VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
-            copyBufferToImage(frame.prepass, packedLuma.buffer, current.image, VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
+            const auto lumaCopy = imageCopy(lumaExtent);
+            copyBufferToImage(frame.prepass, packedLuma.buffer, current.image, VK_IMAGE_LAYOUT_GENERAL, 1, &lumaCopy);
             VK_CHECK(dispatch.vkEndCommandBuffer(frame.prepass));
 
             VK_CHECK(dispatch.vkBeginCommandBuffer(frame.optical, &begin));
@@ -339,8 +342,17 @@ namespace VkHook
         }
     };
 
+    uint32_t Dlss5OpticalFlow::automaticDownscale(VkExtent2D extent) noexcept
+    {
+        // At full resolution the engine takes 1.6 ms at 1080p and 5.9 ms at 4K (RTX 5070 Ti), a quarter
+        // to a third of the whole frame, and nothing else runs on the queue meanwhile. Half resolution
+        // costs a third of that and keeps the output within 45 dB of the full-resolution result on
+        // vkhook-dlss5-frame-bench's scenes. Small frames keep every vector: their flow is cheap already.
+        return uint64_t(extent.width) * extent.height >= 1920u * 1080u ? 2 : 1;
+    }
+
     Dlss5OpticalFlow::Dlss5OpticalFlow(vk::Context& context, QueueTable& queues, uint32_t opticalQueueFamily, VkQueue opticalQueue,
-        VkExtent2D extent, VkFormat sourceFormat, const std::vector<VkImage>& sources,
+        VkExtent2D extent, VkFormat sourceFormat, const std::vector<VkImage>& sources, uint32_t downscale,
         const std::string& shaderPath, PFN_vkGetInstanceProcAddr gipa, PFN_vkGetDeviceProcAddr gdpa)
         : state(std::make_unique<State>(context, queues))
     {
@@ -351,9 +363,13 @@ namespace VkHook
         const bool bgra = sourceFormat == VK_FORMAT_B8G8R8A8_UNORM || sourceFormat == VK_FORMAT_B8G8R8A8_SRGB;
         if (!bgra && sourceFormat != VK_FORMAT_R8G8B8A8_UNORM && sourceFormat != VK_FORMAT_R8G8B8A8_SRGB)
             throw std::runtime_error("DLSS5 optical flow requires RGBA8/BGRA8 source images");
+        if (downscale != 1 && downscale != 2 && downscale != 4)
+            throw std::runtime_error("DLSS5 optical flow downscale must be 1, 2 or 4");
         s.opticalQueue = opticalQueue;
         s.opticalFamily = opticalQueueFamily;
         s.extent = extent;
+        s.downscale = downscale;
+        s.lumaExtent = {(extent.width + downscale - 1) / downscale, (extent.height + downscale - 1) / downscale};
         VkPhysicalDeviceOpticalFlowPropertiesNV opticalProperties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPTICAL_FLOW_PROPERTIES_NV};
         VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &opticalProperties};
         s.dispatch.vkGetPhysicalDeviceProperties2(context.physical(), &properties);
@@ -361,21 +377,24 @@ namespace VkHook
             throw std::runtime_error("DLSS5 optical flow requires a supported 4x4 output grid");
         if (!opticalProperties.costSupported)
             throw std::runtime_error("DLSS5 optical flow requires hardware confidence/cost output");
-        if (extent.width < opticalProperties.minWidth || extent.width > opticalProperties.maxWidth
-            || extent.height < opticalProperties.minHeight || extent.height > opticalProperties.maxHeight)
-            throw std::runtime_error("DLSS5 optical flow source extent is outside the device's supported range");
+        if (s.lumaExtent.width < opticalProperties.minWidth || s.lumaExtent.width > opticalProperties.maxWidth
+            || s.lumaExtent.height < opticalProperties.minHeight || s.lumaExtent.height > opticalProperties.maxHeight)
+            throw std::runtime_error("DLSS5 optical flow input extent is outside the device's supported range");
         const VkDeviceSize pixels = VkDeviceSize(extent.width) * extent.height;
         if (pixels > std::numeric_limits<uint32_t>::max() - 3u)
             throw std::runtime_error("DLSS5 optical flow source exceeds shader addressing range");
-        s.flowExtent = {(extent.width + 3) / 4, (extent.height + 3) / 4};
+        const VkDeviceSize lumaPixels = VkDeviceSize(s.lumaExtent.width) * s.lumaExtent.height;
+        // The engine's time follows its vector count as well as its input, so the
+        // grid stays 4x4 and a reduced input also means a coarser field.
+        s.flowExtent = {(s.lumaExtent.width + 3) / 4, (s.lumaExtent.height + 3) / 4};
         s.requireFormat(VK_FORMAT_R8_UNORM, VK_OPTICAL_FLOW_USAGE_INPUT_BIT_NV, "R8_UNORM luma input support");
         s.requireFormat(VK_FORMAT_R16G16_S10_5_NV, VK_OPTICAL_FLOW_USAGE_OUTPUT_BIT_NV, "R16G16_S10_5_NV flow output support");
         s.requireFormat(VK_FORMAT_R8_UINT, VK_OPTICAL_FLOW_USAGE_COST_BIT_NV, "R8_UINT cost output support");
         s.dispatch.vkGetPhysicalDeviceMemoryProperties(context.physical(), &s.memoryProperties);
         const VkImageUsageFlags lumaUsage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-        s.makeImage(s.current, extent, VK_FORMAT_R8_UNORM, VK_OPTICAL_FLOW_USAGE_INPUT_BIT_NV,
+        s.makeImage(s.current, s.lumaExtent, VK_FORMAT_R8_UNORM, VK_OPTICAL_FLOW_USAGE_INPUT_BIT_NV,
             lumaUsage, VK_FORMAT_FEATURE_2_OPTICAL_FLOW_IMAGE_BIT_NV, "current R8 luma");
-        s.makeImage(s.previous, extent, VK_FORMAT_R8_UNORM, VK_OPTICAL_FLOW_USAGE_INPUT_BIT_NV,
+        s.makeImage(s.previous, s.lumaExtent, VK_FORMAT_R8_UNORM, VK_OPTICAL_FLOW_USAGE_INPUT_BIT_NV,
             lumaUsage, VK_FORMAT_FEATURE_2_OPTICAL_FLOW_IMAGE_BIT_NV, "previous R8 luma");
         s.makeImage(s.forwardImage, s.flowExtent, VK_FORMAT_R16G16_S10_5_NV, VK_OPTICAL_FLOW_USAGE_OUTPUT_BIT_NV,
             VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_FORMAT_FEATURE_2_OPTICAL_FLOW_VECTOR_BIT_NV, "forward S10.5 flow");
@@ -385,8 +404,8 @@ namespace VkHook
             VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_FORMAT_FEATURE_2_OPTICAL_FLOW_COST_BIT_NV, "R8 cost");
 
         VkOpticalFlowSessionCreateInfoNV session{VK_STRUCTURE_TYPE_OPTICAL_FLOW_SESSION_CREATE_INFO_NV};
-        session.width = extent.width;
-        session.height = extent.height;
+        session.width = s.lumaExtent.width;
+        session.height = s.lumaExtent.height;
         session.imageFormat = VK_FORMAT_R8_UNORM;
         session.flowVectorFormat = VK_FORMAT_R16G16_S10_5_NV;
         session.costFormat = VK_FORMAT_R8_UINT;
@@ -411,9 +430,9 @@ namespace VkHook
         bind(s.backwardSession, VK_OPTICAL_FLOW_SESSION_BINDING_POINT_FLOW_VECTOR_NV, s.backwardImage);
 
         s.packedSource = context.createBuffer(pixels * 4, false, "DLSS5 optical raw input");
-        s.packedLuma = context.createBuffer((pixels + 3) & ~VkDeviceSize(3), false, "DLSS5 optical packed luma");
+        s.packedLuma = context.createBuffer((lumaPixels + 3) & ~VkDeviceSize(3), false, "DLSS5 optical packed luma");
         s.parameters = context.createBuffer(16, true, "DLSS5 optical luma parameters");
-        const uint32_t parameters[]{extent.width, extent.height, bgra ? 1u : 0u, 0u};
+        const uint32_t parameters[]{extent.width, extent.height, bgra ? 1u : 0u, downscale};
         std::memcpy(s.parameters.mapped, parameters, sizeof(parameters));
         const VkDeviceSize cells = VkDeviceSize(s.flowExtent.width) * s.flowExtent.height;
         s.forward = context.createBuffer(cells * 4, false, "DLSS5 forward optical flow");
@@ -427,7 +446,7 @@ namespace VkHook
         vk::SpecConstants constants;
         s.luma = context.createComputePipeline(context.loadShaderModule(shaderPath + "/dlss5_luma.spv"),
             constants, "DLSS5 optical luma");
-        const uint32_t groups = static_cast<uint32_t>((pixels + 255) / 256);
+        const uint32_t groups = static_cast<uint32_t>((lumaPixels + 255) / 256);
         s.lumaGroupsX = std::min(groups, properties.properties.limits.maxComputeWorkGroupCount[0]);
         s.lumaGroupsY = (groups + s.lumaGroupsX - 1) / s.lumaGroupsX;
         if (s.lumaGroupsY > properties.properties.limits.maxComputeWorkGroupCount[1])
@@ -501,7 +520,7 @@ namespace VkHook
         VkImageCopy historyCopy{};
         historyCopy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         historyCopy.dstSubresource = historyCopy.srcSubresource;
-        historyCopy.extent = {s.extent.width, s.extent.height, 1};
+        historyCopy.extent = {s.lumaExtent.width, s.lumaExtent.height, 1};
         s.copyImage(commands, s.current.image, VK_IMAGE_LAYOUT_GENERAL,
             s.previous.image, VK_IMAGE_LAYOUT_GENERAL, 1, &historyCopy);
         s.barrier(commands, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
@@ -513,4 +532,6 @@ namespace VkHook
     const vk::Buffer& Dlss5OpticalFlow::forward() const noexcept { return state->forward; }
     const vk::Buffer& Dlss5OpticalFlow::backward() const noexcept { return state->backward; }
     const vk::Buffer& Dlss5OpticalFlow::cost() const noexcept { return state->cost; }
+    const vk::Buffer& Dlss5OpticalFlow::source() const noexcept { return state->packedSource; }
+    uint32_t Dlss5OpticalFlow::downscale() const noexcept { return state->downscale; }
 }

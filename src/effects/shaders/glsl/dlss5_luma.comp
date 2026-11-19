@@ -7,27 +7,38 @@ layout(set = 0, binding = 1, std430) readonly buffer Parameters
     uint width;
     uint height;
     uint bgra;
-    uint pad;
+    uint downscale; // source pixels per luma pixel, per axis
 } params;
 layout(set = 0, binding = 7, std430) writeonly buffer Luminance { uint words[]; } luma;
 
 void main()
 {
+    uvec2 extent = (uvec2(params.width, params.height) + params.downscale - 1u) / params.downscale;
     uint word = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * 64u;
-    uint count = params.width * params.height;
+    uint count = extent.x * extent.y;
     if (word >= (count + 3u) / 4u) return;
+    uint area = params.downscale * params.downscale;
     uint packed = 0u;
     for (uint lane = 0u; lane < 4u; ++lane)
     {
         uint index = word * 4u + lane;
         if (index >= count) break;
-        uint pixel = source.pixels[index];
-        uint red = (pixel >> (params.bgra != 0u ? 16u : 0u)) & 255u;
-        uint green = (pixel >> 8u) & 255u;
-        uint blue = (pixel >> (params.bgra != 0u ? 0u : 16u)) & 255u;
-        // Rec.709 luma on the original nonlinear SDR bytes. Integer weights
-        // sum to 256, preserving black/white and avoiding cross-word races.
-        uint y = (54u * red + 183u * green + 19u * blue + 128u) >> 8u;
+        uvec2 origin = uvec2(index % extent.x, index / extent.x) * params.downscale;
+        uint sum = 0u;
+        for (uint dy = 0u; dy < params.downscale; ++dy)
+            for (uint dx = 0u; dx < params.downscale; ++dx)
+            {
+                uvec2 at = min(origin + uvec2(dx, dy), uvec2(params.width, params.height) - 1u);
+                uint pixel = source.pixels[at.y * params.width + at.x];
+                uint red = (pixel >> (params.bgra != 0u ? 16u : 0u)) & 255u;
+                uint green = (pixel >> 8u) & 255u;
+                uint blue = (pixel >> (params.bgra != 0u ? 0u : 16u)) & 255u;
+                // Rec.709 luma on the original nonlinear SDR bytes. Integer weights
+                // sum to 256, preserving black/white and avoiding cross-word races.
+                sum += 54u * red + 183u * green + 19u * blue;
+            }
+        // The box mean, rounded: a downscale of 1 is the pixel's own luma.
+        uint y = (sum + 128u * area) / (256u * area);
         packed |= y << (lane * 8u);
     }
     luma.words[word] = packed;

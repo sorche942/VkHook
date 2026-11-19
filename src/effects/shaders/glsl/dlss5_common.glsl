@@ -1,7 +1,7 @@
 #ifndef DLSS5_COMMON_GLSL
 #define DLSS5_COMMON_GLSL
 
-// Scalar std430 layout shared with VkHook::Dlss5Parameters (72 bytes).
+// Scalar std430 layout shared with VkHook::Dlss5Parameters (76 bytes).
 layout(std430, binding = 1) readonly buffer Parameters {
     uint width, height, fullWidth, fullHeight;
     uint bgra, seed;
@@ -11,6 +11,7 @@ layout(std430, binding = 1) readonly buffer Parameters {
     uint debugView;
     uint autoMask;
     float style;
+    uint flowScale; // full-resolution pixels per optical-flow input pixel
 } p;
 
 bool dlss5Finite(vec3 value) {

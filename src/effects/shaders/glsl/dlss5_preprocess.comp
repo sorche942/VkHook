@@ -1,16 +1,15 @@
 #version 460
-#extension GL_EXT_shader_explicit_arithmetic_types : require
 #extension GL_GOOGLE_include_directive : require
-#include "common.glsl"
+#include "dlss5_features.glsl"
 #include "dlss5_common.glsl"
-// Feature arithmetic and noise sequence from OpenDLSS-NR (MIT).
+// Noise sequence from OpenDLSS-NR (MIT).
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(std430, binding = 0) readonly buffer Source { uint pixels[]; };
 layout(std430, binding = 2) readonly buffer Reprojection {
     uint accepted, candidates, pad1, pad2;
     vec4 samples[];
 } reprojection;
-layout(std430, binding = 7) writeonly buffer Features { float features[]; };
+layout(std430, binding = 7) writeonly buffer Features { vec4 features[]; };
 float hashUniform(uint value) {
     uint mixed = value;
     mixed = (mixed >> ((mixed >> 28u) + 4u)) ^ mixed;
@@ -42,35 +41,27 @@ uint mirror(uint x, uint size) {
 void main() {
     uvec2 id = gl_GlobalInvocationID.xy;
     if (id.x >= p.fullWidth || id.y >= p.fullHeight) return;
-    vec4 rgba = unpackUnorm4x8(pixels[mirror(id.y, p.height) * p.width + mirror(id.x, p.width)]);
+    uint pixel = mirror(id.y, p.height) * p.width + mirror(id.x, p.width);
+    vec4 rgba = unpackUnorm4x8(pixels[pixel]);
     if (p.bgra != 0u) rgba = rgba.bgra;
-    vec3 centred;
-    for (uint c = 0u; c < 3u; ++c)
-        centred[c] = roundF16(roundF16(roundF16(rgba[c]) - 0.5) * 0.125);
-    vec3 noise = gaussian3(id.x, id.y, p.seed);
+    vec3 centred = dlss5Centred(rgba.rgb);
     vec3 history = centred;
     // Explicit guards keep first/reset frames away from uninitialized history.
     if (dlss5TemporalEnabled()) {
         if (dlss5FrameAccepted(reprojection.accepted, reprojection.candidates)) {
-            uint pixel = mirror(id.y, p.height) * p.width + mirror(id.x, p.width);
             vec4 previous = reprojection.samples[pixel];
-            if (dlss5SampleAccepted(previous)) {
-                for (uint c = 0u; c < 3u; ++c)
-                    history[c] = roundF16(roundF16(roundF16(previous[c]) - 0.5) * 0.125);
-            }
+            if (dlss5SampleAccepted(previous))
+                history = dlss5Centred(previous.rgb);
         }
     }
-    uint base = (id.y * p.fullWidth + id.x) * 16u;
-    for (uint c = 0u; c < 3u; ++c) {
-        features[base + c] = noise[c];
-        features[base + 4u + c] = centred[c];
-        features[base + 7u + c] = history[c];
-    }
-    features[base + 3u] = 1.0;
-    features[base + 10u] = p.style / 128.0;
-    features[base + 11u] = roundF16(p.localTone);
-    features[base + 12u] = roundF16(p.autoMask != 0u ? 1.0 : p.localStructure);
-    features[base + 13u] = roundF16(p.autoMask != 0u ? (p.skinStructure < 0.0 ? p.localStructure : p.skinStructure) : -1.0);
-    features[base + 14u] = roundF16(p.autoMask != 0u ? p.localStructure : -1.0);
-    features[base + 15u] = 0.0;
+    // One pixel's sixteen channels as four whole-vector stores: this pass is bound by
+    // its writes, and scalar stores scatter each channel of a warp across thirty-two rows.
+    vec3 noise = gaussian3(id.x, id.y, p.seed);
+    uint base = (id.y * p.fullWidth + id.x) * 4u;
+    features[base] = vec4(noise, 1.0);
+    features[base + 1u] = vec4(centred, history.r);
+    features[base + 2u] = vec4(history.gb, p.style / 128.0, roundF16(p.localTone));
+    features[base + 3u] = vec4(roundF16(p.autoMask != 0u ? 1.0 : p.localStructure),
+                               roundF16(p.autoMask != 0u ? (p.skinStructure < 0.0 ? p.localStructure : p.skinStructure) : -1.0),
+                               roundF16(p.autoMask != 0u ? p.localStructure : -1.0), 0.0);
 }

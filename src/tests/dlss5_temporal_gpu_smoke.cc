@@ -1,5 +1,6 @@
 // Opt-in NVIDIA GPU regression: production optical flow + temporal shaders.
 // No model weights required; the neural head is controlled to expose blending.
+// The optional second argument is the optical-flow input downscale (1, 2 or 4).
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
 #include "dlss5_device.hh"
@@ -15,6 +16,7 @@
 #include <memory>
 #include <iostream>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 using namespace VkHook;
@@ -103,7 +105,8 @@ int main(int argc, char** argv)
 {
     if (!std::getenv("VKHOOK_TEST_DLSS5_GPU")) return 77;
     try {
-        require(argc == 2, "pass the compiled DLSS5 shader directory");
+        require(argc == 2 || argc == 3, "pass the compiled DLSS5 shader directory [and the optical-flow downscale]");
+        const uint32_t downscale = argc == 3 ? static_cast<uint32_t>(std::stoul(argv[2])) : 1;
         Loader loader;
         Runtime runtime;
         VkApplicationInfo application{VK_STRUCTURE_TYPE_APPLICATION_INFO};
@@ -192,7 +195,7 @@ int main(int argc, char** argv)
         queueTable.add(context.queue(), graphics, 0);
         queueTable.add(opticalQueue, optical, 0);
         Dlss5OpticalFlow flow(context, queueTable, optical, opticalQueue, {width, height}, imageInfo.format,
-                             {runtime.source.image}, argv[1], vkGetInstanceProcAddr, vkGetDeviceProcAddr);
+                             {runtime.source.image}, downscale, argv[1], vkGetInstanceProcAddr, vkGetDeviceProcAddr);
         auto input = context.createBuffer(pixels * 4, false, "test input");
         auto previous = context.createBuffer(pixels * 4, false, "test previous input");
         auto history = context.createBuffer(pixels * 16, false, "test neural history");
@@ -205,7 +208,7 @@ int main(int argc, char** argv)
         params.width = params.fullWidth = width; params.height = params.fullHeight = height;
         params.intensity = params.localTone = params.localStructure = params.historyStrength = 1;
         params.skinStructure = -1; params.temporal = 1;
-        params.flowWidth = flow.flowWidth(); params.flowHeight = flow.flowHeight();
+        params.flowWidth = flow.flowWidth(); params.flowHeight = flow.flowHeight(); params.flowScale = flow.downscale();
         auto pipeline = [&](const char* name) {
             return context.createComputePipeline(context.loadShaderModule(std::string(argv[1]) + "/" + name + ".spv"), {}, name);
         };
@@ -220,7 +223,7 @@ int main(int argc, char** argv)
         std::fill(std::begin(bindings), std::end(bindings), nullptr);
         bindings[0] = &input; bindings[1] = &parameters; bindings[2] = &reprojection; bindings[7] = &tensor;
         const auto preprocessSet = context.allocateSet(bindings);
-        bindings[2] = &head; bindings[3] = &tensor; bindings[4] = &reprojection;
+        bindings[2] = &head; bindings[4] = &reprojection;
         bindings[5] = &history; bindings[6] = &flow.forward(); bindings[7] = &packedOutput;
         const auto compositeSet = context.allocateSet(bindings);
         std::vector<uint32_t> source(pixels);
@@ -305,11 +308,14 @@ int main(int argc, char** argv)
         const auto translated = frame();
         const auto forward = download<uint32_t>(context, flow.forward());
         std::vector<float> dx, dy;
-        for (uint32_t y = 8; y + 8 < params.flowHeight; ++y)
-            for (uint32_t x = 8; x + 8 < params.flowWidth; ++x) {
+        // Skip the same 32-pixel border at every downscale.
+        const uint32_t border = 8 / downscale;
+        for (uint32_t y = border; y + border < params.flowHeight; ++y)
+            for (uint32_t x = border; x + border < params.flowWidth; ++x) {
                 const auto packed = forward[y * params.flowWidth + x];
-                dx.push_back(static_cast<int16_t>(packed & 0xffffu) / 32.f);
-                dy.push_back(static_cast<int16_t>(packed >> 16) / 32.f);
+                // Vectors are in the engine's input pixels.
+                dx.push_back(static_cast<int16_t>(packed & 0xffffu) * static_cast<float>(downscale) / 32.f);
+                dy.push_back(static_cast<int16_t>(packed >> 16) * static_cast<float>(downscale) / 32.f);
             }
         std::sort(dx.begin(), dx.end()); std::sort(dy.begin(), dy.end());
         std::cout << "Motion median: " << dx[dx.size()/2] << ", " << dy[dy.size()/2] << '\n';

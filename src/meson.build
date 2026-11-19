@@ -44,6 +44,7 @@ if dlss5_available
     opendlss_nr_extra_shader_deps = files(
         'effects/shaders/glsl/dlss5_common.glsl',
         'effects/shaders/glsl/dlss5_debug.glsl',
+        'effects/shaders/glsl/dlss5_features.glsl',
     )
     subdir('vendor/opendlss_nr')
     dlss5_paths = configuration_data()
@@ -59,7 +60,8 @@ if dlss5_available
         input : get_option('dlss5_vulkan_registry'),
         output : 'dlss5_device_chain.inc',
         command : [opendlss_nr_python, files('../scripts/generate-dlss5-device-chain.py'), '@INPUT@', '@OUTPUT@'])
-    dlss5_sources += [files('effects/effect_dlss5.cc', 'render/dlss5_device.cc', 'render/dlss5_optical_flow.cc'), dlss5_chain]
+    dlss5_sources += [files('effects/effect_dlss5.cc', 'effects/dlss5_pipeline.cc', 'render/dlss5_device.cc',
+                            'render/dlss5_optical_flow.cc'), dlss5_chain]
     dlss5_dependencies += opendlss_nr_dep
     dlss5_args += '-DVKHOOK_DLSS5=1'
     dlss5_assets += opendlss_nr_assets
@@ -395,9 +397,22 @@ if dlss5_available
         link_depends : dlss5_assets)
     test('DLSS5 optical-flow temporal GPU', dlss5_temporal_gpu,
         args : [opendlss_nr_build_shader_dir], timeout : 120)
+    test('DLSS5 half-resolution optical-flow temporal GPU', dlss5_temporal_gpu,
+        args : [opendlss_nr_build_shader_dir, '2'], timeout : 120)
     # GPU timing and head parity of the network alone: see docs/WORKFLOWS.md.
     executable('vkhook-dlss5-bench', 'tests/dlss5_network_bench.cc',
         dependencies : [opendlss_nr_dep, libdl_dep],
+        link_depends : dlss5_assets)
+    # GPU timing of the effect's whole frame through the production pipeline.
+    executable('vkhook-dlss5-frame-bench',
+        'tests/dlss5_frame_bench.cc',
+        'effects/dlss5_pipeline.cc',
+        'render/dlss5_device.cc',
+        'render/dlss5_optical_flow.cc',
+        'gpu/queue.cc',
+        'gpu/timeline.cc',
+        dlss5_chain,
+        dependencies : [vkhook_core_dep, opendlss_nr_dep, libdl_dep],
         link_depends : dlss5_assets)
 endif
 

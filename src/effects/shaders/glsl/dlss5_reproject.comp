@@ -22,12 +22,12 @@ vec3 unpackColor(uint value) {
     return p.bgra != 0u ? rgba.bgr : rgba.rgb;
 }
 
-// NVIDIA R16G16_SFIXED5_NV: signed S10.5 displacement in source pixels,
-// not normalized UVs and not the 4x4 output-grid units.
+// NVIDIA R16G16_SFIXED5_NV: signed S10.5 displacement in pixels of the engine's
+// (possibly reduced) input, not normalized UVs and not output-grid units.
 vec2 unpackFlow(uint value) {
     int x = int(value << 16u) >> 16;
     int y = int(value) >> 16;
-    return vec2(x, y) * (1.0 / 32.0);
+    return vec2(x, y) * (float(p.flowScale) / 32.0);
 }
 
 uint flowIndex(ivec2 position) {
@@ -39,8 +39,9 @@ float costAt(uint index) {
 }
 
 vec2 sampleFlow(vec2 pixel, bool reverse, out float cost) {
-    // Hardware grid4 cells are centred at pixel-space (2, 2), (6, 2), ... .
-    vec2 grid = clamp((pixel + 0.5) * 0.25 - 0.5,
+    // Hardware grid4 cells cover 4 * flowScale pixels and are centred in them:
+    // at full resolution, at pixel-space (2, 2), (6, 2), ... .
+    vec2 grid = clamp((pixel + 0.5) * (0.25 / float(p.flowScale)) - 0.5,
                       vec2(0.0), vec2(p.flowWidth - 1u, p.flowHeight - 1u));
     ivec2 low = ivec2(floor(grid));
     ivec2 high = min(low + 1, ivec2(p.flowWidth, p.flowHeight) - 1);

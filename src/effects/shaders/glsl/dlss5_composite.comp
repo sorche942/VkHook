@@ -1,10 +1,10 @@
 #version 460
 #extension GL_GOOGLE_include_directive : require
+#include "dlss5_features.glsl"
 #include "dlss5_common.glsl"
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(std430, binding = 0) readonly buffer Source { uint pixels[]; };
 layout(std430, binding = 2) readonly buffer Head { vec4 head[]; };
-layout(std430, binding = 3) readonly buffer Features { float features[]; };
 layout(std430, binding = 4) readonly buffer Reprojection {
     uint accepted, candidates, pad1, pad2;
     vec4 samples[];
@@ -25,10 +25,12 @@ void main() {
     uint padded = id.y * p.fullWidth + id.x;
     vec4 proxy = unpackUnorm4x8(packed);
     if (p.bgra != 0u) proxy = proxy.bgra;
+    // The network's own input for this pixel, recomputed rather than read back
+    // from its sixteen-channel feature buffer.
+    vec3 centred = dlss5Centred(proxy.rgb);
     vec3 neural;
     for (uint c = 0u; c < 3u; ++c) {
-        // Preserve the original no-history feature arithmetic.
-        float inner = fma(head[padded][c], 0.03125, features[padded * 16u + 4u + c]);
+        float inner = fma(head[padded][c], 0.03125, centred[c]);
         neural[c] = clamp(inner * 8.0 + 0.5, 0.0, 1.0);
     }
     bool frameAccepted = false;
