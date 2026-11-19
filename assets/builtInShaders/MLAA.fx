@@ -1,5 +1,5 @@
 /*
-    MSAA.fx — from-scratch morphological anti-aliasing.
+    MLAA.fx — from-scratch morphological anti-aliasing.
 
     This is a post-process (image-space) anti-aliasing filter in the MLAA
     family. It is not hardware multisampling: it looks for luminance
@@ -45,27 +45,27 @@ uniform float BlendStrength <
         "of the original edge.";
 > = 1.0;
 
-float MSAALuma(float3 color)
+float MLAALuma(float3 color)
 {
     return dot(color, float3(0.299, 0.587, 0.114));
 }
 
 // Coverage of a pixel `near` pixels from one end of a segment `total` long.
-float MSAACoverage(float near, float total)
+float MLAACoverage(float near, float total)
 {
     return saturate(0.5 * (1.0 - (2.0 * near + 1.0) / total));
 }
 
 // Measures how far the edge that sits `off` pixels away continues along `step`.
-float2 MSAAMeasure(float2 texcoord, float2 pixel, float2 off, float2 step, int steps, float threshold)
+float2 MLAAMeasure(float2 texcoord, float2 pixel, float2 off, float2 step, int steps, float threshold)
 {
     float left = 0.0;
     [loop]
     for (int i = 1; i <= steps; i++)
     {
         float2 a = texcoord - step * (float)i * pixel;
-        float here = MSAALuma(tex2D(ReShade::BackBuffer, a).rgb);
-        float there = MSAALuma(tex2D(ReShade::BackBuffer, a + off * pixel).rgb);
+        float here = MLAALuma(tex2D(ReShade::BackBuffer, a).rgb);
+        float there = MLAALuma(tex2D(ReShade::BackBuffer, a + off * pixel).rgb);
         if (abs(here - there) <= threshold)
             break;
         left = (float)i;
@@ -75,8 +75,8 @@ float2 MSAAMeasure(float2 texcoord, float2 pixel, float2 off, float2 step, int s
     for (int j = 1; j <= steps; j++)
     {
         float2 a = texcoord + step * (float)j * pixel;
-        float here = MSAALuma(tex2D(ReShade::BackBuffer, a).rgb);
-        float there = MSAALuma(tex2D(ReShade::BackBuffer, a + off * pixel).rgb);
+        float here = MLAALuma(tex2D(ReShade::BackBuffer, a).rgb);
+        float there = MLAALuma(tex2D(ReShade::BackBuffer, a + off * pixel).rgb);
         if (abs(here - there) <= threshold)
             break;
         right = (float)j;
@@ -84,7 +84,7 @@ float2 MSAAMeasure(float2 texcoord, float2 pixel, float2 off, float2 step, int s
     return float2(left, right);
 }
 
-float3 PS_MSAA(float4 position : SV_Position, float2 texcoord : TEXCOORD) : SV_Target
+float3 PS_MLAA(float4 position : SV_Position, float2 texcoord : TEXCOORD) : SV_Target
 {
     const float2 px = ReShade::PixelSize;
     float3 color = tex2D(ReShade::BackBuffer, texcoord).rgb;
@@ -96,7 +96,7 @@ float3 PS_MSAA(float4 position : SV_Position, float2 texcoord : TEXCOORD) : SV_T
     float  edgeWeight[4];
     bool   edgeActive[4];
 
-    const float sourceLuma = MSAALuma(color);
+    const float sourceLuma = MLAALuma(color);
     [unroll]
     for (int e = 0; e < 4; e++)
     {
@@ -107,12 +107,12 @@ float3 PS_MSAA(float4 position : SV_Position, float2 texcoord : TEXCOORD) : SV_T
         const float2 along = (e < 2) ? float2(1.0, 0.0) : float2(0.0, 1.0);
 
         neighbourColor[e] = tex2D(ReShade::BackBuffer, texcoord + off * px).rgb;
-        neighbourLuma[e] = MSAALuma(neighbourColor[e]);
+        neighbourLuma[e] = MLAALuma(neighbourColor[e]);
         edgeActive[e] = abs(sourceLuma - neighbourLuma[e]) > EdgeThreshold;
 
-        const float2 measured = MSAAMeasure(texcoord, px, off, along, SearchSteps, EdgeThreshold);
+        const float2 measured = MLAAMeasure(texcoord, px, off, along, SearchSteps, EdgeThreshold);
         const float total = measured.x + measured.y + 1.0;
-        edgeWeight[e] = MSAACoverage(min(measured.x, measured.y), total) * BlendStrength;
+        edgeWeight[e] = MLAACoverage(min(measured.x, measured.y), total) * BlendStrength;
     }
 
     // One MLAA application. The technique declares three passes, so each one
@@ -126,8 +126,8 @@ float3 PS_MSAA(float4 position : SV_Position, float2 texcoord : TEXCOORD) : SV_T
     return color;
 }
 
-technique MSAA <
-    ui_label = "MSAA (morphological)";
+technique MLAA <
+    ui_label = "MLAA (morphological anti-aliasing)";
     ui_tooltip =
         "Post-process morphological anti-aliasing. Finds luminance edges and\n"
         "blends only the pixels at the ends of each edge segment, leaving long\n"
@@ -135,7 +135,7 @@ technique MSAA <
         "softened image.";
 >
 {
-    pass { VertexShader = PostProcessVS; PixelShader = PS_MSAA; }
-    pass { VertexShader = PostProcessVS; PixelShader = PS_MSAA; }
-    pass { VertexShader = PostProcessVS; PixelShader = PS_MSAA; }
+    pass { VertexShader = PostProcessVS; PixelShader = PS_MLAA; }
+    pass { VertexShader = PostProcessVS; PixelShader = PS_MLAA; }
+    pass { VertexShader = PostProcessVS; PixelShader = PS_MLAA; }
 }
