@@ -2,24 +2,18 @@ subdir('vendor/reshade')
 
 glsl_shader_src = files(
     'effects/shaders/glsl/depth_resolve.frag.glsl',
-    'effects/shaders/glsl/depth_resolve_ms.frag.glsl',
-    'effects/shaders/glsl/depth_resolve_msaa.frag.glsl',
-    'effects/shaders/glsl/depth_resolve_alpha.frag.glsl',
-    'effects/shaders/glsl/depth_resolve_alpha_ms.frag.glsl',
-    'effects/shaders/glsl/depth_resolve_alpha_msaa.frag.glsl',
-    'effects/shaders/glsl/depth_resolve_inverted.frag.glsl',
-    'effects/shaders/glsl/depth_resolve_inverted_ms.frag.glsl',
-    'effects/shaders/glsl/depth_resolve_inverted_msaa.frag.glsl',
-    'effects/shaders/glsl/depth_resolve_universal.frag.glsl',
-    'effects/shaders/glsl/depth_resolve_universal_ms.frag.glsl',
-    'effects/shaders/glsl/depth_resolve_universal_msaa.frag.glsl',
     'effects/shaders/glsl/full_screen_triangle.vert.glsl',
 )
 glsl_compiler = find_program('glslangValidator')
 glsl_generator = generator(glsl_compiler,
     output: ['@BASENAME@.h'],
     arguments: ['-V', '-x', '@INPUT@', '-o', '@OUTPUT@'])
-shader_include = glsl_generator.process(glsl_shader_src)
+# the multisampled depth resolve is the same source built with -DMSAA
+depth_resolve_msaa_spv = custom_target('depth_resolve_msaa.frag.h',
+    input : files('effects/shaders/glsl/depth_resolve.frag.glsl'),
+    output : 'depth_resolve_msaa.frag.h',
+    command : [glsl_compiler, '-V', '-x', '-DMSAA', '@INPUT@', '-o', '@OUTPUT@'])
+shader_include = [glsl_generator.process(glsl_shader_src), depth_resolve_msaa_spv]
 
 dlss5_assets = []
 dlss5_sources = []
@@ -99,6 +93,7 @@ VkHook_src = [
     'present/present.cc',
     'present/present_mode.cc',
     'present/submit.cc',
+    'depth/capture.cc',
     'depth/hooks.cc',
     'depth/tracker.cc',
     'control/frontend.cc',
@@ -138,7 +133,6 @@ VkHook_src = [
     'core/logger.cc',
     'render/logical_swapchain.cc',
     'render/memory.cc',
-    'render/renderpass.cc',
     'effects/reshade_uniforms.cc',
     'render/sampler.cc',
     'render/shader.cc',
@@ -362,15 +356,7 @@ x11_input_handoff_tests = executable('vkhook-x11-input-handoff-tests',
     include_directories : [core_inc, input_inc, source_inc])
 test('x11 input handoff', x11_input_handoff_tests)
 
-# DepthCopyState serializes the CmdEndRenderPass* -> QueueSubmit handoff and the
-# copy ring against DestroyDevice. A missing lock only shows as an intermittent
-# device loss under load, so the state is hammered directly here.
 threads_dep = dependency('threads')
-depth_copy_state_tests = executable('vkhook-depth-copy-state-tests',
-    'render/depth_copy_state_test.cc',
-    dependencies : [threads_dep],
-    include_directories : [render_inc, source_inc])
-test('depth copy state', depth_copy_state_tests)
 
 # RetireQueue + Timeline (formal/VkHookFormal/RetireQueue.lean): seeded random
 # action sequences against a ground-truth GPU model, no Vulkan device needed.
@@ -433,14 +419,15 @@ present_mode_tests = executable('vkhook-present-mode-tests',
 test('present modes', present_mode_tests,
     env : ['VKHOOK_LOG_LEVEL=none'])
 
-# Link the production recorder and fake only Vulkan dispatch. Section GC keeps
-# unrelated command-buffer allocation/effect code out of the headless executable.
-depth_snapshot_scope_tests = executable('vkhook-depth-snapshot-scope-tests',
-    'render/depth_snapshot_scope_test.cc',
-    'render/command_buffer.cc',
+# The depth tracker's contracts (candidate selection, layout tracking through
+# barriers, storage lifetime against recorded command buffers, handle reuse)
+# against a fake Vulkan dispatch; no device needed.
+depth_tracker_tests = executable('vkhook-depth-tracker-tests',
+    'depth/tracker_test.cc',
+    'depth/tracker.cc',
     'render/format.cc',
     'render/image_view.cc',
-    'render/logical_swapchain.cc',
+    'render/memory.cc',
     'gpu/retire.cc',
     'gpu/timeline.cc',
     'core/logger.cc',
@@ -450,8 +437,13 @@ depth_snapshot_scope_tests = executable('vkhook-depth-snapshot-scope-tests',
     link_args : ['-Wl,--gc-sections'],
     dependencies : [threads_dep],
     include_directories : [core_inc, render_inc, effects_inc, source_inc])
-test('depth snapshot scope', depth_snapshot_scope_tests,
+test('depth tracker', depth_tracker_tests,
     env : ['VKHOOK_LOG_LEVEL=none'])
+
+# Raw vkQueue* calls bypass QueueTable's per-queue lock (AGENTS.md invariant 1).
+python3 = find_program('python3')
+test('queue calls', python3,
+    args : [files('tests/check_queue_calls.py'), meson.current_source_dir()])
 
 # The compile cache is what stops a chain reload from re-parsing every ReShade
 # effect. Its keying and bound are the contract, and a missing lock would only

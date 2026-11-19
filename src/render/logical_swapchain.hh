@@ -19,17 +19,7 @@ namespace VkHook
     class Config;
     class InputSession;
     class OverlayRenderer;
-
-    // for each swapchain, we have the Images and the other stuff we need to execute the compute shader
-    // Per-image depth resolve resources — kept together so they
-    // can never desynchronize across parallel vectors.
-    struct DepthResolvePerImage
-    {
-        VkImage        image     = VK_NULL_HANDLE;
-        VkImageView    imageView = VK_NULL_HANDLE;
-        VkDeviceMemory memory    = VK_NULL_HANDLE;
-        bool           initialized = false;
-    };
+    class DepthCapture;  // depth/capture.hh
 
     // Swapchain-lifetime resources and the per-image frame ring, shared by every
     // chain generation of one swapchain. The game holds the fake images, and the
@@ -39,6 +29,11 @@ namespace VkHook
     struct SwapchainShared
     {
         LogicalDevice*             logicalDevice = nullptr;
+        // 3 sets of imageCount, in this order: the game-facing fakes the application
+        // renders into, then the two ping-pong images the effect chain alternates
+        // between (every effect reads one and writes the other; the last writes
+        // the real image, or a ping-pong image when the swapchain cannot be
+        // written directly). Chain depth costs no memory.
         std::vector<VkImage>       fakeImages;
         std::vector<VkDeviceMemory> fakeImageMemories;
         std::vector<VkImageView>   imageViews;  // real images, for overlay rendering
@@ -62,6 +57,12 @@ namespace VkHook
         // for the swapchain's life) and reset before anything it renders into
         // is released.
         std::shared_ptr<OverlayRenderer> overlay;
+
+        // The frame's depth, copied at present for the effects to sample (null
+        // while depth capture is off or its targets could not be created).
+        std::shared_ptr<DepthCapture> depthCapture;
+        // the depth image the last present captured (log on change only)
+        uint64_t                      lastDepthSource = 0;
 
         // First-generation build (vkGetSwapchainImagesKHR). The mutex guards the
         // state variable only and is never held while building; a concurrent
@@ -88,49 +89,13 @@ namespace VkHook
         ~SwapchainShared();
     };
 
-    // Per chain-generation depth-resolve resources. A rebuild builds a fresh set
-    // beside the live one and swaps whole generations (present/swapchain.cc).
-    struct DepthResolveFields
-    {
-        std::vector<DepthResolvePerImage>       depthResolvePerImage;
-        VkFormat                             depthResolveFormat = VK_FORMAT_UNDEFINED;
-        VkExtent3D                           depthResolveExtent = {0, 0, 1};
-        VkImageView                          depthResolveSourceView = VK_NULL_HANDLE;  // Track which view we resolved for
-        bool                                 depthResolveUsesShader = false;
-        // MSAA depth resolve path. When the active depth source is multisampled
-        // and not in GENERAL layout, the layer resolves it down to 1 sample via
-        // a depth-stencil resolve subpass (VkSubpassDescriptionDepthStencilResolve)
-        // before effects sample it. The resolve target is depthResolvePerImage.
-        bool                                 depthResolveIsMsaa = false;
-        VkSampleCountFlagBits                depthResolveSourceSamples = VK_SAMPLE_COUNT_1_BIT;
-        VkResolveModeFlagBits                depthResolveMode = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
-        VkRenderPass                         depthResolveMsaaRenderPass = VK_NULL_HANDLE;
-        std::vector<VkFramebuffer>           depthResolveMsaaFramebuffers;
-        // msaa + transform: resolves into depthResolvePerImage, then a second
-        // subpass writes the transformed copy effects read into
-        // depthResolveTransformedPerImage — all inside one render pass.
-        bool                                 depthResolveMsaaTransform = false;
-        std::vector<DepthResolvePerImage>    depthResolveTransformedPerImage;
-        VkRenderPass                         depthResolveTransformRenderPass = VK_NULL_HANDLE;
-        std::vector<VkFramebuffer>           depthResolveTransformFramebuffers;
-        VkSampler                            depthResolveSampler = VK_NULL_HANDLE;
-        VkDescriptorSetLayout                depthResolveDescriptorSetLayout = VK_NULL_HANDLE;
-        VkDescriptorPool                     depthResolveDescriptorPool = VK_NULL_HANDLE;
-        std::vector<VkDescriptorSet>         depthResolveDescriptorSets;
-        VkRenderPass                         depthResolveRenderPass = VK_NULL_HANDLE;
-        VkPipelineLayout                     depthResolvePipelineLayout = VK_NULL_HANDLE;
-        VkPipeline                           depthResolvePipeline = VK_NULL_HANDLE;
-        std::vector<VkFramebuffer>           depthResolveFramebuffers;
-    };
-
     // One chain generation of a swapchain: the effects, their command buffers
-    // and the depth-resolve resources those buffers reference (AGENTS.md
-    // invariant 6; formal/VkHookFormal/ChainRebuild.lean). A rebuild constructs
+    // (AGENTS.md invariant 6; formal/VkHookFormal/ChainRebuild.lean). A rebuild constructs
     // the next generation with no lock held (cloneBase + build), the registry
     // swaps the pointer under the device's stateLock at a present boundary, and
     // destroying the old object retires its resources through the RetireQueue
     // once the last present thread using it drops its reference.
-    struct LogicalSwapchain : DepthResolveFields
+    struct LogicalSwapchain
     {
         LogicalDevice*                       logicalDevice = nullptr;
         VkSwapchainKHR                       handle        = VK_NULL_HANDLE;
@@ -144,12 +109,14 @@ namespace VkHook
         bool                                 useMutableFormat = false;
         std::vector<VkImage>                 images;
         std::vector<VkImageView>             imageViews;  // for overlay rendering
-        std::vector<VkImage>                 fakeImages;
+        // the three sets of SwapchainShared::fakeImages, each imageCount long
+        std::vector<VkImage>                 fakeImages;  // game-facing
+        std::vector<VkImage>                 pingImages;
+        std::vector<VkImage>                 pongImages;
         // real images served and presents passed through: zero-sized, layered,
         // a surface that cannot take TRANSFER_DST, or fake allocation failed.
         // Fixed once GetSwapchainImages answered; a swapchain is never both.
         bool                                 passthrough = false;
-        size_t                               maxEffectSlots = 0;  // Max number of effects supported
         std::vector<VkSemaphore>             semaphores;
         std::vector<VkSemaphore>             overlaySemaphores;
         std::vector<VkFence>                 effectSubmitFences;
@@ -166,11 +133,9 @@ namespace VkHook
         std::vector<std::shared_ptr<Effect>> effects;
         std::shared_ptr<Effect>              defaultTransfer;
         uint64_t                             generation = 0;
-        // names of the effects `effects` was built from (a depth rebuild builds
-        // the same chain again)
+        // names of the effects `effects` was built from (a rebuild builds the
+        // same chain again)
         std::vector<std::string>             effectNames;
-
-        bool depthReallocPending = false;
 
         LogicalSwapchain() = default;
         LogicalSwapchain(const LogicalSwapchain&)            = delete;
@@ -189,15 +154,10 @@ namespace VkHook
             return shared && image < shared->effectFenceUsed.size() && shared->effectFenceUsed[image];
         }
 
-        // Retires this generation's pool, command buffers and depth-resolve
-        // resources and drops its effects. Called by the destructor.
+        // Retires this generation's pool and command buffers and drops its effects. Called by the destructor.
         void releaseGeneration();
     };
 
-    // Retires every depth-resolve object of the set (the pipeline, pass,
-    // framebuffers, views, images and memory a recorded buffer may reference)
-    // and resets it to empty.
-    void retireDepthResolveFields(LogicalDevice* logicalDevice, DepthResolveFields& fields);
 } // namespace VkHook
 
 #endif // LOGICAL_SWAPCHAIN_HPP_INCLUDED

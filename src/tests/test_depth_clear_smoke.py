@@ -111,12 +111,11 @@ def seed(work, args):
 
 
 def evidence(text, width, height, legacy):
-    layout = 3 if legacy else 1
-    backend = "(?:shader|copy)" if legacy else "shader"
+    # 129 is VK_FORMAT_D24_UNORM_S8_UINT. The capture may sample the image live
+    # or from the layer's preserved copy; either is a real source.
     required = {
-        "selected D24S8 depth": rf"active depth state updated[^\n]*format=129[^\n]*extent={width}x{height}[^\n]*observedLayout={layout}(?:\s|$)",
-        "single-sample snapshot": rf"depth resolve path: {backend} observedLayout={layout} samples=1(?:\s|$)",
-        "offscreen render scope with real draws": r"depth candidate promoted[^\n]*draws=[1-9][0-9]* presentable=false",
+        "tracked D24S8 depth": rf"tracked depth image \S+ 129 {width}x{height} samples: 1(?:\s|$)",
+        "capture source selected": r"depth capture source changed: image \S+ \((?:live|preserved copy)\)",
     }
     found = {}
     for label, pattern in required.items():

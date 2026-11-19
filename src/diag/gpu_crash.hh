@@ -22,7 +22,6 @@ namespace VkHook
         // VKHOOK_SMOKE_DEPTH_REFRESH, read once when the device is created
         int                                   smokeRefreshIntervalMs = 0;
         std::chrono::steady_clock::time_point lastSmokeRefresh{};
-        bool                                  depthDumped = false;
     };
 
     std::string formatHexU64(uint64_t value);
@@ -48,8 +47,4 @@ namespace VkHook
 
     // Smoke-test hook (VKHOOK_SMOKE_DEPTH_REFRESH=<ms>): the Advanced tab's refresh on a timer.
     void maybeForceSmokeDepthRefresh(LogicalDevice* logicalDevice, DiagState& state);
-
-    // Developer-only depth-resolve dump (VKHOOK_DEBUG builds); no-op otherwise.
-    void maybeDumpDepthResolveImage(LogicalDevice* logicalDevice, LogicalSwapchain* logicalSwapchain,
-                                    uint32_t imageIndex, VkQueue queue, DiagState& state);
 } // namespace VkHook

@@ -5,8 +5,7 @@
 //
 //   mode = faked ? (bypass ? CopyOnly : Effects) : Passthrough
 //
-// A bypass (effects off, soft-disabled, depth hold, a chain generation still
-// pending) never selects Passthrough on a faked swapchain: the game rendered
+// A bypass (effects off, soft-disabled) never selects Passthrough on a faked swapchain: the game rendered
 // into the fake images, so something must copy them into the real image the
 // present shows. CopyOnly is that something.
 //
@@ -37,8 +36,6 @@ namespace VkHook
         bool faked             = false;  // the layer replaced the swapchain's images
         bool effectsOn         = true;
         bool softDisabled      = false;
-        bool depthHold         = false;  // depth path held off after a swapchain create
-        bool generationPending = false;  // a chain rebuild is due or failed
     };
 
     PresentMode choosePresentMode(const ModeInputs& inputs);
@@ -63,6 +60,8 @@ namespace VkHook
     {
         PresentMode     mode = PresentMode::Passthrough;
         // faked: the command buffer to run and the semaphore it signals
+        // runs first in the same submission when set (the depth capture)
+        VkCommandBuffer preCommandBuffer = VK_NULL_HANDLE;
         VkCommandBuffer commandBuffer   = VK_NULL_HANDLE;
         VkSemaphore     signalSemaphore = VK_NULL_HANDLE;
         VkFence         fence           = VK_NULL_HANDLE;  // layer submission probe, or null

@@ -1,5 +1,6 @@
 #include "logical_swapchain.hh"
 
+#include "depth/capture.hh"
 #include "gpu/retire.hh"
 #include "logger.hh"
 
@@ -7,66 +8,6 @@
 
 namespace VkHook
 {
-namespace
-{
-    void retireFramebuffers(LogicalDevice* device, std::vector<VkFramebuffer>& framebuffers)
-    {
-        for (VkFramebuffer framebuffer : framebuffers)
-            device->retire(VK_OBJECT_TYPE_FRAMEBUFFER, framebuffer);
-        framebuffers.clear();
-    }
-
-    void retirePerImage(LogicalDevice* device, std::vector<DepthResolvePerImage>& perImage)
-    {
-        for (DepthResolvePerImage& image : perImage)
-        {
-            device->retire(VK_OBJECT_TYPE_IMAGE_VIEW, image.imageView);
-            device->retire(VK_OBJECT_TYPE_IMAGE, image.image);
-            device->retire(VK_OBJECT_TYPE_DEVICE_MEMORY, image.memory);
-        }
-        perImage.clear();
-    }
-} // namespace
-
-    void retireDepthResolveFields(LogicalDevice* device, DepthResolveFields& f)
-    {
-        f.depthResolveSourceView = VK_NULL_HANDLE;
-
-        retireFramebuffers(device, f.depthResolveFramebuffers);
-        retireFramebuffers(device, f.depthResolveMsaaFramebuffers);
-        retireFramebuffers(device, f.depthResolveTransformFramebuffers);
-
-        device->retire(VK_OBJECT_TYPE_RENDER_PASS, f.depthResolveMsaaRenderPass);
-        f.depthResolveMsaaRenderPass = VK_NULL_HANDLE;
-        device->retire(VK_OBJECT_TYPE_RENDER_PASS, f.depthResolveTransformRenderPass);
-        f.depthResolveTransformRenderPass = VK_NULL_HANDLE;
-        device->retire(VK_OBJECT_TYPE_PIPELINE, f.depthResolvePipeline);
-        f.depthResolvePipeline = VK_NULL_HANDLE;
-        device->retire(VK_OBJECT_TYPE_PIPELINE_LAYOUT, f.depthResolvePipelineLayout);
-        f.depthResolvePipelineLayout = VK_NULL_HANDLE;
-        device->retire(VK_OBJECT_TYPE_RENDER_PASS, f.depthResolveRenderPass);
-        f.depthResolveRenderPass = VK_NULL_HANDLE;
-        // the pool frees its sets
-        device->retire(VK_OBJECT_TYPE_DESCRIPTOR_POOL, f.depthResolveDescriptorPool);
-        f.depthResolveDescriptorPool = VK_NULL_HANDLE;
-        device->retire(VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT, f.depthResolveDescriptorSetLayout);
-        f.depthResolveDescriptorSetLayout = VK_NULL_HANDLE;
-        device->retire(VK_OBJECT_TYPE_SAMPLER, f.depthResolveSampler);
-        f.depthResolveSampler = VK_NULL_HANDLE;
-
-        retirePerImage(device, f.depthResolvePerImage);
-        retirePerImage(device, f.depthResolveTransformedPerImage);
-
-        f.depthResolveDescriptorSets.clear();
-        f.depthResolveFormat          = VK_FORMAT_UNDEFINED;
-        f.depthResolveExtent          = {0, 0, 1};
-        f.depthResolveUsesShader      = false;
-        f.depthResolveIsMsaa          = false;
-        f.depthResolveMsaaTransform   = false;
-        f.depthResolveSourceSamples   = VK_SAMPLE_COUNT_1_BIT;
-        f.depthResolveMode            = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
-    }
-
     void SwapchainShared::release(bool gpuIdle)
     {
         if (!logicalDevice)
@@ -74,6 +15,7 @@ namespace
         LogicalDevice& d = *logicalDevice;
         // the renderer retires its own objects; it goes before the images it draws into
         overlay.reset();
+        depthCapture.reset();
         auto drop = [&](VkObjectType type, auto handle) {
             if (!handle)
                 return;
@@ -137,8 +79,9 @@ namespace
         next->images                  = images;
         next->imageViews              = imageViews;
         next->fakeImages              = fakeImages;
+        next->pingImages              = pingImages;
+        next->pongImages              = pongImages;
         next->passthrough             = passthrough;
-        next->maxEffectSlots          = maxEffectSlots;
         next->semaphores              = semaphores;
         next->overlaySemaphores       = overlaySemaphores;
         next->effectSubmitFences      = effectSubmitFences;
@@ -161,9 +104,6 @@ namespace
         // Effects retire their own GPU objects in their destructors.
         effects.clear();
         defaultTransfer.reset();
-
-        if (logicalDevice)
-            retireDepthResolveFields(logicalDevice, *this);
     }
 
     LogicalSwapchain::~LogicalSwapchain()

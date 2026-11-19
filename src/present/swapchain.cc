@@ -6,6 +6,7 @@
 #include "layer/env.hh"
 
 #include "control/frontend.hh"
+#include "depth/capture.hh"
 #include "depth/tracker.hh"
 #include "diag/gpu_crash.hh"
 
@@ -55,54 +56,33 @@ namespace VkHook
             return;
         }
 
-        const size_t requiredSlots = effectStrings.empty()
-            ? 1
-            : effectStrings.size() + (useMutableFormat ? 0u : 1u);
-        const size_t requiredFakeImages = static_cast<size_t>(logicalSwapchain->imageCount) * requiredSlots;
-        if (logicalSwapchain->fakeImages.size() < requiredFakeImages)
-        {
-            Logger::err("Insufficient fake images for effect chain: have "
-                        + std::to_string(logicalSwapchain->fakeImages.size()) + ", need "
-                        + std::to_string(requiredFakeImages));
-            return;
-        }
-
         // If no effects, add pass-through so rendering still works
         if (effectStrings.empty())
         {
-            std::vector<VkImage> firstImages(logicalSwapchain->fakeImages.begin(),
-                                             logicalSwapchain->fakeImages.begin() + logicalSwapchain->imageCount);
             logicalSwapchain->effects.push_back(std::make_shared<TransferEffect>(
                 logicalDevice, logicalSwapchain->format, logicalSwapchain->imageExtent,
-                firstImages, logicalSwapchain->images, config));
+                logicalSwapchain->fakeImages, logicalSwapchain->images, config));
             return;
         }
 
         // New scope for each swapchain build/reload: history must not alias an
         // old chain (possibly still in flight) or another swapchain's images.
         ReshadeTexturePool texturePool(logicalDevice);
+        // Effect 0 reads what the game rendered; every other effect reads what
+        // the previous one wrote. The chain alternates between two images, so
+        // its length costs no memory. Effect i writes ping when i is even,
+        // pong when odd; the last effect writes the real image where the
+        // swapchain can take it directly.
+        const auto pingPong = [&](size_t effect) -> const std::vector<VkImage>& {
+            return effect % 2 == 0 ? logicalSwapchain->pingImages : logicalSwapchain->pongImages;
+        };
         for (uint32_t i = 0; i < effectStrings.size(); i++)
         {
             VKHOOK_LOG_DEBUG([&](std::string& s) { s = "creating effect " + std::to_string(i) + ": " + effectStrings[i]; });
 
-            // Calculate input images for this effect
-            std::vector<VkImage> firstImages(logicalSwapchain->fakeImages.begin() + logicalSwapchain->imageCount * i,
-                                             logicalSwapchain->fakeImages.begin() + logicalSwapchain->imageCount * (i + 1));
-
-            // Calculate output images - last effect writes to swapchain or final fake images
-            std::vector<VkImage> secondImages;
-            if (i == effectStrings.size() - 1)
-            {
-                secondImages = useMutableFormat
-                    ? logicalSwapchain->images
-                    : std::vector<VkImage>(logicalSwapchain->fakeImages.end() - logicalSwapchain->imageCount,
-                                           logicalSwapchain->fakeImages.end());
-            }
-            else
-            {
-                secondImages = std::vector<VkImage>(logicalSwapchain->fakeImages.begin() + logicalSwapchain->imageCount * (i + 1),
-                                                    logicalSwapchain->fakeImages.begin() + logicalSwapchain->imageCount * (i + 2));
-            }
+            const std::vector<VkImage>& firstImages = i == 0 ? logicalSwapchain->fakeImages : pingPong(i - 1);
+            const std::vector<VkImage>& secondImages =
+                (i == effectStrings.size() - 1 && useMutableFormat) ? logicalSwapchain->images : pingPong(i);
 
             // Check if effect should be skipped (disabled or failed)
             bool effectFailed = effectRegistry.hasEffectFailed(effectStrings[i]);
@@ -185,41 +165,18 @@ namespace VkHook
         {
             logicalSwapchain->effects.push_back(std::make_shared<TransferEffect>(
                 logicalDevice, logicalSwapchain->format, logicalSwapchain->imageExtent,
-                std::vector<VkImage>(logicalSwapchain->fakeImages.end() - logicalSwapchain->imageCount, logicalSwapchain->fakeImages.end()),
-                logicalSwapchain->images, config));
+                pingPong(effectStrings.size() - 1), logicalSwapchain->images, config));
         }
     }
 
 namespace
 {
-    // The depth state a chain generation for `sc` records: the device's active
-    // or pinned depth when it matches the swapchain, else the best candidate of
-    // that size. Empty when none fits. Caller holds stateLock.
-    DepthState chainDepthLocked(LogicalDevice* logicalDevice, const LogicalSwapchain& sc)
-    {
-        DepthState effective = getDepthState(logicalDevice);
-        if (hasDepthState(effective) && !validateDepthStateForResolve(logicalDevice, effective))
-            effective = {};
-
-        DepthState chainDepth{};
-        if (depthMatchesSwapchainExtent(effective, &sc))
-            chainDepth = effective;
-        else if (logicalDevice->pinnedDepthImageView == VK_NULL_HANDLE)
-            selectDepthCandidateForSwapchainLocked(logicalDevice, &sc, chainDepth);
-
-        if (!hasDepthState(effective) && hasDepthState(chainDepth))
-            logicalDevice->activeDepthState = chainDepth;
-        return chainDepth;
-    }
-
     // Builds the chain of `next`, an unpublished generation no other thread can
-    // see: its own RESET-flag command pool, the effects, the effect and the
-    // copy-only command buffers, and the depth-resolve resources the effect
-    // buffers reference. No lock is held and nothing waits for the GPU.
+    // see: its own RESET-flag command pool, the effects, and the effect and the
+    // copy-only command buffers. No lock is held and nothing waits for the GPU.
     // On false, `next` is incomplete and must be dropped (its destructor retires
     // whatever was created).
-    bool buildGeneration(LogicalDevice* logicalDevice, LogicalSwapchain& next, std::vector<std::string> effectNames,
-                         const DepthState& depth)
+    bool buildGeneration(LogicalDevice* logicalDevice, LogicalSwapchain& next, std::vector<std::string> effectNames)
     {
         if (next.imageCount == 0 || next.fakeImages.empty())
             return false;
@@ -234,14 +191,6 @@ namespace
             Logger::err("Failed to create the chain command pool (" + std::to_string(poolResult) + ")");
             next.commandPool = VK_NULL_HANDLE;
             return false;
-        }
-
-        // Fake images are allocated at swapchain creation based on maxEffectSlots
-        if (effectNames.size() > next.maxEffectSlots)
-        {
-            Logger::warn("Cannot add more effects than maxEffectSlots (" + std::to_string(effectNames.size()) + " > "
-                         + std::to_string(next.maxEffectSlots) + "). Increase maxEffects in config.");
-            effectNames.resize(next.maxEffectSlots);
         }
 
         createEffectsForSwapchain(&next, logicalDevice, config.get(), effectNames, true);
@@ -263,9 +212,8 @@ namespace
             return false;
         }
 
-        ensureDepthResolveResources(&next, depth);
-        writeCommandBuffers(logicalDevice, &next, next.effects, next.commandBuffersEffect, depth);
-        writeCommandBuffers(logicalDevice, &next, {next.defaultTransfer}, next.commandBuffersNoEffect, DepthState{});
+        writeCommandBuffers(logicalDevice, &next, next.effects, next.commandBuffersEffect);
+        writeCommandBuffers(logicalDevice, &next, {next.defaultTransfer}, next.commandBuffersNoEffect);
         return true;
     }
 
@@ -308,15 +256,10 @@ namespace
         bool swapped = false;
         guardLayerWork(logicalDevice, "chain rebuild", [&] {
             auto next = current->cloneBase();
-            DepthState depth;
-            {
-                std::lock_guard<std::mutex> l(logicalDevice->stateLock);
-                depth = chainDepthLocked(logicalDevice, *next);
-            }
             const std::vector<std::string>& names = effects ? *effects : current->effectNames;
             Logger::info("rebuilding the chain: " + std::to_string(names.size()) + " effects, generation "
                          + std::to_string(next->generation));
-            if (!buildGeneration(logicalDevice, *next, names, depth))
+            if (!buildGeneration(logicalDevice, *next, names))
             {
                 Logger::err("chain rebuild failed; keeping the current generation");
                 return;
@@ -489,22 +432,10 @@ namespace
 
         const auto selectedEffects = effectRegistry.getSelectedEffects();
 
-        // Allow dynamic effect loading by allocating for more effects than configured
-        // (the store clamps maxEffects to its schema range).
-        const int32_t maxEffects  = ConfigStore::instance().getMaxEffects();
-        const size_t  effectSlots = std::max(selectedEffects.size(), static_cast<size_t>(maxEffects));
-        next->maxEffectSlots      = effectSlots;
-
-        // create 1 more set of images when we can't use the swapchain itself
-        const uint64_t slotCount        = static_cast<uint64_t>(effectSlots) + (next->useMutableFormat ? 0u : 1u);
-        const uint64_t fakeImageCount64 = static_cast<uint64_t>(next->imageCount) * slotCount;
-        if (fakeImageCount64 == 0 || fakeImageCount64 > std::numeric_limits<uint32_t>::max())
-        {
-            Logger::err("Invalid fake image count computed: " + std::to_string(fakeImageCount64));
-            shared.release(false);
-            error = VK_ERROR_OUT_OF_HOST_MEMORY;
-            return nullptr;
-        }
+        // Three sets of images however long the chain is: the game-facing fakes and
+        // the two ping-pong images the effects alternate between (H21).
+        constexpr uint64_t kImageSets = 3;
+        const uint64_t fakeImageCount64 = static_cast<uint64_t>(next->imageCount) * kImageSets;
 
         shared.fakeImages = createFakeSwapchainImages(logicalDevice, next->swapchainCreateInfo,
                                                       static_cast<uint32_t>(fakeImageCount64), shared.fakeImageMemories);
@@ -548,7 +479,9 @@ namespace
 
         // the swapchain-lifetime objects are in `shared`; the generation carries value copies
         next->imageViews         = shared.imageViews;
-        next->fakeImages         = shared.fakeImages;
+        next->fakeImages.assign(shared.fakeImages.begin(), shared.fakeImages.begin() + next->imageCount);
+        next->pingImages.assign(shared.fakeImages.begin() + next->imageCount, shared.fakeImages.begin() + 2 * next->imageCount);
+        next->pongImages.assign(shared.fakeImages.begin() + 2 * next->imageCount, shared.fakeImages.end());
         next->fakeImageMemories  = shared.fakeImageMemories;
         next->semaphores         = shared.semaphores;
         next->overlaySemaphores  = shared.overlaySemaphores;
@@ -566,13 +499,11 @@ namespace
             effectNames = selectedEffects;
         }
 
-        DepthState depth;
-        {
-            std::lock_guard<std::mutex> l(logicalDevice->stateLock);
-            depth = chainDepthLocked(logicalDevice, *next);
-        }
+        // the capture targets the effects will sample (only while depth capture is on)
+        if (logicalDevice->depth)
+            shared.depthCapture = DepthCapture::create(logicalDevice, next->imageExtent, next->imageCount);
 
-        if (!buildGeneration(logicalDevice, *next, std::move(effectNames), depth))
+        if (!buildGeneration(logicalDevice, *next, std::move(effectNames)))
             return passthroughGeneration("the effect chain could not be built");
 
         Logger::debug("built chain generation " + std::to_string(next->generation) + " with "
@@ -709,7 +640,6 @@ namespace
             skeleton->passthrough       = !fakeable;
             skeleton->shared            = std::make_shared<SwapchainShared>(logicalDevice);
             skeleton->shared->input     = findSurfaceSession(pCreateInfo->surface);
-            skeleton->depthReallocPending = true;
         });
 
         // forwarded with no lock held
@@ -742,19 +672,7 @@ namespace
                     replaced = std::move(it->second);
                 }
                 logicalDevice->swapchains[*swapchain] = skeleton;
-
-                // Also clear device-level depth state when swapchain is recreated (Roblox OTA scenario)
-                logicalDevice->activeDepthState     = {};
-                logicalDevice->pinnedDepthImageView = VK_NULL_HANDLE;
-                logicalDevice->depthReallocPending  = false;
-                // The previous generation's depth resources die with the old
-                // swapchain: hold the depth path off until the app has re-created
-                // and re-rendered its depth, so no deferred copy or resolve build
-                // ever executes against a dying image (NVRM Xid 109 at resize).
-                armDepthTransitionHoldLocked(logicalDevice, "swapchain rebuilt");
-                logicalDevice->depthRetry = DepthRetryState{};
             }
-            Logger::debug("CreateSwapchainKHR: cleared device depth state for fresh detection");
         });
 
         return result;
@@ -889,6 +807,8 @@ namespace
             });
         }
 
+        if (logicalDevice->depth)
+            logicalDevice->depth->forgetSelection(handleToU64(swapchain));
         logicalDevice->vkd.DestroySwapchainKHR(device, swapchain, pAllocator);
         // `removed` (the last generation) retires its pool, effects and depth resources here
     }

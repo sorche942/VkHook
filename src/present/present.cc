@@ -3,6 +3,7 @@
 #include "layer/guard.hh"
 
 #include "control/frontend.hh"
+#include "depth/capture.hh"
 #include "depth/tracker.hh"
 #include "diag/gpu_crash.hh"
 #include "present/present_mode.hh"
@@ -54,6 +55,23 @@ namespace
         return nullptr;
     }
 
+    // The Wayland surface ids of every presented swapchain's own input session,
+    // each once: a present that mixes swapchains of several windows must keep
+    // every one of their commits out of the open syncobj sequence.
+    void gateSurfaces(LogicalDevice& logicalDevice, const VkPresentInfoKHR* presentInfo, std::vector<uint32_t>& out)
+    {
+        out.clear();
+        for (uint32_t i = 0; i < presentInfo->swapchainCount; ++i)
+        {
+            const std::shared_ptr<LogicalSwapchain> swapchain = findSwapchain(logicalDevice, presentInfo->pSwapchains[i]);
+            if (!swapchain || !swapchain->shared || !swapchain->shared->input || !swapchain->shared->input->alive())
+                continue;
+            const uint32_t surfaceId = swapchain->shared->input->waylandSurfaceId();
+            if (surfaceId && std::find(out.begin(), out.end(), surfaceId) == out.end())
+                out.push_back(surfaceId);
+        }
+    }
+
     // The real present, bracketed so Mesa's explicit-sync points inside it
     // are not interleaved with window commits from other threads.
     VkResult realPresent(LogicalDevice* logicalDevice, VkQueue queue, const VkPresentInfoKHR* presentInfo,
@@ -61,15 +79,15 @@ namespace
     {
         installWaylandInterposeHooks();
 
-        const std::shared_ptr<InputSession> session = presentSession(*logicalDevice, presentInfo);
-        const uint32_t surfaceId = session ? session->waylandSurfaceId() : 0;
-        if (surfaceId)
+        thread_local std::vector<uint32_t> surfaces;
+        gateSurfaces(*logicalDevice, presentInfo, surfaces);
+        for (uint32_t surfaceId : surfaces)
             WaylandSyncobjGate::beginPresent(surfaceId);
 
         const VkResult vr = logicalDevice->queues.present(queue, presentInfo);
 
-        if (surfaceId)
-            WaylandSyncobjGate::endPresent(surfaceId);
+        for (auto it = surfaces.rbegin(); it != surfaces.rend(); ++it)
+            WaylandSyncobjGate::endPresent(*it);
 
         reportDeviceLostDiagnostics(logicalDevice, queue, diagContext, vr);
         if (vr == VK_ERROR_DEVICE_LOST)
@@ -83,9 +101,8 @@ namespace
         std::shared_ptr<LogicalSwapchain> swapchain;  // null: the layer does not track it
         uint32_t                          index = 0;
         PresentMode                       mode  = PresentMode::Passthrough;
-        bool                              depthBypass = false;  // depth unusable this frame
-        bool                              rebuild     = false;  // chain rebuild due
-        bool                              recovered   = false;  // the rebuild ends a depth retry
+        // the frame's depth, kept alive until the capture's submission is queued
+        DepthSource                       depth;
     };
 
     struct SubmitContext
@@ -122,84 +139,6 @@ namespace
         if (state && state->family == logicalDevice->queueFamilyIndex)
             return presentQueue;
         return logicalDevice->queue;
-    }
-
-    // Depth recovery is intentionally non-blocking (invariant 6). Decides, under
-    // stateLock, which presented swapchains need a chain rebuild and which must
-    // run CopyOnly this frame because their depth is unusable; never rebuilds
-    // here. A chain whose depth does not match must not submit its effect
-    // buffers: they may reference a depth image the game has just destroyed.
-    void decideDepth(LogicalDevice* logicalDevice, std::vector<PresentSlot>& slots)
-    {
-        const bool hold = logicalDevice->depthTransitionHold.load(std::memory_order_acquire);
-
-        // Depth promotion and pin changes happen while the application is
-        // recording/submitting its render work. The chains are rebuilt here,
-        // at the next present boundary, once the input settled: a burst of
-        // transform clicks used to arm a rebuild per frame.
-        if (logicalDevice->depthReallocPending && !hold)
-        {
-            const auto now = std::chrono::steady_clock::now();
-            if (!logicalDevice->depthReallocFirstArmed.time_since_epoch().count())
-                logicalDevice->depthReallocFirstArmed = now;
-
-            constexpr auto kDepthRebuildSettle = std::chrono::milliseconds(150);
-            if (now - logicalDevice->depthReallocFirstArmed >= kDepthRebuildSettle)
-            {
-                for (auto& [_, sc] : logicalDevice->swapchains)
-                    if (sc)
-                        sc->depthReallocPending = true;
-                logicalDevice->depthReallocPending    = false;
-                logicalDevice->depthReallocFirstArmed = {};
-            }
-        }
-
-        for (PresentSlot& slot : slots)
-        {
-            LogicalSwapchain* sc = slot.swapchain.get();
-            if (!sc || !sc->faked())
-                continue;
-
-            if (sc->depthReallocPending && !hold && !sc->commandBuffersEffect.empty())
-                slot.rebuild = true;
-
-            DepthState currentDepth = getDepthState(logicalDevice);
-            const bool currentValid = !hasDepthState(currentDepth) || validateDepthStateForResolve(logicalDevice, currentDepth);
-            const bool exactMatch   = currentValid && depthMatchesSwapchainExtent(currentDepth, sc);
-
-            if (hasDepthState(currentDepth) && (!currentValid || !exactMatch))
-            {
-                armDepthRetryLocked(logicalDevice, sc,
-                                    currentValid ? "depth extent does not match swapchain"
-                                                 : "depth image is no longer valid");
-                slot.depthBypass = true;
-                continue;
-            }
-
-            if (logicalDevice->depthRetry.disabled)
-            {
-                slot.depthBypass = true;
-                if (!depthRetryDueLocked(logicalDevice))
-                    continue;
-
-                DepthState candidate{};
-                if (!selectDepthCandidateForSwapchainLocked(logicalDevice, sc, candidate))
-                    candidate = getDepthState(logicalDevice);
-                if (depthMatchesSwapchainExtent(candidate, sc) && validateDepthStateForResolve(logicalDevice, candidate))
-                {
-                    logicalDevice->activeDepthState = candidate;
-                    slot.rebuild                    = true;
-                    slot.recovered                  = true;
-                }
-                else
-                {
-                    VKHOOK_LOG_DEBUG([](std::string& s) {
-                        s = "depth retry: no swapchain-sized depth buffer yet (exact or chrome-inset)";
-                    });
-                    scheduleDepthRetryLocked(logicalDevice, false);
-                }
-            }
-        }
     }
 
     // Waits for the image's previous layer submission before its command buffer
@@ -276,50 +215,7 @@ namespace
         // Test hook: rebuilds the depth path while the app keeps presenting.
         maybeForceSmokeDepthRefresh(logicalDevice, control.diag);
 
-        bool anyFaked = false;
-        for (const PresentSlot& slot : slots)
-            anyFaked |= slot.swapchain && slot.swapchain->faked();
-
-        if (anyFaked)
-        {
-            {
-                std::lock_guard<std::mutex> l(logicalDevice->stateLock);
-                decideDepth(logicalDevice, slots);
-            }
-
-            // chain rebuilds: off-lock builds, swapped in under the short lock
-            for (PresentSlot& slot : slots)
-            {
-                if (!slot.rebuild)
-                    continue;
-                const VkSwapchainKHR handle = slot.swapchain->handle;
-                if (rebuildSwapchainChain(logicalDevice, slot.swapchain, nullptr))
-                {
-                    slot.swapchain = findSwapchain(*logicalDevice, handle);
-                    if (!slot.swapchain)
-                        continue;
-                    slot.depthBypass = false;
-                    Logger::debug("deferred depth change rebuilt presented swapchain");
-                    if (slot.recovered)
-                    {
-                        std::lock_guard<std::mutex> l(logicalDevice->stateLock);
-                        logicalDevice->depthRetry = DepthRetryState{};
-                        logicalDevice->depthReallocPending = false;
-                        for (auto& [_, other] : logicalDevice->swapchains)
-                            if (other && other.get() != slot.swapchain.get())
-                                other->depthReallocPending = true;
-                    }
-                }
-                else if (slot.recovered)
-                {
-                    std::lock_guard<std::mutex> l(logicalDevice->stateLock);
-                    scheduleDepthRetryLocked(logicalDevice, true);
-                }
-            }
-        }
-
         // modes, and the bounds every faked swapchain needs
-        const bool depthHold = logicalDevice->depthTransitionHold.load(std::memory_order_acquire);
         std::vector<PresentMode> modes(slots.size());
         for (size_t i = 0; i < slots.size(); ++i)
         {
@@ -329,8 +225,6 @@ namespace
             in.faked             = sc && sc->faked();
             in.effectsOn         = effectsOn;
             in.softDisabled      = softDisabled;
-            in.depthHold         = depthHold;
-            in.generationPending = slot.depthBypass || (sc && sc->depthReallocPending);
             slot.mode            = choosePresentMode(in);
             modes[i]             = slot.mode;
 
@@ -402,19 +296,38 @@ namespace
                     {
                         // Updating ordinary descriptor bindings invalidates the
                         // executable buffer: re-record only this fence-safe image.
-                        DepthState frameDepth;
-                        {
-                            std::lock_guard<std::mutex> l(logicalDevice->stateLock);
-                            frameDepth = getDepthState(logicalDevice);
-                            if (!depthMatchesSwapchainExtent(frameDepth, sc)
-                                || !validateDepthStateForResolve(logicalDevice, frameDepth))
-                                frameDepth = {};
-                        }
-                        writeCommandBuffers(logicalDevice, sc, sc->effects, sc->commandBuffersEffect, frameDepth, index);
+                        writeCommandBuffers(logicalDevice, sc, sc->effects, sc->commandBuffersEffect, index);
                     }
                 });
                 if (!updated)
                     slot.mode = target.mode = PresentMode::CopyOnly;  // the layer just soft-disabled itself
+            }
+
+            // The frame's depth, copied in the layer's own command buffer ahead of
+            // the effects. Without a source the target is cleared, never stale.
+            if (slot.mode == PresentMode::Effects && shared.depthCapture && logicalDevice->depth)
+            {
+                guardLayerWork(logicalDevice, "depth capture", [&] {
+                    const auto settings = ConfigStore::instance().snapshot();
+                    DepthCaptureParams params;
+                    params.invert      = settings->depthInvert;
+                    params.flip        = settings->depthFlip;
+                    params.flop        = settings->depthFlop;
+                    params.resolveMode = settings->depthResolveMode == 1 ? VK_RESOLVE_MODE_SAMPLE_ZERO_BIT
+                                                                         : VK_RESOLVE_MODE_AVERAGE_BIT;
+                    slot.depth = logicalDevice->depth->selectForPresent(handleToU64(sc->handle), sc->imageExtent);
+                    target.preCommandBuffer = shared.depthCapture->record(index, slot.depth, params);
+                    const uint64_t sourceId = slot.depth.valid ? handleToU64(slot.depth.image) : 0;
+                    if (sourceId != shared.lastDepthSource)
+                    {
+                        shared.lastDepthSource = sourceId;
+                        VKHOOK_LOG_DEBUG([&](std::string& s) {
+                            s = slot.depth.valid ? "depth capture source changed: image " + convertToString(slot.depth.image)
+                                                       + (slot.depth.fromStorage ? " (preserved copy)" : " (live)")
+                                                 : "depth capture source changed: none (far plane)";
+                        });
+                    }
+                });
             }
 
             target.commandBuffer = slot.mode == PresentMode::Effects ? sc->commandBuffersEffect[index]
@@ -487,7 +400,6 @@ namespace
             SwapchainShared& shared = *slots[i].swapchain->shared;
             if (index < shared.effectFenceUsed.size() && targets[i].fence != VK_NULL_HANDLE)
                 shared.effectFenceUsed[index] = 1;
-            maybeDumpDepthResolveImage(logicalDevice, slots[i].swapchain.get(), index, submitQueue, control.diag);
         }
 
         VkPresentInfoKHR presentInfo   = *pPresentInfo;
@@ -497,19 +409,9 @@ namespace
         const VkResult presentResult = realPresent(logicalDevice, queue, &presentInfo,
                                                    "vkQueuePresentKHR(final)", "Vulkan device lost during final present");
 
-        // OUT_OF_DATE / SUBOPTIMAL: flag the affected swapchains for a rebuild. The
-        // result is returned unchanged: swallowing OUT_OF_DATE hid the standard
-        // recreate-now signal from the application, whose present path then
-        // waited forever on frames the compositor would never take.
-        if (presentResult == VK_ERROR_OUT_OF_DATE_KHR || presentResult == VK_SUBOPTIMAL_KHR)
-        {
-            Logger::warn("QueuePresentKHR returned " + std::string(presentResult == VK_ERROR_OUT_OF_DATE_KHR ? "OUT_OF_DATE" : "SUBOPTIMAL") + ", flagging swapchains for reset");
-            std::lock_guard<std::mutex> l(logicalDevice->stateLock);
-            for (const PresentSlot& slot : slots)
-                if (slot.swapchain)
-                    slot.swapchain->depthReallocPending = true;
-        }
-
+        // OUT_OF_DATE / SUBOPTIMAL are returned unchanged: swallowing them hid the
+        // standard recreate-now signal from the application, whose present path
+        // then waited forever on frames the compositor would never take.
         return presentResult;
     }
 

@@ -11,6 +11,20 @@
 # VKHOOK_SMOKE_DEPTH_REFRESH sets how often, in ms, the run forces a depth
 # re-detect (default 500), which is what drives the rebuild assertions below.
 #
+# VKHOOK_SMOKE_VALIDATION=1 enables ONLY VK_LAYER_KHRONOS_validation plus the
+# test layer (never the "*VKHOOK*" glob, which would also pull in an installed
+# VkHook), and asserts that the loader inserted the validation layer and that
+# the run produced zero "Validation Error" / VUID- lines. Set VK_LAYER_ENABLES
+# (e.g. VALIDATION_CHECK_ENABLE_SYNCHRONIZATION_VALIDATION) to add checks; it is
+# passed through untouched.
+#
+# headless: `env -u WAYLAND_DISPLAY xvfb-run -a src/tests/smoke_vkcube.sh LIB 11`.
+# vkcube prefers Wayland whenever WAYLAND_DISPLAY is set, even under xvfb-run, so
+# the script unsets it for the vkcube child when it knows the display is virtual:
+# VKHOOK_SMOKE_HEADLESS=1 (explicit), or xvfb-run's own XAUTHORITY
+# (/tmp/xvfb-run.*/Xauthority*), or this script having re-exec'd itself under
+# xvfb-run. On a real display none of these hold and the environment is untouched.
+#
 # needs a display. on CI wrap it: xvfb-run -a src/tests/smoke_vkcube.sh
 # there is no GPU on a CI runner either, so point VK_ICD_FILENAMES at lavapipe
 # or the loader will find nothing to run on.
@@ -180,6 +194,26 @@ say "duration   ${DURATION}s"
 # The XDG_CONFIG_HOME redirect sends the layer's own log somewhere disposable, so
 # "did the layer actually engage" is answerable without reading a stale log from
 # an earlier run, and a local run cannot scribble on a real config.
+# Headless: a virtual X display only works if vkcube is steered away from Wayland.
+VKCUBE_ENV=()
+if [[ "${VKHOOK_SMOKE_HEADLESS:-}" == 1 || -n "${VKHOOK_SMOKE_XVFB:-}" || "${XAUTHORITY:-}" == */xvfb-run.*/Xauthority* ]]; then
+    VKCUBE_ENV+=(-u WAYLAND_DISPLAY)
+    say "headless   virtual X display, WAYLAND_DISPLAY unset for vkcube"
+fi
+
+# Validation mode: only the Khronos validation layer and the test layer, and the
+# system explicit-layer dirs so the loader can find validation.
+ENABLE_LAYERS="$LAYER_NAME"
+SEARCH_PATH="$LAYER_DIR"
+if [[ "${VKHOOK_SMOKE_VALIDATION:-}" == 1 ]]; then
+    ENABLE_LAYERS="VK_LAYER_KHRONOS_validation,$LAYER_NAME"
+    for d in /usr/share ${XDG_DATA_DIRS//:/ }; do
+        [[ -d "$d/vulkan/explicit_layer.d" ]] && [[ ":$SEARCH_PATH:" != *":$d/vulkan/explicit_layer.d:"* ]] \
+            && SEARCH_PATH="$SEARCH_PATH:$d/vulkan/explicit_layer.d"
+    done
+    say "validation on ($ENABLE_LAYERS)"
+fi
+
 set +e
 # Debug level is set here rather than left to the ambient default, because the
 # assertions below need lines that only exist at debug. Notably "detected depth
@@ -187,12 +221,13 @@ set +e
 # real failure) apart from "depth was found but resolve never engaged" (an
 # environment limitation). At the default info level those two look identical,
 # so the test cannot fail correctly without asking for debug.
-VK_LOADER_DEBUG=layer \
+env "${VKCUBE_ENV[@]}" \
+    VK_LOADER_DEBUG=layer \
     VKHOOK_LOG_LEVEL=debug \
     VKHOOK_SMOKE_DEPTH_REFRESH="${VKHOOK_SMOKE_DEPTH_REFRESH:-500}" \
-    VK_LOADER_LAYERS_ENABLE="$LAYER_NAME" \
+    VK_LOADER_LAYERS_ENABLE="$ENABLE_LAYERS" \
     VK_LOADER_LAYERS_DISABLE="$INSTALLED_LAYER" \
-    VK_LAYER_PATH="$LAYER_DIR" \
+    VK_LAYER_PATH="$SEARCH_PATH" \
     ENABLE_VKHOOK=1 \
     XDG_CONFIG_HOME="$CONFIG_DIR" \
     timeout "$DURATION" vkcube >"$WORK_DIR/vkcube.log" 2>&1
@@ -210,6 +245,24 @@ if [[ "$LOADED" != yes ]]; then
     die "the loader never loaded $LIBRARY, so this run proves nothing. an installed copy of the layer may be shadowing it; check the loader lines above."
 fi
 ok "layer loaded from the build directory"
+
+if [[ "${VKHOOK_SMOKE_VALIDATION:-}" == 1 ]]; then
+    # The loader's own log line is the proof validation was actually in the chain;
+    # without it "0 errors" would also be what a run with no validation reports.
+    if ! grep -qE 'Insert instance layer "?VK_LAYER_KHRONOS_validation' "$WORK_DIR/vkcube.log"; then
+        grep -E 'VK_LAYER_KHRONOS_validation|layer' "$WORK_DIR/vkcube.log" | head -20 >&2 || true
+        die "validation requested but the loader never inserted VK_LAYER_KHRONOS_validation"
+    fi
+    # one "Validation Error:" line per message; the VUID- spec URL on the next
+    # line would double count, so VUID- is only the fallback for other formats
+    VALIDATION_ERRORS=$(grep -c 'Validation Error' "$WORK_DIR/vkcube.log" || true)
+    (( VALIDATION_ERRORS > 0 )) || VALIDATION_ERRORS=$(grep -c 'VUID-' "$WORK_DIR/vkcube.log" || true)
+    if (( VALIDATION_ERRORS > 0 )); then
+        grep -E -B1 -A3 'Validation Error|VUID-' "$WORK_DIR/vkcube.log" | head -60 >&2
+        die "validation: $VALIDATION_ERRORS error line(s) (full log: $WORK_DIR/vkcube.log)"
+    fi
+    ok "validation: 0 errors, layer loaded"
+fi
 
 LAYER_LOG="$CONFIG_DIR/VkHook/vkhook.log"
 if [[ -s "$LAYER_LOG" ]]; then
@@ -260,36 +313,29 @@ else
     die "DisplayDepth was never built, so this run exercised the pass-through path and proves nothing about the effect pipeline. The log above shows how far it got."
 fi
 
-# Depth resolve is reported, not asserted, and that is deliberate.
-#
-# Under X11 plus lavapipe -- which is exactly what CI runs -- the layer finds
-# vkcube's depth attachment ("detected depth image") but never builds the
-# resolve resources for it, so hasDepth is false for every frame and nothing
-# logs the resolve. Confirmed pre-existing: the last green commit behaves
-# identically. The earlier version of this test asserted on it and turned CI
-# red on six consecutive commits, which says nothing about the code.
-#
-# The cost is real and worth stating: on a software-Vulkan runner this test
-# cannot tell you the depth path works. It can only tell you the layer loaded,
-# built a real effect from a real community shader, and did not crash. The
-# depth path needs a GPU to be covered, and nothing in this script can conjure
-# one.
-if grep -q 'depth resolve source view changed' "$LAYER_LOG"; then
-    ok "depth resolve engaged"
-
-    # VKHOOK_SMOKE_DEPTH_REFRESH drops the depth selection every 500ms, the
-    # same as clicking "Refresh depth buffers", so the rebuild below runs
-    # repeatedly while the queue is loaded. A rebuild frees command buffers and
-    # tears down resolve targets: getting the fence gating or the safe-mode wait
-    # wrong turns that into a GPU hang, which reads here as a missing rebuild
-    # (present stopped) or a device-lost panic, not as a silent difference.
-    rebuilds=$(grep -c 'deferred depth change rebuilt presented swapchain' "$LAYER_LOG" || true)
-    (( rebuilds > 0 )) || die "the refresh hook ran but no depth rebuild happened; the rebuild path is not covered"
-    ok "$rebuilds depth rebuild(s) while presenting"
-elif grep -q 'detected depth image' "$LAYER_LOG"; then
-    warn "depth attachment seen but resolve never engaged (pre-existing under X11 + lavapipe; CI cannot cover the depth path)"
+# The depth capture: the tracker must see vkcube's depth image, and the capture
+# must pick it as the effect's source. The capture runs in the layer's own
+# command buffer ahead of the effects, so it works the same on lavapipe as on a
+# GPU.
+if grep -q 'tracked depth image' "$LAYER_LOG"; then
+    ok "depth image tracked"
 else
-    die "no depth attachment detected at all. DisplayDepth uses depth, so capture is off or the app never provided one; the run survived but exercised nothing depth-related."
+    die "no depth image tracked. DisplayDepth uses depth, so capture is off or the app never provided one; the run exercised nothing depth-related."
+fi
+if grep -q 'depth capture source changed: image' "$LAYER_LOG"; then
+    ok "depth capture engaged"
+
+    # VKHOOK_SMOKE_DEPTH_REFRESH drops the depth selection every 500ms, the same
+    # as clicking "Refresh depth buffers": each refresh must re-select a source
+    # without rebuilding anything or stalling present.
+    reselects=$(grep -c 'depth capture source changed: image' "$LAYER_LOG" || true)
+    refreshes=$(grep -c 'smoke hook: forced depth re-detect' "$LAYER_LOG" || true)
+    if (( refreshes > 1 )); then
+        (( reselects > 1 )) || die "the refresh hook ran $refreshes times but the depth source was never re-selected"
+        ok "$reselects depth selection(s) across $refreshes refresh(es)"
+    fi
+else
+    die "depth image tracked but never captured: the selection found no window-sized image that drew"
 fi
 
 # 124 is what timeout reports when it had to stop the process, which is the only

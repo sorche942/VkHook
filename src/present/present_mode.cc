@@ -19,7 +19,7 @@ namespace VkHook
     {
         if (!inputs.faked)
             return PresentMode::Passthrough;
-        const bool bypass = !inputs.effectsOn || inputs.softDisabled || inputs.depthHold || inputs.generationPending;
+        const bool bypass = !inputs.effectsOn || inputs.softDisabled;
         return bypass ? PresentMode::CopyOnly : PresentMode::Effects;
     }
 
@@ -81,8 +81,10 @@ namespace VkHook
             submit.waitSemaphoreCount   = waitsConsumed ? 0 : accounting.layerWaitCount;
             submit.pWaitSemaphores      = waitsConsumed ? nullptr : appWaits;
             submit.pWaitDstStageMask    = waitsConsumed ? nullptr : tlsWaitStages.data();
-            submit.commandBufferCount   = 1;
-            submit.pCommandBuffers      = &target.commandBuffer;
+            const VkCommandBuffer buffers[2] = {target.preCommandBuffer, target.commandBuffer};
+            const bool            hasPre     = target.preCommandBuffer != VK_NULL_HANDLE;
+            submit.commandBufferCount   = hasPre ? 2 : 1;
+            submit.pCommandBuffers      = hasPre ? buffers : &target.commandBuffer;
             submit.signalSemaphoreCount = 1;
             submit.pSignalSemaphores    = &target.signalSemaphore;
 
