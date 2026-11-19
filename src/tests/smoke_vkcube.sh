@@ -123,8 +123,7 @@ jq -e . "$LAYER_DIR/$LAYER_NAME.json" >/dev/null || die "generated manifest is n
 #
 # The depth settings are pinned rather than left to defaults so the test is not
 # quietly at the mercy of whatever a previous run happened to write:
-#   depthSourceChannel = 0 -> Luminance/Red, the standard Vulkan depth layout
-#   depthInvert        = false -> near/far not flipped
+#   depthInvert = false -> near/far not flipped
 seed_config() {
     local base="$CONFIG_DIR/VkHook"
     mkdir -p "$base/configs/shaders" "$base/reshade/packages/Shaders"
@@ -141,8 +140,6 @@ showDebugWindow = false
 depthResolveMode = 0
 depthManualPin =
 depthTransientWorkaround = true
-depthCaptureMethod = 1
-depthSourceChannel = 0
 depthInvert = false
 CONF
 
@@ -209,9 +206,12 @@ ENABLE_LAYERS="$LAYER_NAME"
 SEARCH_PATH="$LAYER_DIR"
 if [[ "${VKHOOK_SMOKE_VALIDATION:-}" == 1 ]]; then
     ENABLE_LAYERS="VK_LAYER_KHRONOS_validation,$LAYER_NAME"
-    for d in /usr/share ${XDG_DATA_DIRS//:/ }; do
-        [[ -d "$d/vulkan/explicit_layer.d" ]] && [[ ":$SEARCH_PATH:" != *":$d/vulkan/explicit_layer.d:"* ]] \
-            && SEARCH_PATH="$SEARCH_PATH:$d/vulkan/explicit_layer.d"
+    data_dirs="${XDG_DATA_DIRS:-}"
+    for d in /usr/share /etc ${data_dirs//:/ }; do
+        layer_dir="$d/vulkan/explicit_layer.d"
+        if [[ -d "$layer_dir" && ":$SEARCH_PATH:" != *":$layer_dir:"* ]]; then
+            SEARCH_PATH="$SEARCH_PATH:$layer_dir"
+        fi
     done
     say "validation on ($ENABLE_LAYERS)"
 fi
