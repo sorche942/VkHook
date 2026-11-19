@@ -247,13 +247,13 @@ void Graph::placeActivations() {
   // The probe records against an unbound stand-in for the caller's input features.
   const uint32_t fullRows = geometry_.fullWidth * geometry_.fullHeight;
   Activation features;
-  features.format = Format::F32;
+  features.format = Format::F16;
   features.rows = fullRows;
   features.channels = 16;
   features.allocRows = alignRows(fullRows);
   features.label = "input features";
   VkMemoryRequirements unused;
-  features.buffer = context_.createUnboundBuffer((VkDeviceSize)features.allocRows * 16 * formatBytes(Format::F32),
+  features.buffer = context_.createUnboundBuffer((VkDeviceSize)features.allocRows * 16 * formatBytes(Format::F16),
                                                  features.label.c_str(), unused);
   placements_[features.buffer.buffer] = {};
   VkCommandBuffer scratch = VK_NULL_HANDLE;
@@ -825,8 +825,8 @@ void Graph::recordNetwork(VkCommandBuffer commands, const Activation& inputFeatu
   kernels_.resetSync(commands);   // chaining and split-K tile counters
   const Geometry& g = geometry_;
   const uint32_t fullRows = g.fullWidth * g.fullHeight;
-  if (inputFeatures.format != Format::F32 || inputFeatures.rows != fullRows || inputFeatures.channels != 16)
-    throw std::runtime_error("input features must be f32 [fullWidth*fullHeight][16]");
+  if (inputFeatures.format != Format::F16 || inputFeatures.rows != fullRows || inputFeatures.channels != 16)
+    throw std::runtime_error("input features must be f16 [fullWidth*fullHeight][16]");
   boundaries_.clear();
   usedThisRecord_.clear();
   for (uint32_t& phase : windowPhase_) phase = 0;
@@ -872,14 +872,12 @@ void Graph::recordNetwork(VkCommandBuffer commands, const Activation& inputFeatu
     chainBlock32(f, 0, 0, fusePool);   // block 1 reads the pooled rows
     kernels_.fusedBlock32(commands, f);
   } else {
-    inputHalf_ = allocate("input features f16", fullRows, 16, Format::F16);
-    kernels_.convertF32ToF16(commands, inputFeatures, *inputHalf_);
     Activation* projectedFp16 = allocate("full FP16 input adapter", fullRows, 32, Format::F16);
     Activation* projected = allocate("full FP8 input adapter", fullRows, 32, Format::E4);
     {
       uint32_t paddedN = 0;
       GemmF16Args pre;
-      pre.input = inputHalf_;
+      pre.input = &inputFeatures;
       pre.weights = &model_.f16Matrix(preTensor, preLayout.inputAdapter, 16, 32, paddedN);
       pre.paddedN = paddedN; pre.output = projectedFp16; pre.dualOutput = projected;
       pre.rows = fullRows; pre.K = 16; pre.N = 32;

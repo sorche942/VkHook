@@ -9,7 +9,8 @@ layout(std430, binding = 2) readonly buffer Reprojection {
     uint accepted, candidates, pad1, pad2;
     vec4 samples[];
 } reprojection;
-layout(std430, binding = 7) writeonly buffer Features { vec4 features[]; };
+// Sixteen halves per pixel, as the network's first block consumes them.
+layout(std430, binding = 7) writeonly buffer Features { uvec4 features[]; };
 float hashUniform(uint value) {
     uint mixed = value;
     mixed = (mixed >> ((mixed >> 28u) + 4u)) ^ mixed;
@@ -54,14 +55,15 @@ void main() {
                 history = dlss5Centred(previous.rgb);
         }
     }
-    // One pixel's sixteen channels as four whole-vector stores: this pass is bound by
+    // One pixel's sixteen channels as two whole-vector stores: this pass is bound by
     // its writes, and scalar stores scatter each channel of a warp across thirty-two rows.
+    // Every value is rounded to the half grid first, so packing them is exact.
     vec3 noise = gaussian3(id.x, id.y, p.seed);
-    uint base = (id.y * p.fullWidth + id.x) * 4u;
-    features[base] = vec4(noise, 1.0);
-    features[base + 1u] = vec4(centred, history.r);
-    features[base + 2u] = vec4(history.gb, p.style / 128.0, roundF16(p.localTone));
-    features[base + 3u] = vec4(roundF16(p.autoMask != 0u ? 1.0 : p.localStructure),
-                               roundF16(p.autoMask != 0u ? (p.skinStructure < 0.0 ? p.localStructure : p.skinStructure) : -1.0),
-                               roundF16(p.autoMask != 0u ? p.localStructure : -1.0), 0.0);
+    uint base = (id.y * p.fullWidth + id.x) * 2u;
+    features[base] = halfWords(vec4(noise, 1.0), vec4(centred, history.r));
+    features[base + 1u] = halfWords(
+        vec4(history.gb, roundF16(p.style / 128.0), roundF16(p.localTone)),
+        vec4(roundF16(p.autoMask != 0u ? 1.0 : p.localStructure),
+             roundF16(p.autoMask != 0u ? (p.skinStructure < 0.0 ? p.localStructure : p.skinStructure) : -1.0),
+             roundF16(p.autoMask != 0u ? p.localStructure : -1.0), 0.0));
 }

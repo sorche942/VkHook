@@ -201,7 +201,7 @@ int main(int argc, char** argv)
         auto history = context.createBuffer(pixels * 16, false, "test neural history");
         auto reprojection = context.createBuffer(16 + pixels * 16, false, "test reprojection");
         auto packedOutput = context.createBuffer(pixels * 4, false, "test output");
-        auto tensor = context.createBuffer(pixels * 64, false, "test features");
+        auto tensor = context.createBuffer(pixels * 32, false, "test features");
         auto head = context.createBuffer(pixels * 16, false, "test neural head");
         auto parameters = context.createBuffer(sizeof(Dlss5Parameters), true, "test parameters");
         Dlss5Parameters params{};
@@ -290,7 +290,7 @@ int main(int argc, char** argv)
             return output;
         };
         auto requireNoHistory = [&]() {
-            const auto features = download<float>(context, tensor);
+            const auto features = download<uint16_t>(context, tensor);
             for (uint32_t i = 0; i < pixels; ++i)
                 for (uint32_t c = 0; c < 3; ++c)
                     require(features[i * 16 + 4 + c] == features[i * 16 + 7 + c], "invalid history reached model input");

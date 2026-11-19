@@ -13,7 +13,6 @@
 layout(local_size_x = 256) in;
 
 layout(constant_id = 0) const uint MODE = 0;
-const uint MODE_F32_TO_F16 = 0u;        // input features -> f16 A operand
 const uint MODE_QUANTIZE = 1u;          // f16 -> E4M3
 const uint MODE_DOWNSAMPLE_FP8 = 2u;    // raw f16 2x box pool -> E4M3
 const uint MODE_POST_BLEND = 3u;        // 2x upsample E4 * scale + adapter E4 * scale -> f16 raw + E4M3
@@ -31,7 +30,6 @@ layout(push_constant) uniform Push {
   uint dual;         // also publish f16 raw output (binding 6)
 } pc;
 
-layout(std430, binding = 0) readonly buffer In32 { vec4 in32x4[]; };
 layout(std430, binding = 1) readonly buffer In16 { uvec4 in16x8[]; };
 layout(std430, binding = 2) readonly buffer In8 { uvec2 in8x8[]; };
 layout(std430, binding = 3) readonly buffer Skip8 { uvec2 skip8x8[]; };
@@ -69,11 +67,7 @@ void main() {
   const uint groupsPerPixel = pc.channels / 8u;
   const uint c = (group % groupsPerPixel) * 8u;
   const uint pixel = group / groupsPerPixel;
-  if (MODE == MODE_F32_TO_F16) {
-    vec4 a = in32x4[group * 2u], b = in32x4[group * 2u + 1u];
-    out16x8[group] = uvec4(packFloat2x16(f16vec2(a.xy)), packFloat2x16(f16vec2(a.zw)), packFloat2x16(f16vec2(b.xy)),
-                           packFloat2x16(f16vec2(b.zw)));
-  } else if (MODE == MODE_QUANTIZE) {
+  if (MODE == MODE_QUANTIZE) {
     out8x8[group] = quantize8(in16x8[group]);
   } else if (MODE == MODE_DOWNSAMPLE_FP8) {
     uint ox = pixel % pc.outWidth, oy = pixel / pc.outWidth;

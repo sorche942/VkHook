@@ -80,10 +80,9 @@ class Kernels {
     bool autoMask;
     float localTone, localStructure, skinStructure, style;
   };
-  // Input features from an RGBA f32 proxy image (display code values).
+  // Input features (f16) from an RGBA f32 proxy image (display code values).
   void preprocessFromProxy(VkCommandBuffer commands, const vk::Buffer& proxy, Activation& features,
                            const PreprocessArgs& args);
-  void convertF32ToF16(VkCommandBuffer commands, const Activation& input, Activation& output);
   void quantize(VkCommandBuffer commands, const Activation& input, Activation& output);
   void downsample2x(VkCommandBuffer commands, const Activation& input, Activation& output, uint32_t inWidth,
                     uint32_t inHeight, uint32_t outWidth, uint32_t outHeight);
@@ -100,7 +99,7 @@ class Kernels {
   // Fused 32-channel Swin block: one dispatch per block (see fused_block32.comp).
   struct FusedBlock32Args {
     // Pre / post fusion (block 0 / block 70): the input adapter, the post blend and the RGBA head in the block.
-    const Activation* features = nullptr;   // F_PRE: f32 [tokens][16] input features (replaces state / skip16)
+    const Activation* features = nullptr;   // F_PRE: f16 [tokens][16] input features (replaces state / skip16)
     const vk::Buffer* adapterWeights = nullptr;   // F_PRE: f16 [16][32] (f16Matrix layout 1)
     const Activation* lowRes = nullptr;     // F_POST: half-resolution E4 block output (state = block-0 output)
     const Activation* lowProjection = nullptr;   // F_UPRES: half-resolution f16 projection (state = E4 skip, scaled by inputScale)

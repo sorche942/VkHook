@@ -492,8 +492,8 @@ struct OpsPush {
 
 void Kernels::preprocessFromProxy(VkCommandBuffer commands, const vk::Buffer& proxy, Activation& features,
                                   const PreprocessArgs& a) {
-  check(features.format == Format::F32 && features.channels == 16 && features.rows == a.fullWidth * a.fullHeight,
-        "preprocess output must be f32 [full][16]");
+  check(features.format == Format::F16 && features.channels == 16 && features.rows == a.fullWidth * a.fullHeight,
+        "preprocess output must be f16 [full][16]");
   struct Push {
     uint32_t fullWidth, fullHeight, validWidth, validHeight, sourceWidth, sourceHeight, seed;
     float autoMask, localTone, localStructure, skinStructure, style;
@@ -505,20 +505,6 @@ void Kernels::preprocessFromProxy(VkCommandBuffer commands, const vk::Buffer& pr
   dispatchLabel_ = "preprocess";
   dispatch(commands, pipeline("preprocess", {}, 0), bindings, &push, sizeof(push), (a.fullWidth + 7) / 8,
            (a.fullHeight + 7) / 8, 1);
-}
-
-void Kernels::convertF32ToF16(VkCommandBuffer commands, const Activation& input, Activation& output) {
-  check(input.format == Format::F32 && output.format == Format::F16, "convert formats");
-  uint32_t count = input.rows * input.channels;
-  vk::SpecConstants constants;
-  constants.add(0, 0);
-  OpsPush push{count, input.channels, 0, 0, 0, 0, 0, 0, 0};
-  const vk::Buffer* bindings[vk::kGenericBindings] = {};
-  bindings[0] = &input.buffer;
-  bindings[6] = &output.buffer;
-  dispatchLabel_ = "convert f32->f16";
-  check(count % 8 == 0, "ops: element count must be a multiple of 8");
-  dispatchLinear(commands, pipeline("ops", constants), bindings, &push, sizeof(push), count / 8);
 }
 
 void Kernels::quantize(VkCommandBuffer commands, const Activation& input, Activation& output) {
@@ -622,6 +608,7 @@ bool Kernels::ptxBlock32Enabled() {
 
 void Kernels::fusedBlock32Ptx(VkCommandBuffer commands, const FusedBlock32Args& a) {
   check(a.w1Ptx && a.w2Ptx, "PTX fused block needs the permuted / tiled weights");
+  check(!a.features || (a.features->format == Format::F16 && a.features->channels == 16 && a.adapterWeights), "fused pre inputs");
   check(!a.skip16 && !a.outF16, "PTX fused block: f16 skip / raw output variants are not generated");
   uint32_t flags = (a.outE4 ? 2u : 0u) | (a.features ? 8u : 0u) | (a.lowRes ? 16u : 0u) | (a.head ? 32u : 0u) |
                    (a.pooled ? 64u : 0u) | (a.lowProjection ? 128u : 0u);
@@ -692,7 +679,7 @@ void Kernels::fusedBlock32(VkCommandBuffer commands, const FusedBlock32Args& a) 
   bindings[7] = a.prior;
   if (a.outE4) bindings[8] = &a.outE4->buffer;
   if (a.outF16) bindings[9] = &a.outF16->buffer;
-  if (a.features) { check(a.features->format == Format::F32 && a.features->channels == 16 && a.adapterWeights, "fused pre inputs"); bindings[0] = &a.features->buffer; bindings[11] = a.adapterWeights; }
+  if (a.features) { check(a.features->format == Format::F16 && a.features->channels == 16 && a.adapterWeights, "fused pre inputs"); bindings[0] = &a.features->buffer; bindings[11] = a.adapterWeights; }
   if (a.lowRes) { check(a.lowRes->format == Format::E4 && a.state && a.state->format == Format::E4, "fused post inputs"); bindings[1] = &a.lowRes->buffer; }
   if (a.lowProjection) { check(a.lowProjection->format == Format::F16 && a.lowProjection->channels == 32 && a.state && !a.lowRes && !a.skip16, "fused upres inputs"); bindings[1] = &a.lowProjection->buffer; }
   if (a.head) { check(a.head->format == Format::F32 && a.head->channels == 4 && a.headWeights, "fused head"); bindings[9] = &a.head->buffer; bindings[11] = a.headWeights; }

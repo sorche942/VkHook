@@ -197,14 +197,14 @@ int main(int argc, char** argv)
         const nr::Geometry geometry = nr::Geometry::fromValid(width, height);
         nr::Graph graph(context, network, kernels, geometry, nr::Graph::Options{});
         const uint32_t fullRows = geometry.fullWidth * geometry.fullHeight;
-        nr::Activation* features = graph.allocate("input features", fullRows, 16, nr::Format::F32);
+        nr::Activation* features = graph.allocate("input features", fullRows, 16, nr::Format::F16);
         const std::string image = argument(argc, argv, "--image");
         std::vector<uint8_t> source;
         if (image.empty()) {
-            std::vector<float> synthetic(static_cast<size_t>(fullRows) * 16);
+            std::vector<uint16_t> synthetic(static_cast<size_t>(fullRows) * 16);
             for (size_t index = 0; index < synthetic.size(); ++index)
-                synthetic[index] = num::roundF16(std::sin(index * 0.0017f) * 0.125f);
-            context.upload(features->buffer, synthetic.data(), synthetic.size() * sizeof(float));
+                synthetic[index] = num::f16Bits(std::sin(index * 0.0017f) * 0.125f);
+            context.upload(features->buffer, synthetic.data(), synthetic.size() * sizeof(uint16_t));
         } else {
             source = readFile(image);
             require(source.size() == static_cast<size_t>(width) * height * 4,
@@ -323,7 +323,7 @@ int main(int argc, char** argv)
         }
         if (!image.empty()) {
             const auto lanes = context.download(features->buffer, features->validBytes());
-            const float* centred = reinterpret_cast<const float*>(lanes.data());
+            const uint16_t* centred = reinterpret_cast<const uint16_t*>(lanes.data());
             const float* rgbw = reinterpret_cast<const float*>(bytes.data());
             std::vector<uint8_t> composed(source.size());
             for (uint32_t y = 0; y < height; ++y)
@@ -331,7 +331,8 @@ int main(int argc, char** argv)
                     const size_t pixel = static_cast<size_t>(y) * width + x;
                     const size_t padded = static_cast<size_t>(y) * geometry.fullWidth + x;
                     for (int c = 0; c < 3; ++c)
-                        composed[pixel * 4 + c] = composeChannel(rgbw[padded * 4 + c], centred[padded * 16 + 4 + c]);
+                        composed[pixel * 4 + c] =
+                            composeChannel(rgbw[padded * 4 + c], num::f16ToF32(centred[padded * 16 + 4 + c]));
                     composed[pixel * 4 + 3] = source[pixel * 4 + 3];
                 }
             const std::string output = argument(argc, argv, "--output");

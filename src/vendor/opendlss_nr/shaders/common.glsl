@@ -28,6 +28,12 @@ float roundF16(float value) {
 uint f16Bits(float16_t value) { return uint(float16BitsToUint16(value)); }
 float16_t f16FromBits(uint bits) { return uint16BitsToFloat16(uint16_t(bits & 0xffffu)); }
 
+// Eight f32 values already on the half grid (roundF16) as the sixteen bytes of eight halves: the conversion is exact.
+uvec4 halfWords(vec4 a, vec4 b) {
+  return uvec4(packFloat2x16(f16vec2(a.xy)), packFloat2x16(f16vec2(a.zw)), packFloat2x16(f16vec2(b.xy)),
+               packFloat2x16(f16vec2(b.zw)));
+}
+
 uint shiftRne(uint value, uint shift) {
   uint quotient = value >> shift;
   uint remainderMask = (1u << shift) - 1u;

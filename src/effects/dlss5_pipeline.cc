@@ -134,7 +134,7 @@ namespace VkHook
             std::lock_guard<std::mutex> lock(*info.modelUse);
             s.graph = std::make_unique<nr::Graph>(s.context, *info.model, *s.kernels, geometry, nr::Graph::Options{});
         }
-        s.features = s.graph->allocate("input features", geometry.fullWidth * geometry.fullHeight, 16, nr::Format::F32);
+        s.features = s.graph->allocate("input features", geometry.fullWidth * geometry.fullHeight, 16, nr::Format::F16);
         const VkDeviceSize pixelBytes = VkDeviceSize(info.extent.width) * info.extent.height * sizeof(uint32_t);
         s.packedInput  = s.context.createBuffer(pixelBytes, false, "DLSS5 packed input");
         s.packedOutput = s.context.createBuffer(pixelBytes, false, "DLSS5 packed output");

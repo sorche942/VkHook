@@ -32,4 +32,7 @@ VkHook vendor integration:
 - Places the graph's activations by lifetime: the constructor records the network once without submitting it,
   and activations whose barrier intervals never overlap share one allocation (Graph::placeActivations,
   vk::BufferUseObserver). Outputs are bit-identical; see docs/WORKFLOWS.md "Video memory".
+- Takes the input features as f16 [pixels][16] instead of f32: the first block converted every value to f16
+  before its first use, so the preprocess writes halves and the block loads them as they are (half the
+  feature memory and traffic; Kernels::convertF32ToF16 is gone). Outputs are bit-identical.
 - NVIDIA model weights are not part of this vendored source directory.
