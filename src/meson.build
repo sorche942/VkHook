@@ -368,7 +368,7 @@ depth_copy_state_tests = executable('vkhook-depth-copy-state-tests',
     'render/depth_copy_state_test.cc',
     dependencies : threads_dep,
     include_directories : vkhook_inc)
-test('depth copy state', depth_copy_state_tests)
+test('depth copy state', depth_copy_state_tests, suite : ['threaded'])
 
 # RetireQueue + Timeline (formal/VkHookFormal/RetireQueue.lean): seeded random
 # action sequences against a ground-truth GPU model, no Vulkan device needed.
@@ -377,7 +377,7 @@ retire_tests = executable('vkhook-retire-tests',
     'gpu/retire.cc',
     'gpu/timeline.cc',
     dependencies : vkhook_core_dep)
-test('retire queue', retire_tests)
+test('retire queue', retire_tests, suite : ['threaded'])
 
 if dlss5_available
     dlss5_device_tests = executable('vkhook-dlss5-device-tests',
@@ -423,7 +423,8 @@ present_mode_tests = executable('vkhook-present-mode-tests',
     'gpu/timeline.cc',
     dependencies : vkhook_core_dep)
 test('present modes', present_mode_tests,
-    env : ['VKHOOK_LOG_LEVEL=none'])
+    env : ['VKHOOK_LOG_LEVEL=none'],
+    suite : ['threaded'])
 
 # Link the production recorder and fake only Vulkan dispatch. Section GC keeps
 # unrelated command-buffer allocation/effect code out of the headless executable.
@@ -448,7 +449,7 @@ wayland_syncobj_gate_tests = executable('vkhook-wayland-syncobj-gate-tests',
     'tests/wayland_syncobj_gate_test.cc',
     'input/wayland_syncobj_gate.cc',
     dependencies : vkhook_core_dep)
-test('wayland syncobj gate', wayland_syncobj_gate_tests)
+test('wayland syncobj gate', wayland_syncobj_gate_tests, suite : ['threaded'])
 
 # The marshal patcher parses live ELF state; reading one dynamic-section
 # pointer with the wrong convention took the whole client down once.
@@ -520,7 +521,7 @@ compile_cache_tests = executable('vkhook-compile-cache-tests',
     'effects/shader_cache.cc',
     'effects/reshade_module_io.cc',
     dependencies : vkhook_core_dep)
-test('compile cache', compile_cache_tests)
+test('compile cache', compile_cache_tests, suite : ['threaded'])
 
 # Uniform ring layout, descriptor budgets, the forwarding decision, the shared
 # render pass description and the batched texture upload, all headless.
@@ -562,24 +563,37 @@ test('reshade uniform sources', reshade_uniform_tests)
 persist_tests = executable('vkhook-persist-tests',
     'tests/persist_test.cc',
     dependencies : vkhook_core_dep)
-test('persistence queue', persist_tests)
+test('persistence queue', persist_tests, suite : ['threaded'])
 
 # The settings schema (defaults, clamping, file round trip), the published
 # snapshots and the config-directory migrations.
 config_store_tests = executable('vkhook-config-store-tests',
     'tests/config_store_test.cc',
     dependencies : vkhook_core_dep)
-test('config store', config_store_tests)
+test('config store', config_store_tests, suite : ['threaded'])
 
 # the overlay's command queue and the SetParam value copy
 overlay_commands_tests = executable('vkhook-overlay-commands-tests',
     'tests/overlay_commands_test.cc',
     'overlay/commands.cc',
     dependencies : vkhook_core_dep)
-test('overlay commands', overlay_commands_tests)
+test('overlay commands', overlay_commands_tests, suite : ['threaded'])
 
 # the numeric field editors parse with std::from_chars; the grammar is pinned here
 field_parse_tests = executable('vkhook-field-parse-tests',
     'tests/field_parse_test.cc',
     include_directories : include_directories('overlay/params'))
 test('field parse', field_parse_tests)
+
+# C2 regression: a game-shaped app reads the X server's view of its window back and
+# checks it follows what the app rendered while the layer swaps the swapchain images.
+# It must not link libvkhook: the layer is loaded through the Vulkan loader, like a game.
+present_pixels_app = executable('present-pixels',
+    'tests/present_pixels.cc',
+    dependencies : [dependency('vulkan'), x11_dep])
+test('present pixels', find_program('python3', native : true),
+    args : [files('tests/present_pixels.py'), present_pixels_app.full_path(), vkhook_lib.full_path()],
+    depends : [present_pixels_app, vkhook_lib],
+    is_parallel : false,
+    timeout : 180,
+    protocol : 'exitcode')
