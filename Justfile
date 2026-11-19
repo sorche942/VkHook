@@ -19,6 +19,10 @@ flatpak_manifest := repo_root / "packaging/flatpak/org.freedesktop.Platform.Vulk
 flatpak_build_dir := repo_root / "build/flatpak"
 flatpak_repo_dir := repo_root / "build/flatpak-repo"
 
+# Check the Veil models and proofs in formal/ (needs ~/Development/veil or VEIL_HOME).
+formal:
+    cd {{ repo_root }}/formal && lake build
+
 flatpak-build:
     flatpak-builder \
       --force-clean \

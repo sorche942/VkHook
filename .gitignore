@@ -11,3 +11,5 @@ build-debug.sh
 .flatpak-*/
 __pycache__/
 steam-*.log
+formal/.lake/
+formal/lake-manifest.json
