@@ -69,8 +69,8 @@ def seed(work, library, variant, game):
         "enableOnLaunch = true\noverlayKey = Home\nreloadKey = F10\nmaxEffects = 10\n"
         f"autoApply = true\nautoApplyDelay = 200\ndepthCapture = {depth}\n"
         "showDebugWindow = false\ndepthResolveMode = 0\ndepthManualPin =\n"
-        "depthTransientWorkaround = true\ndepthCaptureMethod = 1\n"
-        "depthSourceChannel = 0\ndepthInvert = false\n")
+        "depthTransientWorkaround = true\n"
+        "depthInvert = false\n")
     if effect:
         shaders = config / "reshade" / "packages" / "Shaders"
         shutil.copy(FIXTURES / "ReShade.fxh", shaders / "ReShade.fxh")

@@ -22,7 +22,6 @@ namespace VkHook
         uint32_t bufferWidth = 1920;   // BUFFER_WIDTH / BUFFER_HEIGHT
         uint32_t bufferHeight = 1080;
         uint32_t colorBitDepth = 8;    // BUFFER_COLOR_DEPTH
-        int depthSourceMode = 0;       // see addReshadeDepthMacros
         std::vector<PreprocessorDefinition> userDefs;  // per-effect user macros
         std::vector<std::string> includePaths;          // shader roots; expanded to include dirs
     };

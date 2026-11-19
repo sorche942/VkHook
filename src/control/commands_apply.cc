@@ -330,7 +330,7 @@ namespace VkHook
             c.observedLayout = e.layout;
             c.transient = e.transient;
             c.drawCount = e.drawCount;
-            c.hasPresentableSnapshotTarget = depthExtentMatchesWindow(e.extent, depthInfo.swapchainExtent);
+            c.matchesWindowSize = depthExtentMatchesWindow(e.extent, depthInfo.swapchainExtent);
         };
         if (report.hasActive)
             describe(depthInfo.active, report.active);
@@ -627,7 +627,6 @@ namespace VkHook
 
         // The transforms are push constants read from the settings at every
         // present: a toggle needs nothing rebuilt.
-        void operator()(const DepthTransformChanged&) const {}
 
         void operator()(const SetSetting& c) const
         {

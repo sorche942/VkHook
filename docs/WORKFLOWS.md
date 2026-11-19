@@ -685,8 +685,10 @@ shader (`texelFetch` for MSAA, specialization constants for the sample count and
 resolve mode) into an R32F target the effects sample, so a change of depth
 source never rebuilds an effect chain. Without a usable source the target is
 cleared to the far plane and effects keep running. `depthSourceChannel` and
-`depthCaptureMethod` are no longer read (the capture always exposes the raw
-depth in the red channel). Memory no longer scales with chain length: a faked
+`depthCaptureMethod` no longer exist (the capture always exposes the raw
+depth in the red channel; a config migration deletes both keys).
+`depthResolveMode` picks the MSAA reduction: 0 = average, 1 = sample zero
+(the former 2 = average is migrated to 0). Memory no longer scales with chain length: a faked
 swapchain holds three image sets (game, ping, pong) however many effects run, so
 `maxEffects` is only the overlay's add limit.
 

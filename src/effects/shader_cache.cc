@@ -200,7 +200,6 @@ namespace VkHook
         digest = mixU64(digest, setup.bufferWidth);
         digest = mixU64(digest, setup.bufferHeight);
         digest = mixU64(digest, setup.colorBitDepth);
-        digest = mixU64(digest, static_cast<uint64_t>(static_cast<int64_t>(setup.depthSourceMode)));
         digest = mixU64(digest, setup.userDefs.size());
         for (const auto& def : setup.userDefs)
         {

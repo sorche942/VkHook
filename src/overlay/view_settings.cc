@@ -124,8 +124,7 @@ namespace VkHook
         if (ImGui::IsItemHovered())
         {
             ImGui::BeginTooltip();
-            ImGui::Text("Maximum number of effects that can be active simultaneously.");
-            ImGui::TextColored(UI::Warning(), "High values use significant VRAM.");
+            ImGui::Text("Maximum number of effects that can be added to the chain.");
             ImGui::EndTooltip();
         }
         ImGui::SameLine(160.0f * d);
@@ -135,13 +134,6 @@ namespace VkHook
             emitSetting("maxEffects", maxEffectsVal);
         if (ImGui::IsItemDeactivatedAfterEdit())
             emit(SettingsChanged{});
-        float bytesPerSlot = 2.0f * currentWidth * currentHeight * 4.0f;
-        int estimatedVramMB = static_cast<int>((cfg.maxEffects * bytesPerSlot) / (1024.0f * 1024.0f));
-        ImGui::SameLine();
-        if (cfg.maxEffects > 20)
-            ImGui::TextColored(UI::Attention(), "~%d MB @ %ux%u", estimatedVramMB, currentWidth, currentHeight);
-        else
-            ImGui::TextDisabled("~%d MB @ %ux%u", estimatedVramMB, currentWidth, currentHeight);
         ImGui::TextDisabled("Requires restart");
 
         ImGui::Spacing();

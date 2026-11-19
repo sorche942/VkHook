@@ -83,11 +83,11 @@ namespace
         expect(s.uiScale == 0.0f, "zero or negative uiScale means automatic");
 
         AppSettings loaded;
-        Schema::load(loaded, {{"maxEffects", "5000"}, {"depthCaptureMethod", "9"}, {"depthSourceChannel", "x"},
+        Schema::load(loaded, {{"maxEffects", "5000"}, {"depthResolveMode", "9"}, {"autoApplyDelay", "x"},
                               {"autoApply", "off"}, {"depthCapture", "on"}, {"unknownKey", "1"}});
         expect(loaded.maxEffects == 200, "load clamps through the same table");
-        expect(loaded.depthCaptureMethod == 2, "load clamps depthCaptureMethod");
-        expect(loaded.depthSourceChannel == 0, "an unparsable value keeps the default");
+        expect(loaded.depthResolveMode == 1, "load clamps depthResolveMode to its two values");
+        expect(loaded.autoApplyDelay == 200, "an unparsable value keeps the default");
         expect(!loaded.autoApply && loaded.depthCapture, "bool spellings on/off");
     }
 
@@ -231,10 +231,30 @@ namespace
         expect(manager.find("shaderPath = /x\nshaderPath = /y\n") != std::string::npos,
                "comma-separated lists split one per line");
         const std::string conf = readFile((base / "VkHook.conf").string());
-        expect(conf.find("# mine\nmaxEffects = 12\ndepthCapture = false\n") == 0 && conf.find("schemaVersion = 2") != std::string::npos,
+        expect(conf.find("# mine\nmaxEffects = 12\ndepthCapture = false\n") == 0 && conf.find("schemaVersion = 3") != std::string::npos,
                "the stamp is added without disturbing the user's file");
         expect(conf.find("depthRebuildMode") == std::string::npos, "the obsolete depthRebuildMode key and its comment are dropped");
-        expect(Migrate::storedVersion(base.string()) == 2, "the version is stored");
+        expect(Migrate::storedVersion(base.string()) == Schema::kCurrentVersion, "the version is stored");
+
+        // v3: depthSourceChannel/depthCaptureMethod dropped, depthResolveMode 2 -> 0
+        writeFile(base / "VkHook.conf",
+                  "# keep me\nschemaVersion = 2\nmaxEffects = 12\n# depthResolveMode: old help\ndepthResolveMode = 2\n"
+                  "# depthCaptureMethod: 0=off\ndepthCaptureMethod = 1\n"
+                  "# depthSourceChannel mode selection:\n#   0 = Luminance\n#   1 = Alpha\ndepthSourceChannel = 4\nfutureKey = x\n# trailing\n");
+        expect(Migrate::run(base.string()) == Schema::kCurrentVersion, "a v2 file migrates to the current version");
+        const std::string v3 = readFile((base / "VkHook.conf").string());
+        expect(v3.find("depthCaptureMethod") == std::string::npos && v3.find("depthSourceChannel") == std::string::npos,
+               "the removed depth keys and their comments are gone");
+        expect(v3.find("# keep me\n") == 0 && v3.find("maxEffects = 12\n") != std::string::npos
+                   && v3.find("futureKey = x\n# trailing\n") != std::string::npos,
+               "other keys and comments are preserved");
+        expect(v3.find("depthResolveMode = 0\n") != std::string::npos && v3.find("depthResolveMode = 2") == std::string::npos,
+               "depthResolveMode 2 (average) becomes 0");
+        expect(Migrate::storedVersion(base.string()) == Schema::kCurrentVersion, "the new version is stamped");
+        writeFile(base / "VkHook.conf", "schemaVersion = 2\ndepthResolveMode = 1\n");
+        Migrate::run(base.string());
+        expect(readFile((base / "VkHook.conf").string()).find("depthResolveMode = 1\n") != std::string::npos,
+               "sample zero is untouched");
 
         // run once: a re-created legacy artifact is left alone at the current version
         writeFile(base / "configs/late@default.conf", "x");
@@ -246,13 +266,13 @@ namespace
         std::vector<int> ran;
         trace = &ran;
         const Migrate::Step custom[] = {
-            {3, "three", [](const std::string&) { trace->push_back(3); return true; }},
-            {4, "four", [](const std::string&) { trace->push_back(4); return false; }},
-            {5, "five", [](const std::string&) { trace->push_back(5); return true; }},
+            {4, "four", [](const std::string&) { trace->push_back(4); return true; }},
+            {5, "five", [](const std::string&) { trace->push_back(5); return false; }},
+            {6, "six", [](const std::string&) { trace->push_back(6); return true; }},
         };
-        expect(Migrate::run(base.string(), custom) == 3, "a failing step stops the chain at the last good version");
-        expect(ran == std::vector<int>({3, 4}), "steps run in ascending order and stop at the failure");
-        expect(Migrate::storedVersion(base.string()) == 3, "the last good version is stamped");
+        expect(Migrate::run(base.string(), custom) == 4, "a failing step stops the chain at the last good version");
+        expect(ran == std::vector<int>({4, 5}), "steps run in ascending order and stop at the failure");
+        expect(Migrate::storedVersion(base.string()) == 4, "the last good version is stamped");
 
         // a fresh install has nothing to migrate and still gets stamped
         fs::remove_all(base);

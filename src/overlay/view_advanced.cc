@@ -30,7 +30,7 @@ namespace VkHook
             if (windowSized(c))
                 return c.imageView;
         for (const auto& c : info.candidates)
-            if (c.hasPresentableSnapshotTarget)
+            if (c.matchesWindowSize)
                 return c.imageView;
         return info.candidates.empty() ? VK_NULL_HANDLE : info.candidates.front().imageView;
     }
@@ -133,7 +133,7 @@ namespace VkHook
             ImGui::TextDisabled("%s | MSAA %s | %u draws%s%s", depthFormatName(c.format),
                                 sampleName(c.samples), c.drawCount,
                                 c.transient ? " | transient" : "",
-                                c.hasPresentableSnapshotTarget ? " | swapchain" : "");
+                                c.matchesWindowSize ? " | swapchain" : "");
             ImGui::Separator();
             ImGui::PopID();
             return action;
@@ -203,32 +203,25 @@ namespace VkHook
         }
 
         ImGui::Spacing();
-        // --- Encoding: the two modes that actually behave differently ---
-        // Luminance/Red and every other single-channel mask decode depth the same
-        // way, so they collapse to "Red"; View-space Z is the only transform with
-        // distinct behaviour.
+        // --- MSAA resolve: how a multisampled depth source is reduced to one sample ---
         {
-            static const int kChannels[] = { 0, 4 };   // depth source channel indices
-            const char* labels[] = { "Luminance/Red", "View-space Z" };
+            const char* labels[] = { "Average", "Sample zero" };
             const char* hints[] = {
-                "Read depth from the red / luminance channel. The standard Vulkan depth layout.",
-                "Convert raw view-space Z into [0,1]. Use when the red channel reads flat or inverted."
+                "Average all samples of each pixel. Smoother, the default.",
+                "Take sample 0 of each pixel. Exact depth values, but edges are not averaged."
             };
             ImGui::AlignTextToFramePadding();
-            ImGui::TextUnformatted("Encoding");
+            ImGui::TextUnformatted("MSAA resolve");
             ImGui::SameLine();
             ImGui::SetNextItemWidth(240.0f * d);
-            ImGui::PushID("##depth_encoding");
-            int index = (cfg.depthSourceChannel == kChannels[1]) ? 1 : 0;
-            if (ImGui::Combo("##depth_channel", &index, labels, 2))
+            int index = cfg.depthResolveMode == 1 ? 1 : 0;
+            if (ImGui::Combo("##depth_resolve", &index, labels, 2))
             {
-                emitSetting("depthSourceChannel", kChannels[index]);
-                emit(DepthTransformChanged{});
+                emitSetting("depthResolveMode", index);
                 emit(SettingsChanged{});
             }
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("%s", hints[index]);
-            ImGui::PopID();
         }
 
         // --- Transforms: one compact row ---
@@ -267,7 +260,6 @@ namespace VkHook
 
             if (changed)
             {
-                emit(DepthTransformChanged{});
                 emit(SettingsChanged{});
             }
         }

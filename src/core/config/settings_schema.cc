@@ -62,9 +62,9 @@ namespace VkHook
         // File order is the order a fresh VkHook.conf is written in. Depth
         // capture defaults on so depth effects work on a game's first launch
         // instead of needing a restart.
-        const std::array<SettingDesc, 21>& table()
+        const std::array<SettingDesc, 19>& table()
         {
-            static const std::array<SettingDesc, 21> rows = {
+            static const std::array<SettingDesc, 19> rows = {
                 boolRow("overlayBlockInput", &S::overlayBlockInput, true, "Overlay settings"),
                 boolRow("usePortalIntegration", &S::usePortalIntegration, true),
                 floatRow("uiScale", &S::uiScale, 0.0f, 0.75, 3.0, true, "",
@@ -79,21 +79,10 @@ namespace VkHook
                 boolRow("depthCapture", &S::depthCapture, true, "", "", true),
                 boolRow("showDebugWindow", &S::showDebugWindow, false, "Debug"),
                 boolRow("separateEffectParams", &S::separateEffectParams, true, "Overlay layout"),
-                intRow("depthResolveMode", &S::depthResolveMode, 0, 0, 2, "Advanced (depth buffer)",
-                       "# depthResolveMode: 0=auto (prefer average), 1=sample-zero, 2=average\n"),
+                intRow("depthResolveMode", &S::depthResolveMode, 0, 0, 1, "Advanced (depth buffer)",
+                       "# depthResolveMode: MSAA depth resolve. 0=average, 1=sample zero\n"),
                 stringRow("depthManualPin", &S::depthManualPin, ""),
                 boolRow("depthTransientWorkaround", &S::depthTransientWorkaround, true),
-                intRow("depthCaptureMethod", &S::depthCaptureMethod, 2, 0, 2, "",
-                       "# depthCaptureMethod: 0=off, 1=renderpass-end (recommended), 2=queue-submit (robust fallback)\n"),
-                intRow("depthSourceChannel", &S::depthSourceChannel, 0, 0, 6, "Alternative depth buffer handling",
-                       "# depthSourceChannel mode selection:\n"
-                       "#   0 = Luminance/Red (standard Vulkan depth)\n"
-                       "#   1 = Alpha (alpha-encoded depth)\n"
-                       "#   2 = Packed RGB (depth in RGB channels)\n"
-                       "#   3 = Logarithmic (log-encoded depth)\n"
-                       "#   4 = View-space Z (raw view-space Z)\n"
-                       "#   5 = NDC (Normalized Device Coordinates)\n"
-                       "#   6 = Reversed-Z (inverted for precision)\n"),
                 boolRow("depthInvert", &S::depthInvert, false, "",
                         "# depthInvert: invert depth values (flips near/far planes)\n"),
                 boolRow("depthFlip", &S::depthFlip, false, "",

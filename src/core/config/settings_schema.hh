@@ -36,17 +36,12 @@ namespace VkHook
         // Effect parameters in their own tabbed card (default) or inline in the
         // effect list.
         bool separateEffectParams;
-        // Depth resolve mode for MSAA sources: 0 auto, 1 sample-zero, 2 average.
+        // Depth resolve mode for MSAA sources: 0 average, 1 sample zero.
         int depthResolveMode;
         // Manual depth buffer pin: the tracked image view key, "" for auto.
         std::string depthManualPin;
         // Inject a depth resolve attachment for transient multisampled depth.
         bool depthTransientWorkaround;
-        // 0 off, 1 render-pass-end hook, 2 queue-submit interception.
-        int depthCaptureMethod;
-        // Depth encoding: 0 red, 1 alpha, 2 packed RGB, 3 logarithmic,
-        // 4 view-space Z, 5 NDC, 6 reversed-Z.
-        int depthSourceChannel;
         bool depthInvert;
         bool depthFlip;
         bool depthFlop;
@@ -85,7 +80,7 @@ namespace VkHook
     {
         // Bumped when a file layout changes in a way that needs a migration
         // (migrate.hh). Stored in VkHook.conf as `schemaVersion`.
-        constexpr int kCurrentVersion = 2;
+        constexpr int kCurrentVersion = 3;
         constexpr const char* kVersionKey = "schemaVersion";
 
         std::span<const SettingDesc> settings();

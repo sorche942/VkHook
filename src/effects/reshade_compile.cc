@@ -107,7 +107,7 @@ namespace VkHook
 
             // Only the static source encoding is a macro. The user's invert/flip/flop
             // transforms are runtime resolve push constants (see addReshadeDepthMacros).
-            addReshadeDepthMacros(pp, setup.depthSourceMode);
+            addReshadeDepthMacros(pp);
 
             pp.append_string(kCompatibilityPrelude);
 

@@ -71,8 +71,6 @@ namespace VkHook
         bool getEnableOnLaunch() const { return snapshot()->enableOnLaunch; }
         bool getDepthCapture() const { return snapshot()->depthCapture; }
         int getDepthResolveMode() const { return snapshot()->depthResolveMode; }
-        int getDepthCaptureMethod() const { return snapshot()->depthCaptureMethod; }
-        int getDepthSourceChannel() const { return snapshot()->depthSourceChannel; }
         bool getDepthInvert() const { return snapshot()->depthInvert; }
         bool getDepthFlip() const { return snapshot()->depthFlip; }
         bool getDepthFlop() const { return snapshot()->depthFlop; }

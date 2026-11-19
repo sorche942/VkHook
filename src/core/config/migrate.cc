@@ -180,7 +180,9 @@ namespace VkHook::Migrate
         }
 
         // Removes `key` and the "# key: ..." comment the schema writes above it
-        // from the user's VkHook.conf; every other line stays as the user wrote it.
+        // from the user's VkHook.conf (including the "#   N = ..." option lines
+        // the schema writes below a "# key mode selection:" header); every
+        // other line stays as the user wrote it.
         bool dropSettingKey(const fs::path& file, std::string_view key)
         {
             std::ifstream in(file, std::ios::binary);
@@ -188,7 +190,8 @@ namespace VkHook::Migrate
                 return true;
             const std::string existing((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
 
-            const std::string commentPrefix = "# " + std::string(key) + ":";
+            const std::string commentPrefix = "# " + std::string(key);
+            bool inOptionList = false;
             std::string out;
             bool changed = false;
             size_t pos = 0;
@@ -202,12 +205,63 @@ namespace VkHook::Migrate
                 pos = hasNewline ? eol + 1 : eol;
 
                 const Ini::Line parsed = Ini::tokenize(line);
-                const bool drop = (parsed.kind == Ini::LineKind::Pair && parsed.key == key)
-                    || (parsed.kind == Ini::LineKind::Comment && line.compare(0, commentPrefix.size(), commentPrefix) == 0);
+                const bool header = parsed.kind == Ini::LineKind::Comment
+                    && line.compare(0, commentPrefix.size(), commentPrefix) == 0
+                    && (line.size() == commentPrefix.size() || line[commentPrefix.size()] == ':'
+                        || line[commentPrefix.size()] == ' ');
+                const bool option = inOptionList && line.size() > 5 && line.compare(0, 4, "#   ") == 0
+                    && line[4] >= '0' && line[4] <= '9';
+                const bool drop = (parsed.kind == Ini::LineKind::Pair && parsed.key == key) || header || option;
+                inOptionList = header || option;
                 if (drop)
                 {
                     changed = true;
                     continue;
+                }
+                out += line;
+                if (hasNewline)
+                    out += '\n';
+            }
+            if (!changed)
+                return true;
+            if (!writeAtomically(file.string(), out))
+            {
+                Logger::err("Could not rewrite " + file.string());
+                return false;
+            }
+            return true;
+        }
+
+        // depthResolveMode = 2 (average) becomes 0 (average); the line's comment
+        // and every other line stay as the user wrote them.
+        bool remapDepthResolveMode(const fs::path& file)
+        {
+            std::ifstream in(file, std::ios::binary);
+            if (!in)
+                return true;
+            const std::string existing((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+            in.close();
+
+            std::string out;
+            bool changed = false;
+            size_t pos = 0;
+            while (pos < existing.size())
+            {
+                size_t eol = existing.find('\n', pos);
+                const bool hasNewline = eol != std::string::npos;
+                if (!hasNewline)
+                    eol = existing.size();
+                std::string line = existing.substr(pos, eol - pos);
+                pos = hasNewline ? eol + 1 : eol;
+
+                const Ini::Line parsed = Ini::tokenize(line);
+                if (parsed.kind == Ini::LineKind::Pair && parsed.key == "depthResolveMode" && parsed.value == "2")
+                {
+                    changed = true;
+                    const bool crlf = !line.empty() && line.back() == '\r';
+                    line = "depthResolveMode = 0";
+                    if (crlf)
+                        line += '\r';
                 }
                 out += line;
                 if (hasNewline)
@@ -230,9 +284,22 @@ namespace VkHook::Migrate
             return dropSettingKey(fs::path(baseDir) / "VkHook.conf", "depthRebuildMode");
         }
 
-        constexpr std::array<Step, 2> kSteps = {{
+        // The depth capture no longer reads depthSourceChannel or
+        // depthCaptureMethod, and depthResolveMode is now 0 = average,
+        // 1 = sample zero (the old 2 = average is the same as 0).
+        bool toVersion3(const std::string& baseDir)
+        {
+            const fs::path file = fs::path(baseDir) / "VkHook.conf";
+            const bool channel = dropSettingKey(file, "depthSourceChannel");
+            const bool method = dropSettingKey(file, "depthCaptureMethod");
+            const bool resolve = remapDepthResolveMode(file);
+            return channel && method && resolve;
+        }
+
+        constexpr std::array<Step, 3> kSteps = {{
             {1, "legacy config layouts", toVersion1},
             {2, "drop depthRebuildMode", toVersion2},
+            {3, "drop depth source settings, collapse depthResolveMode", toVersion3},
         }};
     } // namespace
 

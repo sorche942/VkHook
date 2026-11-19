@@ -28,7 +28,7 @@ namespace VkHook
         VkImageLayout observedLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         bool transient = false;
         uint32_t drawCount = 0;
-        bool hasPresentableSnapshotTarget = false;
+        bool matchesWindowSize = false;
     };
 
     struct DepthInfo

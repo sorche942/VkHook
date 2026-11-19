@@ -68,8 +68,6 @@ namespace VkHook
     struct ClearDepthPin {};
     // forget the active buffer, the best candidate and any pin
     struct RefreshDepth {};
-    // a depth encoding or transform setting changed: re-record the resolve path
-    struct DepthTransformChanged {};
 
     // --- settings ---
     // Set one schema key (settings_schema.hh); core clamps and publishes it.
@@ -84,7 +82,7 @@ namespace VkHook
                                  ReorderEffects, ClearEffects, RebuildChain, SaveProfile, SwitchProfile,
                                  CreateProfile, RenameProfile, DeleteProfile, ImportPreset, LoadConfig, SaveConfig,
                                  SetDefaultConfig, DeleteConfig, ReloadConfig, PinDepth, ClearDepthPin,
-                                 RefreshDepth, DepthTransformChanged, SetSetting, SettingsChanged,
+                                 RefreshDepth, SetSetting, SettingsChanged,
                                  ShaderPathsChanged>;
 
     // Many producers (the overlay's thread, input handlers), one consumer. The
