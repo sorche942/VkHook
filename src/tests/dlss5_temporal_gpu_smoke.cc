@@ -1,6 +1,8 @@
 // Opt-in NVIDIA GPU regression: production optical flow + temporal shaders.
 // No model weights required; the neural head is controlled to expose blending.
-// The optional second argument is the optical-flow input downscale (1, 2 or 4).
+// The optional second argument is the optical-flow input downscale (1, 2 or 4); reduced flow is refined
+// on the source pixels as Dlss5Pipeline refines it, and must then recover an odd translation that the
+// engine's reduced input cannot resolve.
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
 #include "dlss5_device.hh"
@@ -209,22 +211,53 @@ int main(int argc, char** argv)
         params.intensity = params.localTone = params.localStructure = params.historyStrength = 1;
         params.skinStructure = -1; params.temporal = 1;
         params.flowWidth = flow.flowWidth(); params.flowHeight = flow.flowHeight(); params.flowScale = flow.downscale();
-        auto pipeline = [&](const char* name) {
-            return context.createComputePipeline(context.loadShaderModule(std::string(argv[1]) + "/" + name + ".spv"), {}, name);
+        // No subgroup-size requirement: these shaders use no subgroup operation (see Dlss5Pipeline).
+        auto pipeline = [&](const char* name, const vk::SpecConstants& constants = {}) {
+            return context.createComputePipeline(context.loadShaderModule(std::string(argv[1]) + "/" + name + ".spv"), constants,
+                name, 0);
         };
         auto reprojectPipeline = pipeline("dlss5_reproject");
         auto preprocessPipeline = pipeline("dlss5_preprocess");
         auto compositePipeline = pipeline("dlss5_composite");
+        const bool refined = downscale > 1;
+        // Odd: half a pixel of a half-resolution engine input, which only the refinement resolves.
+        const uint32_t shiftX = refined ? 7 : 8, shiftY = refined ? 3 : 4;
+        const VkDeviceSize flowBytes = VkDeviceSize(flow.flowWidth()) * flow.flowHeight() * 4;
+        auto searchedForward = context.createBuffer(flowBytes, false, "test searched forward flow");
+        auto searchedBackward = context.createBuffer(flowBytes, false, "test searched backward flow");
+        auto refinedForward = context.createBuffer(flowBytes, false, "test refined forward flow");
+        auto refinedBackward = context.createBuffer(flowBytes, false, "test refined backward flow");
+        vk::SpecConstants search, propagation, propagationWithOpposite; // dlss5_flow_refine.comp kPass
+        search.add(0, 0);
+        propagation.add(0, 1);
+        propagationWithOpposite.add(0, 2);
+        auto searchPipeline = pipeline("dlss5_flow_refine", search);
+        auto propagatePipeline = pipeline("dlss5_flow_refine", propagation);
+        auto propagateBackwardPipeline = pipeline("dlss5_flow_refine", propagationWithOpposite);
+        // One direction per set, as Dlss5Pipeline binds them.
+        const auto refineSet = [&](const vk::Buffer& reference, const vk::Buffer& displaced, const vk::Buffer& given,
+                                   const vk::Buffer* opposite, const vk::Buffer& result) {
+            const vk::Buffer* refine[vk::kGenericBindings]{};
+            refine[0] = &reference; refine[1] = &parameters; refine[2] = &displaced;
+            refine[4] = &given; refine[5] = opposite; refine[6] = &result;
+            return context.allocateSet(refine);
+        };
+        const auto searchForwardSet = refineSet(input, previous, flow.forward(), nullptr, searchedForward);
+        const auto searchBackwardSet = refineSet(previous, input, flow.backward(), nullptr, searchedBackward);
+        const auto propagateForwardSet = refineSet(input, previous, searchedForward, nullptr, refinedForward);
+        const auto propagateBackwardSet = refineSet(previous, input, searchedBackward, &searchedForward, refinedBackward);
+        const vk::Buffer& forwardFlow = refined ? refinedForward : flow.forward();
+        const vk::Buffer& backwardFlow = refined ? refinedBackward : flow.backward();
         const vk::Buffer* bindings[vk::kGenericBindings]{};
         bindings[0] = &input; bindings[1] = &parameters; bindings[2] = &previous;
-        bindings[3] = &history; bindings[4] = &flow.forward(); bindings[5] = &flow.backward();
+        bindings[3] = &history; bindings[4] = &forwardFlow; bindings[5] = &backwardFlow;
         bindings[6] = &flow.cost(); bindings[7] = &reprojection;
         const auto reprojectSet = context.allocateSet(bindings);
         std::fill(std::begin(bindings), std::end(bindings), nullptr);
         bindings[0] = &input; bindings[1] = &parameters; bindings[2] = &reprojection; bindings[7] = &tensor;
         const auto preprocessSet = context.allocateSet(bindings);
         bindings[2] = &head; bindings[4] = &reprojection;
-        bindings[5] = &history; bindings[6] = &flow.forward(); bindings[7] = &packedOutput;
+        bindings[5] = &history; bindings[6] = &forwardFlow; bindings[7] = &packedOutput;
         const auto compositeSet = context.allocateSet(bindings);
         std::vector<uint32_t> source(pixels);
         std::vector<float> neuralHead(pixels * 4, 0);
@@ -271,6 +304,20 @@ int main(int argc, char** argv)
             VK_CHECK(vkBeginCommandBuffer(commands, &begin));
             if (params.temporal) {
                 flow.recordResults(commands);
+                if (refined) {
+                    const auto refine = [&](const vk::Pipeline& pass, VkDescriptorSet set) {
+                        vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pass.pipeline);
+                        vkCmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_COMPUTE, context.pipelineLayout(), 0, 1, &set, 0,
+                            nullptr);
+                        vkCmdDispatch(commands, (params.flowWidth + 7) / 8, (params.flowHeight + 7) / 8, 1);
+                    };
+                    refine(searchPipeline, searchForwardSet);
+                    refine(searchPipeline, searchBackwardSet);
+                    context.transferBarrier(commands);
+                    refine(propagatePipeline, propagateForwardSet);
+                    refine(propagateBackwardPipeline, propagateBackwardSet);
+                    context.transferBarrier(commands);
+                }
                 vkCmdFillBuffer(commands, reprojection.buffer, 0, 16, 0);
                 context.transferBarrier(commands);
                 dispatch(reprojectPipeline, reprojectSet);
@@ -303,23 +350,36 @@ int main(int argc, char** argv)
         params.historyValid = 1;
         for (uint32_t y = 0; y < height; ++y)
             for (uint32_t x = 0; x < width; ++x)
-                source[y * width + x] = x >= 8 && y >= 4 ? pixel(x - 8, y - 4) : 0xffeeee05u;
+                source[y * width + x] = x >= shiftX && y >= shiftY ? pixel(x - shiftX, y - shiftY) : 0xffeeee05u;
         for (uint32_t i = 0; i < pixels; ++i) neuralHead[i * 4] = -.5f;
         const auto translated = frame();
-        const auto forward = download<uint32_t>(context, flow.forward());
+        const auto forward = download<uint32_t>(context, forwardFlow);
         std::vector<float> dx, dy;
         // Skip the same 32-pixel border at every downscale.
         const uint32_t border = 8 / downscale;
+        // Refinement keeps an engine vector that already matches, sub-pixel part included, and one
+        // that a gentle gradient does not clearly contradict.
+        const auto engine = download<uint32_t>(context, flow.forward());
+        const auto within = [&](uint32_t packed) {
+            // Vectors are in the engine's input pixels.
+            return std::abs(static_cast<int16_t>(packed & 0xffffu) * static_cast<float>(downscale) / 32.f + shiftX) <= .25f
+                && std::abs(static_cast<int16_t>(packed >> 16) * static_cast<float>(downscale) / 32.f + shiftY) <= .25f;
+        };
+        uint32_t close = 0, engineClose = 0;
         for (uint32_t y = border; y + border < params.flowHeight; ++y)
             for (uint32_t x = border; x + border < params.flowWidth; ++x) {
                 const auto packed = forward[y * params.flowWidth + x];
-                // Vectors are in the engine's input pixels.
                 dx.push_back(static_cast<int16_t>(packed & 0xffffu) * static_cast<float>(downscale) / 32.f);
                 dy.push_back(static_cast<int16_t>(packed >> 16) * static_cast<float>(downscale) / 32.f);
+                close += within(packed);
+                engineClose += within(engine[y * params.flowWidth + x]);
             }
+        std::cout << "Motion vectors within a quarter pixel: " << close << '/' << dx.size() << " (engine alone " << engineClose << ")\n";
         std::sort(dx.begin(), dx.end()); std::sort(dy.begin(), dy.end());
         std::cout << "Motion median: " << dx[dx.size()/2] << ", " << dy[dy.size()/2] << '\n';
-        require(std::abs(dx[dx.size()/2] + 8) < 1.5f && std::abs(dy[dy.size()/2] + 4) < 1.5f, "optical motion direction/scale wrong");
+        require(std::abs(dx[dx.size()/2] + shiftX) < 1.5f && std::abs(dy[dy.size()/2] + shiftY) < 1.5f,
+            "optical motion direction/scale wrong");
+        require(!refined || close * 4 >= dx.size() * 3, "refinement did not recover the source-pixel translation");
         const auto repro = download<float>(context, reprojection);
         uint32_t accepted = 0; std::memcpy(&accepted, repro.data(), sizeof(accepted));
         std::cout << "Accepted history pixels: " << accepted << '/' << pixels << '\n';
@@ -392,7 +452,7 @@ int main(int argc, char** argv)
         for (uint32_t i = 0; i < pixels; ++i) neuralHead[i * 4] = .5f;
         frame();
         params.historyValid = 1;
-        objectScene(8, 4);
+        objectScene(shiftX, shiftY);
         for (uint32_t i = 0; i < pixels; ++i) neuralHead[i * 4] = -.5f;
         const auto objectBlended = frame();
         params.temporal = 0;
@@ -414,8 +474,12 @@ int main(int argc, char** argv)
         params.temporal = 1; params.historyValid = 0; params.intensity = 0;
         require(frame() == source, "zero intensity not byte-exact"); requireNoHistory();
         std::cout << "PASS explicit reset, byte-exact zero intensity, preserved alpha, odd dimensions\n";
-        for (auto* p : {&reprojectPipeline, &preprocessPipeline, &compositePipeline}) context.destroyPipeline(*p);
-        for (auto* b : {&input, &previous, &history, &reprojection, &packedOutput, &tensor, &head, &parameters}) context.destroyBuffer(*b);
+        for (auto* p : {&reprojectPipeline, &preprocessPipeline, &compositePipeline, &searchPipeline, &propagatePipeline,
+                 &propagateBackwardPipeline})
+            context.destroyPipeline(*p);
+        for (auto* b : {&input, &previous, &history, &reprojection, &packedOutput, &tensor, &head, &parameters, &searchedForward,
+                 &searchedBackward, &refinedForward, &refinedBackward})
+            context.destroyBuffer(*b);
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';

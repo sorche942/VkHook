@@ -39,6 +39,7 @@ if dlss5_available
         'effects/shaders/glsl/dlss5_preprocess.comp',
         'effects/shaders/glsl/dlss5_composite.comp',
         'effects/shaders/glsl/dlss5_reproject.comp',
+        'effects/shaders/glsl/dlss5_flow_refine.comp',
         'effects/shaders/glsl/dlss5_luma.comp',
     )
     opendlss_nr_extra_shader_deps = files(

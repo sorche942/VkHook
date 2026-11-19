@@ -19,6 +19,15 @@ namespace VkHook
                 throw std::runtime_error(std::string("DLSS5: missing downstream ") + name);
             return reinterpret_cast<Function>(address);
         }
+
+        // The network's kernels need full 32-wide subgroups, which is the context's
+        // default. These shaders use no subgroup operation, and their 8x8 groups
+        // cannot ask for it (VUID-VkPipelineShaderStageCreateInfo-pNext-02757).
+        vk::Pipeline bridgePipeline(vk::Context& context, const std::string& shaderPath, const char* shader, const char* label,
+                                    const vk::SpecConstants& constants = {})
+        {
+            return context.createComputePipeline(context.loadShaderModule(shaderPath + "/" + shader + ".spv"), constants, label, 0);
+        }
     } // namespace
 
     struct Dlss5Pipeline::State
@@ -38,6 +47,9 @@ namespace VkHook
         bool       sharedSource = false;
         vk::Buffer packedInput{}, packedOutput{};
         vk::Buffer previousInput{}, history{}, reprojection{};
+        // The engine's vectors matched again on full-resolution pixels (dlss5_flow_refine.comp):
+        // searched around each vector, then exchanged between neighbouring cells.
+        vk::Buffer searchedForward{}, searchedBackward{}, refinedForward{}, refinedBackward{};
         Dlss5Parameters parameters{}, submittedParameters{};
         uint64_t lastFrameSerial = 0;
         std::chrono::steady_clock::time_point lastSubmission{};
@@ -46,10 +58,13 @@ namespace VkHook
         struct Sets
         {
             VkDescriptorSet preprocess = VK_NULL_HANDLE, composite = VK_NULL_HANDLE, reproject = VK_NULL_HANDLE;
+            // Flow refinement, one direction per dispatch.
+            VkDescriptorSet searchForward = VK_NULL_HANDLE, searchBackward = VK_NULL_HANDLE, propagateForward = VK_NULL_HANDLE,
+                            propagateBackward = VK_NULL_HANDLE;
         };
         // Per image: `still` reads packedInput, `moving` the source of a frame with history.
         std::vector<Sets> still, moving;
-        vk::Pipeline    preprocess{}, composite{}, reproject{};
+        vk::Pipeline    preprocess{}, composite{}, reproject{}, search{}, propagate{}, propagateWithOpposite{};
         VkCommandPool   commandPool = VK_NULL_HANDLE;
         VkCommandBuffer network     = VK_NULL_HANDLE;
 
@@ -68,9 +83,16 @@ namespace VkHook
             context.destroyPipeline(preprocess);
             context.destroyPipeline(composite);
             context.destroyPipeline(reproject);
+            context.destroyPipeline(search);
+            context.destroyPipeline(propagate);
+            context.destroyPipeline(propagateWithOpposite);
             context.destroyBuffer(previousInput);
             context.destroyBuffer(history);
             context.destroyBuffer(reprojection);
+            context.destroyBuffer(searchedForward);
+            context.destroyBuffer(searchedBackward);
+            context.destroyBuffer(refinedForward);
+            context.destroyBuffer(refinedBackward);
             for (auto& buffer : parameterBuffers)
                 context.destroyBuffer(buffer);
             context.destroyBuffer(packedInput);
@@ -151,8 +173,24 @@ namespace VkHook
             s.previousInput = s.context.createBuffer(pixelBytes, false, "DLSS5 previous input");
             s.history       = s.context.createBuffer(pixelBytes * 4, false, "DLSS5 neural history");
             s.reprojection  = s.context.createBuffer(16 + pixelBytes * 4, false, "DLSS5 reprojected history");
-            s.reproject = s.context.createComputePipeline(s.context.loadShaderModule(info.shaderPath + "/dlss5_reproject.spv"), {},
-                                                          "DLSS5 reprojection");
+            s.reproject = bridgePipeline(s.context, info.shaderPath, "dlss5_reproject", "DLSS5 reprojection");
+            // At full resolution the engine already matches source pixels.
+            if (info.refineFlow && s.flow->downscale() > 1)
+            {
+                const VkDeviceSize flowBytes = VkDeviceSize(s.flow->flowWidth()) * s.flow->flowHeight() * sizeof(uint32_t);
+                s.searchedForward  = s.context.createBuffer(flowBytes, false, "DLSS5 searched forward flow");
+                s.searchedBackward = s.context.createBuffer(flowBytes, false, "DLSS5 searched backward flow");
+                s.refinedForward   = s.context.createBuffer(flowBytes, false, "DLSS5 refined forward flow");
+                s.refinedBackward  = s.context.createBuffer(flowBytes, false, "DLSS5 refined backward flow");
+                vk::SpecConstants search, propagate, propagateWithOpposite; // dlss5_flow_refine.comp kPass
+                search.add(0, 0);
+                propagate.add(0, 1);
+                propagateWithOpposite.add(0, 2);
+                s.search    = bridgePipeline(s.context, info.shaderPath, "dlss5_flow_refine", "DLSS5 flow search", search);
+                s.propagate = bridgePipeline(s.context, info.shaderPath, "dlss5_flow_refine", "DLSS5 flow propagation", propagate);
+                s.propagateWithOpposite = bridgePipeline(s.context, info.shaderPath, "dlss5_flow_refine",
+                                                         "DLSS5 backward flow propagation", propagateWithOpposite);
+            }
         }
 
         // Record the expensive graph once. The per-image primaries execute this
@@ -176,17 +214,18 @@ namespace VkHook
         s.graph->record(s.network, *s.features);
         VK_CHECK(s.dispatch.vkEndCommandBuffer(s.network));
 
-        vk::SpecConstants constants;
-        s.preprocess = s.context.createComputePipeline(s.context.loadShaderModule(info.shaderPath + "/dlss5_preprocess.spv"), constants,
-                                                       "DLSS5 input");
-        s.composite = s.context.createComputePipeline(s.context.loadShaderModule(info.shaderPath + "/dlss5_composite.spv"), constants,
-                                                      "DLSS5 output");
+        s.preprocess = bridgePipeline(s.context, info.shaderPath, "dlss5_preprocess", "DLSS5 input");
+        s.composite  = bridgePipeline(s.context, info.shaderPath, "dlss5_composite", "DLSS5 output");
         const size_t count = info.input.size();
         s.parameterBuffers.resize(count);
         s.still.resize(count);
         s.moving.resize(count);
         s.recordedTemporal.resize(count, 2);
         const vk::Buffer& movingSource = s.sharedSource ? s.flow->source() : s.packedInput;
+        // What the reprojection and the debug views read: the refined vectors when there are any.
+        const bool        refined  = s.search.pipeline != VK_NULL_HANDLE;
+        const vk::Buffer* forward  = !s.flow ? nullptr : refined ? &s.refinedForward : &s.flow->forward();
+        const vk::Buffer* backward = !s.flow ? nullptr : refined ? &s.refinedBackward : &s.flow->backward();
         for (uint32_t index = 0; index < count; ++index)
         {
             s.parameterBuffers[index] = s.context.createBuffer(sizeof(Dlss5Parameters), true, "DLSS5 parameters");
@@ -202,18 +241,39 @@ namespace VkHook
                 bindings[2] = &s.graph->head().buffer;
                 bindings[4] = s.flow ? &s.reprojection : nullptr;
                 bindings[5] = s.flow ? &s.history : nullptr;
-                bindings[6] = s.flow ? &s.flow->forward() : nullptr;
+                bindings[6] = forward;
                 bindings[7] = &s.packedOutput;
                 sets.composite = s.context.allocateSet(bindings);
                 if (history)
                 {
                     bindings[2] = &s.previousInput;
                     bindings[3] = &s.history;
-                    bindings[4] = &s.flow->forward();
-                    bindings[5] = &s.flow->backward();
+                    bindings[4] = forward;
+                    bindings[5] = backward;
                     bindings[6] = &s.flow->cost();
                     bindings[7] = &s.reprojection;
                     sets.reproject = s.context.allocateSet(bindings);
+                    if (refined)
+                    {
+                        // One direction per set: the image whose cells are matched, the image they are
+                        // looked for in, the vectors in, the other direction's vectors and the vectors out.
+                        const auto refineSet = [&](const vk::Buffer& reference, const vk::Buffer& displaced, const vk::Buffer& given,
+                                                   const vk::Buffer* opposite, const vk::Buffer& result) {
+                            const vk::Buffer* refine[vk::kGenericBindings]{};
+                            refine[0] = &reference;
+                            refine[1] = &s.parameterBuffers[index];
+                            refine[2] = &displaced;
+                            refine[4] = &given;
+                            refine[5] = opposite;
+                            refine[6] = &result;
+                            return s.context.allocateSet(refine);
+                        };
+                        sets.searchForward     = refineSet(source, s.previousInput, s.flow->forward(), nullptr, s.searchedForward);
+                        sets.searchBackward    = refineSet(s.previousInput, source, s.flow->backward(), nullptr, s.searchedBackward);
+                        sets.propagateForward  = refineSet(source, s.previousInput, s.searchedForward, nullptr, s.refinedForward);
+                        sets.propagateBackward =
+                            refineSet(s.previousInput, source, s.searchedBackward, &s.searchedForward, s.refinedBackward);
+                    }
                 }
                 return sets;
             };
@@ -334,6 +394,21 @@ namespace VkHook
         }
         s.stamp(commands, stamps, kInputCopy);
         const VkPipelineLayout layout = s.context.pipelineLayout();
+        if (temporal && s.search.pipeline)
+        {
+            const auto refine = [&](const vk::Pipeline& pipeline, VkDescriptorSet set) {
+                s.dispatch.vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.pipeline);
+                s.dispatch.vkCmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0, nullptr);
+                s.dispatch.vkCmdDispatch(commands, (s.parameters.flowWidth + 7) / 8, (s.parameters.flowHeight + 7) / 8, 1);
+            };
+            refine(s.search, sets.searchForward);
+            refine(s.search, sets.searchBackward);
+            s.memoryBarrier(commands);
+            refine(s.propagate, sets.propagateForward);
+            refine(s.propagateWithOpposite, sets.propagateBackward);
+            s.memoryBarrier(commands);
+        }
+        s.stamp(commands, stamps, kFlowRefine);
         if (temporal)
         {
             s.dispatch.vkCmdFillBuffer(commands, s.reprojection.buffer, 0, 16, 0);

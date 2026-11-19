@@ -3,9 +3,9 @@
 // No layer, no window.
 //
 //   vkhook-dlss5-frame-bench --model DIR --shaders DIR [--ptx DIR] [--width W --height H --frames N]
-//                            [--images N] [--temporal 0|1] [--flow-scale 0|1|2|4] [--depth N] [--motion DX,DY]
-//                            [--objects DX,DY] [--pattern smooth|detail] [--image in.rgba] [--debug-view N]
-//                            [--output out.rgba]
+//                            [--images N] [--temporal 0|1] [--flow-scale 0|1|2|4] [--flow-refine 0|1] [--depth N]
+//                            [--motion DX,DY] [--objects DX,DY] [--pattern smooth|detail] [--image in.rgba]
+//                            [--debug-view N] [--output out.rgba]
 //
 // The source ring shows the same picture translated by --motion pixels per image (default 8,4), so optical flow
 // and history reprojection do real work. The built-in patterns are evaluated at the translated coordinates, so a
@@ -17,6 +17,7 @@
 // the cross-queue semaphore round trips, during which the graphics queue runs nothing else.
 // --depth N keeps N frames in flight (the fence wait trails the submit by N - 1 frames), which is how a game
 // that does not wait for its presents drives the layer.
+// --flow-refine 0 reprojects with the optical-flow engine's own vectors instead of the refined ones.
 // --output writes the last frame's output image as raw RGBA8, to compare builds on pixels; with --debug-view
 // (1 motion, 2 confidence, 3 reprojected history, 4 blend weight) it is the effect's diagnostic picture.
 #define VK_NO_PROTOTYPES
@@ -179,7 +180,7 @@ int main(int argc, char** argv)
         const std::string ptx = argument(argc, argv, "--ptx", shaders);
         require(!model.empty() && !shaders.empty(),
             "usage: vkhook-dlss5-frame-bench --model DIR --shaders DIR [--ptx DIR] [--width W --height H --frames N] "
-            "[--images N] [--temporal 0|1] [--flow-scale 0|1|2|4] [--depth N] [--motion DX,DY] [--objects DX,DY] "
+            "[--images N] [--temporal 0|1] [--flow-scale 0|1|2|4] [--flow-refine 0|1] [--depth N] [--motion DX,DY] [--objects DX,DY] "
             "[--pattern smooth|detail] [--image FILE] [--debug-view N] [--output FILE]");
         const uint32_t width = std::stoul(argument(argc, argv, "--width", "1920"));
         const uint32_t height = std::stoul(argument(argc, argv, "--height", "1080"));
@@ -340,8 +341,11 @@ int main(int argc, char** argv)
             const auto scene = [&](float x, float y) -> Color {
                 if (!objects.empty()) {
                     const float u = x - ox, v = y - oy;
-                    if (u - 384 * std::floor(u / 384) < 128 && v - 384 * std::floor(v / 384) < 128)
-                        return picked(u + 1000, v + 700); // another part of the picture, moving with the square
+                    if (u - 384 * std::floor(u / 384) < 128 && v - 384 * std::floor(v / 384) < 128) {
+                        // Another part of the picture, moving with the square. Wrapped: the repeated
+                        // border beyond the picture would leave the square's vertical motion open.
+                        return picked(std::fmod(u + 1000, static_cast<float>(width)), std::fmod(v + 700, static_cast<float>(height)));
+                    }
                 }
                 return picked(x - dx, y - dy);
             };
@@ -378,6 +382,7 @@ int main(int argc, char** argv)
         info.opticalQueue = opticalQueue;
         info.opticalFamily = optical;
         info.flowDownscale = flowScale;
+        info.refineFlow = argument(argc, argv, "--flow-refine", "1") != "0";
         info.extent = {width, height};
         info.format = format;
         info.input = sources;
@@ -432,8 +437,8 @@ int main(int argc, char** argv)
             VK_CHECK(vkEndCommandBuffer(primaries[index]));
         };
 
-        static const char* const stageNames[Dlss5Pipeline::kStageCount] = {"", "flow results", "input copy", "reprojection",
-            "input features", "network", "composite", "output copy"};
+        static const char* const stageNames[Dlss5Pipeline::kStageCount] = {"", "flow results", "input copy", "flow refinement",
+            "reprojection", "input features", "network", "composite", "output copy"};
         using Clock = std::chrono::steady_clock;
         struct Pending { uint32_t index; Clock::time_point start; };
         std::vector<Pending> inFlight;

@@ -37,6 +37,9 @@ namespace VkHook
             // Reduction of the optical-flow input per axis: 1, 2 or 4, or 0 to let
             // Dlss5OpticalFlow::automaticDownscale choose from the extent.
             uint32_t flowDownscale = 0;
+            // Match the vectors of a reduced optical-flow input again on full-resolution pixels.
+            // Off only to compare against the engine's own vectors.
+            bool refineFlow = true;
             VkExtent2D extent{};
             VkFormat   format = VK_FORMAT_UNDEFINED; // RGBA8/BGRA8, UNORM or SRGB
             // One entry per swapchain image. `motionSources` are what the game rendered;
@@ -67,7 +70,19 @@ namespace VkHook
         VkResult prepare(uint32_t imageIndex, uint64_t frameSerial, VkSubmitInfo& submission) noexcept;
 
         // GPU timestamps after each stage, for benchmarks: query `first + stage`.
-        enum Stage : uint32_t { kBegin, kFlowResults, kInputCopy, kReproject, kFeatures, kNetwork, kComposite, kEnd, kStageCount };
+        enum Stage : uint32_t
+        {
+            kBegin,
+            kFlowResults,
+            kInputCopy,
+            kFlowRefine,
+            kReproject,
+            kFeatures,
+            kNetwork,
+            kComposite,
+            kEnd,
+            kStageCount
+        };
         struct Stamps
         {
             VkQueryPool pool  = VK_NULL_HANDLE;

@@ -1,0 +1,175 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "dlss5_common.glsl"
+
+// Fed a reduced image, the hardware engine resolves motion in pixels of that
+// image: against known translations its vectors are 1.1 source pixels RMS off at
+// half resolution when the motion is an odd number of pixels, where the
+// full-resolution engine is exact, and history reprojected with them is misplaced.
+// Each vector is matched again on the full-resolution pixels of its cell. One
+// dispatch refines one direction, the bound images swapped for the backward one,
+// in two passes:
+//   search     the whole-pixel displacements around the engine's vector;
+//   propagate  the searched vectors of the four neighbouring cells, which replaces
+//              the engine's occasional blunder that no small search reaches, and
+//              for the backward vector the opposite of the forward one.
+// A vector is replaced only by a clearly better one. The engine's own answer,
+// sub-pixel part included, otherwise stands: on noise, a flat cell or motion
+// between two whole pixels the candidates cost about the same, and independent
+// picks for the two directions would fail the reprojection's consistency test.
+layout(local_size_x = 8, local_size_y = 8) in;
+const uint kSearch = 0u, kPropagate = 1u, kPropagateWithOpposite = 2u;
+layout(constant_id = 0) const uint kPass = kSearch;
+// Search candidates on each side of the engine's vector, in source pixels: the
+// engine's rounding leaves one open at half resolution and two at a quarter.
+const int kRadius = 2;
+const int kSide = 2 * kRadius + 1;
+// A cell is compared on a 4x4 grid of its pixels, whatever its size.
+const int kTaps = 16;
+// What a candidate must gain per sampled pixel for each pixel it lies from the
+// engine's vector, in code values summed over the channels. Where the picture
+// leaves a direction open (an edge, stripes, a flat cell) every displacement
+// along it costs the same, and the answer must stay the engine's.
+const int kDistanceCost = 2;
+// The image whose cells are matched (the current one for the forward vectors)
+// and the image they are looked for in.
+layout(std430, binding = 0) readonly buffer Reference { uint pixels[]; } reference;
+layout(std430, binding = 2) readonly buffer Displaced { uint pixels[]; } displaced;
+layout(std430, binding = 4) readonly buffer GivenFlow { uint vectors[]; } given;
+// The other direction's vectors, as cells of the displaced image.
+layout(std430, binding = 5) readonly buffer OppositeFlow { uint vectors[]; } opposite;
+layout(std430, binding = 6) writeonly buffer RefinedFlow { uint vectors[]; } refined;
+
+ivec3 unpackRgb(uint value) {
+    return ivec3(value & 255u, (value >> 8u) & 255u, (value >> 16u) & 255u);
+}
+
+uint pixelIndex(ivec2 at) {
+    at = clamp(at, ivec2(0), ivec2(p.width, p.height) - 1);
+    return uint(at.y) * p.width + uint(at.x);
+}
+
+int difference(ivec3 a, ivec3 b) {
+    ivec3 d = abs(a - b);
+    return d.r + d.g + d.b;
+}
+
+uint cellIndex(ivec2 cell) {
+    cell = clamp(cell, ivec2(0), ivec2(p.flowWidth, p.flowHeight) - 1);
+    return uint(cell.y) * p.flowWidth + uint(cell.x);
+}
+
+// Vectors are handled in 1/32 source pixels: the engine's S10.5 pixels of its
+// reduced input, scaled up.
+ivec2 unpackVector(uint packed) {
+    return ivec2(int(packed << 16u) >> 16, int(packed) >> 16) * int(p.flowScale);
+}
+
+ivec2 wholePixels(ivec2 vector) {
+    return (vector + 16) >> 5;
+}
+
+bool clearlyBetter(int cost, int own) {
+    return cost * 4 < own * 3;
+}
+
+// The sampled pixel `tap` (0..3 per axis) of the cell at `origin`.
+ivec2 tapAt(ivec2 origin, ivec2 tap) {
+    int stride = int(p.flowScale);
+    return origin + tap * stride + stride / 2;
+}
+
+// The cost of a displacement is the sum of absolute differences between the
+// cell's sampled pixels and the displaced pixels of the other image. Vectors are
+// compared at their nearest whole pixel.
+int cellCost(ivec2 origin, ivec2 displacement) {
+    int cost = 0;
+    for (int y = 0; y < 4; ++y)
+        for (int x = 0; x < 4; ++x) {
+            ivec2 at = tapAt(origin, ivec2(x, y));
+            cost += difference(unpackRgb(reference.pixels[pixelIndex(at)]), unpackRgb(displaced.pixels[pixelIndex(at + displacement)]));
+        }
+    return cost;
+}
+
+ivec2 search(ivec2 origin, ivec2 own) {
+    ivec2 corner = wholePixels(own) - kRadius;
+    int costs[kSide * kSide];
+    for (int i = 0; i < kSide * kSide; ++i) costs[i] = 0;
+    for (int y = 0; y < 4; ++y)
+        for (int x = 0; x < 4; ++x) {
+            ivec2 at = tapAt(origin, ivec2(x, y));
+            ivec3 pixel = unpackRgb(reference.pixels[pixelIndex(at)]);
+            for (int dy = 0; dy < kSide; ++dy)
+                for (int dx = 0; dx < kSide; ++dx)
+                    costs[dy * kSide + dx] += difference(pixel, unpackRgb(displaced.pixels[pixelIndex(at + corner + ivec2(dx, dy))]));
+        }
+    int centre = kRadius * kSide + kRadius;
+    int best = centre;
+    int bestCost = costs[centre];
+    for (int dy = 0; dy < kSide; ++dy)
+        for (int dx = 0; dx < kSide; ++dx) {
+            int cost = costs[dy * kSide + dx] + kDistanceCost * kTaps * (abs(dx - kRadius) + abs(dy - kRadius));
+            if (cost < bestCost) {
+                bestCost = cost;
+                best = dy * kSide + dx;
+            }
+        }
+    if (clearlyBetter(bestCost, costs[centre])) return (corner + ivec2(best % kSide, best / kSide)) * 32;
+    // An exact match that a pixel to any side loses is the motion, whatever
+    // sub-pixel part the engine reported. A flat cell matches everywhere and
+    // keeps the engine's vector.
+    int beside = min(min(costs[centre - 1], costs[centre + 1]), min(costs[centre - kSide], costs[centre + kSide]));
+    if (costs[centre] <= kTaps && beside > costs[centre] + kDistanceCost * kTaps) return wholePixels(own) * 32;
+    return own;
+}
+
+ivec2 propagate(ivec2 cell, ivec2 origin, ivec2 own, int ownCost) {
+    const ivec2 kNeighbours[4] = ivec2[4](ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1));
+    ivec2 tried[4];
+    ivec2 result = own;
+    int resultCost = ownCost;
+    for (int i = 0; i < 4; ++i) {
+        ivec2 candidate = unpackVector(given.vectors[cellIndex(cell + kNeighbours[i])]);
+        tried[i] = wholePixels(candidate);
+        bool repeated = tried[i] == wholePixels(own);
+        for (int j = 0; j < i; ++j) repeated = repeated || tried[i] == tried[j];
+        if (repeated) continue;
+        int cost = cellCost(origin, tried[i]);
+        if (cost < resultCost && clearlyBetter(cost, ownCost)) {
+            resultCost = cost;
+            result = candidate;
+        }
+    }
+    if (kPass == kPropagateWithOpposite) {
+        // Where this cell's pixels went, the other direction's vector should be
+        // the opposite one. Its opposite is taken unless this vector matches
+        // clearly better: two vectors that round a motion between whole pixels
+        // differently then agree, and a real disagreement, an occlusion, still shows.
+        ivec2 landed = max(origin + 2 * int(p.flowScale) + wholePixels(result), ivec2(0)) / (4 * int(p.flowScale));
+        ivec2 reversed = -unpackVector(opposite.vectors[cellIndex(landed)]);
+        if (wholePixels(reversed) != wholePixels(result) && !clearlyBetter(resultCost, cellCost(origin, wholePixels(reversed))))
+            result = reversed;
+    }
+    return result;
+}
+
+void main() {
+    ivec2 cell = ivec2(gl_GlobalInvocationID.xy);
+    if (cell.x >= int(p.flowWidth) || cell.y >= int(p.flowHeight)) return;
+    // First/reset frames have no previous pixels, and the reprojection reads no flow.
+    if (!dlss5TemporalEnabled()) return;
+    ivec2 origin = cell * 4 * int(p.flowScale);
+    uint index = cellIndex(cell);
+    ivec2 own = unpackVector(given.vectors[index]);
+    int ownCost = cellCost(origin, wholePixels(own));
+    ivec2 result = own;
+    // Nothing matches better than exactly, and up to one code value per sampled
+    // pixel is rounding: a still or already exact cell, most of a frame when the
+    // camera rests, costs this one comparison. Only the search can tell an exact
+    // whole-pixel match from the sub-pixel vector of a flat cell.
+    bool settled = ownCost <= kTaps && (kPass != kSearch || own == wholePixels(own) * 32);
+    if (!settled) result = kPass == kSearch ? search(origin, own) : propagate(cell, origin, own, ownCost);
+    result /= int(p.flowScale);
+    refined.vectors[index] = (uint(result.x) & 0xffffu) | (uint(result.y) << 16u);
+}
