@@ -140,6 +140,10 @@ namespace
         current->events += 'P';
     }
 
+    VKAPI_ATTR void VKAPI_CALL setViewport(VkCommandBuffer, uint32_t, uint32_t, const VkViewport*) {}
+
+    VKAPI_ATTR void VKAPI_CALL setScissor(VkCommandBuffer, uint32_t, uint32_t, const VkRect2D*) {}
+
     VKAPI_ATTR void VKAPI_CALL pushConstants(VkCommandBuffer, VkPipelineLayout,
         VkShaderStageFlags, uint32_t, uint32_t, const void*)
     {
@@ -172,6 +176,8 @@ namespace
         dispatch.CmdBeginRenderPass = beginRenderPass;
         dispatch.CmdBindDescriptorSets = bindDescriptorSets;
         dispatch.CmdBindPipeline = bindPipeline;
+        dispatch.CmdSetViewport = setViewport;
+        dispatch.CmdSetScissor = setScissor;
         dispatch.CmdPushConstants = pushConstants;
         dispatch.CmdDraw = draw;
         dispatch.CmdEndRenderPass = endRenderPass;

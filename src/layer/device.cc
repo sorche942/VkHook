@@ -312,15 +312,6 @@ namespace
         for (const std::string& message : plan->warnings)
             Logger::warn(message);
 
-        const VkPhysicalDeviceProperties& deviceProps = caps.properties;
-        const bool enableNvCheckpoints         = plan->enableNvCheckpoints;
-        const bool enableNvDiagnosticsConfig   = plan->enableNvDiagnosticsConfig;
-        const bool enableDeviceFault           = plan->enableDeviceFault;
-        const bool enableDeviceFaultFeature    = plan->enableDeviceFaultFeature;
-        const bool dlss5Supported              = plan->dlss5Supported;
-        const std::string& dlss5UnavailableReason = plan->dlss5UnavailableReason;
-        const uint32_t opticalFlowFamily       = plan->opticalFlowFamily;
-
         VkResult ret = createFunc(physicalDevice, &plan->createInfo(), pAllocator, pDevice);
 
         if (ret != VK_SUCCESS)

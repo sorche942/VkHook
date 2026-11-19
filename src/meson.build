@@ -115,8 +115,12 @@ VkHook_src = [
     'effects/effect_reshade.cc',
     'effects/reshade_texture_pool.cc',
     'effects/effect_transfer.cc',
+    'effects/effect_renderpass.cc',
+    'effects/texture_upload.cc',
     'effects/reshade_parser.cc',
     'effects/reshade_compile.cc',
+    'effects/shader_cache.cc',
+    'effects/reshade_module_io.cc',
     'effects/texture_convert.cc',
     'render/fake_swapchain.cc',
     'render/format.cc',
@@ -453,6 +457,7 @@ reshade_compile_tests = executable('vkhook-reshade-compile-tests',
     'effects/reshade_compile_test.cc',
     'effects/reshade_parser.cc',
     'effects/reshade_compile.cc',
+    'effects/reshade_module_io.cc',
     'vendor/reshade/effect_codegen_spirv.cc',
     'vendor/reshade/effect_expression.cc',
     'vendor/reshade/effect_lexer.cc',
@@ -482,9 +487,31 @@ test('texture convert', texture_convert_tests)
 
 compile_cache_tests = executable('vkhook-compile-cache-tests',
     'effects/compile_cache_test.cc',
+    'effects/shader_cache.cc',
+    'effects/reshade_module_io.cc',
+    'core/config/persist.cc',
+    'core/logger.cc',
     dependencies : [threads_dep],
-    include_directories : [effects_inc, source_inc])
+    include_directories : [core_inc, effects_inc, effects_params_inc, vendor_inc, include_directories('vendor/reshade'), source_inc])
 test('compile cache', compile_cache_tests)
+
+# Uniform ring layout, descriptor budgets, the forwarding decision, the shared
+# render pass description and the batched texture upload, all headless.
+effect_plan_tests = executable('vkhook-effect-plan-tests',
+    'effects/effect_plan_test.cc',
+    'effects/texture_upload.cc',
+    'gpu/queue.cc',
+    'effects/effect_renderpass.cc',
+    'render/buffer.cc',
+    'render/memory.cc',
+    'render/image.cc',
+    'render/format.cc',
+    'gpu/retire.cc',
+    'gpu/retire_device.cc',
+    'gpu/timeline.cc',
+    'core/logger.cc',
+    include_directories : [core_inc, render_inc, effects_inc, effects_params_inc, vendor_inc, include_directories('vendor/reshade'), source_inc])
+test('effect plan', effect_plan_tests)
 
 reshade_texture_pool_tests = executable('vkhook-reshade-texture-pool-tests',
     'effects/reshade_texture_pool_test.cc',

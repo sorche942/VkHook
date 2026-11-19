@@ -1,4 +1,5 @@
 #include "reshade_compile.hh"
+#include "reshade_module_io.hh"
 #include "reshade_parser.hh"
 
 #include <cstdio>
@@ -117,6 +118,32 @@ int main(int argc, char** argv)
         for (const auto& spec : module.spec_constants)
             userSpecConstant |= spec.name.rfind("__vkhook_", 0) != 0;
         expect(!userSpecConstant, "no uniform became a specialization constant");
+    }
+
+    // What the on-disk shader cache stores is what the compiler produced.
+    {
+        ReshadePreprocessSetup setup;
+        std::string source, error;
+        reshadefx::module module;
+        const bool ok = preprocessReshadeFile(gated, setup, source, error) &&
+                        compileReshadeSource(std::move(source), ReshadeCodegenOptions{}, module, error);
+        expect(ok, "fixture compiles for the cache round trip");
+        const auto bytes = serializeReshadeModule(module);
+        reshadefx::module decoded;
+        expect(deserializeReshadeModule(bytes.data(), bytes.size(), decoded), "a compiled module survives the cache encoding");
+        expect(decoded.spirv == module.spirv, "SPIR-V is identical after the round trip");
+        expect(decoded.uniforms.size() == module.uniforms.size() && decoded.total_uniform_size == module.total_uniform_size,
+               "uniform layout is identical after the round trip");
+        bool sameUniforms = decoded.uniforms.size() == module.uniforms.size();
+        for (size_t i = 0; sameUniforms && i < module.uniforms.size(); ++i)
+            sameUniforms = decoded.uniforms[i].name == module.uniforms[i].name &&
+                           decoded.uniforms[i].offset == module.uniforms[i].offset &&
+                           decoded.uniforms[i].size == module.uniforms[i].size &&
+                           decoded.uniforms[i].annotations.size() == module.uniforms[i].annotations.size();
+        expect(sameUniforms, "every uniform keeps its name, offset, size and annotations");
+        expect(decoded.techniques.size() == module.techniques.size() &&
+                   (module.techniques.empty() || decoded.techniques[0].passes.size() == module.techniques[0].passes.size()),
+               "techniques and passes are identical after the round trip");
     }
 
     if (failures == 0)

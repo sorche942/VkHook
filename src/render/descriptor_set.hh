@@ -13,6 +13,13 @@
 
 namespace VkHook
 {
+    // A pool of exactly `maxSets` sets drawing on `poolSizes`.
+    VkDescriptorPool createDescriptorPool(LogicalDevice*                          logicalDevice,
+                                          const std::vector<VkDescriptorPoolSize>& poolSizes,
+                                          uint32_t                                maxSets);
+
+    // For a pool whose every set holds exactly one descriptor (one set per
+    // descriptor), so maxSets is the total descriptor count.
     VkDescriptorPool createDescriptorPool(LogicalDevice* logicalDevice, const std::vector<VkDescriptorPoolSize>& poolSizes);
 
     VkDescriptorSetLayout createUniformBufferDescriptorSetLayout(LogicalDevice* logicalDevice);
@@ -20,7 +27,9 @@ namespace VkHook
     VkDescriptorSet writeBufferDescriptorSet(LogicalDevice*        logicalDevice,
                                              VkDescriptorPool      descriptorPool,
                                              VkDescriptorSetLayout descriptorSetLayout,
-                                             VkBuffer              buffer);
+                                             VkBuffer              buffer,
+                                             VkDeviceSize          offset = 0,
+                                             VkDeviceSize          range = VK_WHOLE_SIZE);
 
     VkDescriptorSetLayout createImageSamplerDescriptorSetLayout(LogicalDevice*                         logicalDevice,
                                                                 const std::vector<VkDescriptorType>& bindingTypes);

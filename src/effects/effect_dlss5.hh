@@ -9,6 +9,13 @@ namespace VkHook
     class Config;
     class EffectRegistry;
 
+    // Releases the loaded DLSS5 network and weights cached for `device`. The
+    // cache holds GPU buffers created on the device, so this must run while the
+    // device is still alive and idle: at vkDestroyDevice, after vkDeviceWaitIdle
+    // and before the real destroy. Effects built from the cache must already be
+    // gone. Safe to call for a device that never used DLSS5.
+    void clearDlss5ModelCache(VkDevice device);
+
     class Dlss5Effect final : public Effect
     {
     public:

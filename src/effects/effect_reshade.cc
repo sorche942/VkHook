@@ -25,7 +25,11 @@
 #include "settings_manager.hh"
 #include "reshade_compile.hh"
 #include "texture_convert.hh"
-#include "compile_cache.hh"
+#include "descriptor_budget.hh"
+#include "effect_renderpass.hh"
+#include "output_forward.hh"
+#include "shader_cache.hh"
+#include "texture_upload.hh"
 
 #include "util.hh"
 
@@ -92,38 +96,21 @@ namespace VkHook
 
     }
 
-    // One cache per device, shared by every effect so a chain reload reuses the
-    // pipelines the previous chain already made the driver compile. Created on
-    // first use; effect construction runs with NO layer lock held, so two builds
-    // on one device can race here: the cache is published under stateLock and a
-    // loser destroys its (never used) cache.
-    static VkPipelineCache devicePipelineCache(LogicalDevice* logicalDevice)
+    // Texture uploads run as one submission per effect, through the queue's
+    // QueueState mutex, with the fence wait taken outside any lock.
+    static bool submitUploadAndWait(LogicalDevice* logicalDevice, VkCommandBuffer commandBuffer)
     {
-        if (!logicalDevice)
-            return VK_NULL_HANDLE;
+        VkSubmitInfo submitInfo       = {};
+        submitInfo.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submitInfo.commandBufferCount = 1;
+        submitInfo.pCommandBuffers    = &commandBuffer;
+        const VkResult result = logicalDevice->queues.submitAndWait(logicalDevice->queue, submitInfo, 4000);
+        if (result != VK_SUCCESS)
         {
-            std::lock_guard<std::mutex> l(logicalDevice->stateLock);
-            if (logicalDevice->pipelineCache != VK_NULL_HANDLE)
-                return logicalDevice->pipelineCache;
+            Logger::err("texture upload: submit/wait failed: " + std::to_string(result));
+            return false;
         }
-
-        VkPipelineCacheCreateInfo createInfo = {};
-        createInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
-        VkPipelineCache created = VK_NULL_HANDLE;
-        if (logicalDevice->vkd.CreatePipelineCache(logicalDevice->device, &createInfo, nullptr, &created) != VK_SUCCESS)
-            return VK_NULL_HANDLE;
-
-        VkPipelineCache winner = created;
-        {
-            std::lock_guard<std::mutex> l(logicalDevice->stateLock);
-            if (logicalDevice->pipelineCache == VK_NULL_HANDLE)
-                logicalDevice->pipelineCache = created;
-            else
-                winner = logicalDevice->pipelineCache;
-        }
-        if (winner != created)
-            logicalDevice->vkd.DestroyPipelineCache(logicalDevice->device, created, nullptr);
-        return winner;
+        return true;
     }
 
     void ReshadeEffect::requireDescriptorSets(const std::vector<VkDescriptorSet>& sets, const char* what) const
@@ -177,7 +164,6 @@ namespace VkHook
         this->imageExtent           = imageExtent;
         this->inputImages           = inputImages;
         this->outputImages          = outputImages;
-        outputImageInitialized.assign(outputImages.size(), false);
         this->effectRegistry       = effectRegistry;
         this->effectName            = effectName;
         this->effectPath            = effectPath;
@@ -195,6 +181,7 @@ namespace VkHook
         Logger::debug("created ImageViews");
 
         createReshadeModule();
+        const reshadefx::module& module = *compiledModule;
 
         std::vector<std::string> zeroedSources;
         uniforms = createReshadeUniforms(module, &zeroedSources);
@@ -214,25 +201,26 @@ namespace VkHook
         bufferSize = module.total_uniform_size;
         if (bufferSize)
         {
+            uniformRing = UniformRing(static_cast<uint32_t>(inputImages.size()), bufferSize);
             createBuffer(logicalDevice,
-                         bufferSize,
+                         uniformRing.totalBytes(),
                          VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                         stagingBuffer,
-                         stagingBufferMemory);
-            if (stagingBuffer == VK_NULL_HANDLE || stagingBufferMemory == VK_NULL_HANDLE)
+                         uniformBuffer,
+                         uniformBufferMemory);
+            if (uniformBuffer == VK_NULL_HANDLE || uniformBufferMemory == VK_NULL_HANDLE)
                 throw EffectBuildError("uniform buffer creation failed for effect '" + effectName + "'");
-            // Persistent map — HOST_COHERENT means no flush needed, just write directly
-            VkResult mapResult = logicalDevice->vkd.MapMemory(logicalDevice->device, stagingBufferMemory, 0, bufferSize, 0, &stagingBufferMapped);
+            // Persistent map: HOST_COHERENT means no flush is needed, writes are just made.
+            VkResult mapResult = logicalDevice->vkd.MapMemory(logicalDevice->device, uniformBufferMemory, 0, uniformRing.totalBytes(), 0, &uniformBufferMapped);
             if (mapResult != VK_SUCCESS)
             {
-                stagingBufferMapped = nullptr;
+                uniformBufferMapped = nullptr;
                 throw EffectBuildError("MapMemory failed for effect '" + effectName + "': " + std::to_string(mapResult));
             }
             // Fresh device memory holds whatever was there before; no uniform may
             // read it, including ones nothing below writes.
-            std::memset(stagingBufferMapped, 0, bufferSize);
-            buildBindings();
+            std::memset(uniformBufferMapped, 0, uniformRing.totalBytes());
+            buildBindings(module);
         }
 
         stencilFormat = getStencilFormat(logicalDevice);
@@ -256,6 +244,10 @@ namespace VkHook
 
         // Cache shader manager config once for all texture lookups (avoids re-reading per texture)
         ShaderManagerConfig cachedShaderMgrConfig = ConfigSerializer::loadShaderManagerConfig();
+
+        // Every file texture's initial contents (or its clear, when the file is
+        // unusable) go to the GPU in one submission after the loop.
+        TextureUploadBatch textureUploads;
 
         // Private textures belong to this instance of the effect file. Another
         // file that declares the same name still shares it (ReShade semantics).
@@ -367,7 +359,7 @@ namespace VkHook
                 // else is rejected rather than uploaded from an under-sized buffer.
                 // A texture that cannot be loaded is cleared, never left undefined.
                 const std::string textureName = source->value.string_data;
-                auto leaveBlank = [&]() { changeImageLayout(logicalDevice, images, module.textures[i].levels); };
+                auto leaveBlank = [&]() { textureUploads.addClear(images[0], module.textures[i].levels); };
                 const auto fileLayout = textureFileLayout(textureFormatsUNORM[module.textures[i].unique_name]);
                 if (!fileLayout)
                 {
@@ -476,10 +468,12 @@ namespace VkHook
                     continue;
                 }
 
-                uploadToImage(logicalDevice, images[0], textureExtent, static_cast<uint32_t>(upload.size()), upload.data(),
-                              module.textures[i].levels);
+                textureUploads.addUpload(images[0], textureExtent, module.textures[i].levels, std::move(upload));
             }
         }
+
+        if (!textureUploads.submit(logicalDevice, [this](VkCommandBuffer commands) { return submitUploadAndWait(this->logicalDevice, commands); }))
+            throw EffectBuildError("texture upload failed for effect '" + effectName + "'");
 
         std::set<std::string> depthTextureNames;
         for (const auto& texture : module.textures)
@@ -533,25 +527,24 @@ namespace VkHook
             throw EffectBuildError("descriptor set layout creation failed for effect '" + effectName + "'");
         Logger::debug("created descriptorSetLayouts");
 
-        VkDescriptorPoolSize sampledImagePoolSize;
-        sampledImagePoolSize.type            = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        sampledImagePoolSize.descriptorCount = inputImages.size() * sampledBindingCount * 3;
+        // Output writes decide how many image/sampler set groups exist, so count
+        // them before sizing the pool.
+        for (const auto& pass : module.techniques[0].passes)
+        {
+            if (pass.cs_entry_point.empty() && pass.render_target_names[0].empty())
+            {
+                outputWrites++;
+            }
+        }
+        outputForwardRequired = reshadeOutputNeedsForward(module, outputWrites);
+        Logger::debug("output writes: " + std::to_string(outputWrites));
 
-        VkDescriptorPoolSize storageImagePoolSize;
-        storageImagePoolSize.type            = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        storageImagePoolSize.descriptorCount = inputImages.size() * storageBindingCount * 3;
-
-        VkDescriptorPoolSize bufferPoolSize;
-        bufferPoolSize.type            = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-        bufferPoolSize.descriptorCount = 3;
-
-        std::vector<VkDescriptorPoolSize> poolSizes = {bufferPoolSize};
-        if (sampledImagePoolSize.descriptorCount > 0)
-            poolSizes.push_back(sampledImagePoolSize);
-        if (storageImagePoolSize.descriptorCount > 0)
-            poolSizes.push_back(storageImagePoolSize);
-
-        descriptorPool = createDescriptorPool(logicalDevice, poolSizes);
+        const DescriptorBudget budget = computeDescriptorBudget(static_cast<uint32_t>(inputImages.size()),
+                                                                static_cast<uint32_t>(sampledBindingCount),
+                                                                static_cast<uint32_t>(storageBindingCount),
+                                                                samplerSetGroups(outputWrites),
+                                                                bufferSize != 0);
+        descriptorPool = createDescriptorPool(logicalDevice, budget.poolSizes(), budget.maxSets);
         if (descriptorPool == VK_NULL_HANDLE)
             throw EffectBuildError("descriptor pool creation failed for effect '" + effectName + "'");
         Logger::debug("created descriptorPool");
@@ -564,21 +557,15 @@ namespace VkHook
 
         Logger::debug("created Pipeline layout");
 
-        // count the back buffer writes
-        for (const auto& pass : module.techniques[0].passes)
-        {
-            if (pass.cs_entry_point.empty() && pass.render_target_names[0].empty())
-            {
-                outputWrites++;
-            }
-        }
-
-        Logger::debug("output writes: " + std::to_string(outputWrites));
         if (bufferSize)
         {
-            bufferDescriptorSet = writeBufferDescriptorSet(logicalDevice, descriptorPool, uniformDescriptorSetLayout, stagingBuffer);
-            if (bufferDescriptorSet == VK_NULL_HANDLE)
-                throw EffectBuildError("uniform descriptor set allocation failed for effect '" + effectName + "'");
+            for (uint32_t slot = 0; slot < uniformRing.slotCount(); ++slot)
+            {
+                bufferDescriptorSets.push_back(writeBufferDescriptorSet(
+                    logicalDevice, descriptorPool, uniformDescriptorSetLayout, uniformBuffer, uniformRing.offset(slot), bufferSize));
+                if (bufferDescriptorSets.back() == VK_NULL_HANDLE)
+                    throw EffectBuildError("uniform descriptor set allocation failed for effect '" + effectName + "'");
+            }
         }
 
         inputDescriptorSets =
@@ -680,8 +667,7 @@ namespace VkHook
                 continue;
             }
 
-            std::vector<VkAttachmentReference>               attachmentReferences;
-            std::vector<VkAttachmentDescription>             attachmentDescriptions;
+            EffectRenderPassDesc                             renderPassDesc;
             std::vector<VkPipelineColorBlendAttachmentState> attachmentBlendStates;
             std::vector<std::vector<VkImageView>>            attachmentImageViews;
             std::vector<std::string>                         currentRenderTargets;
@@ -691,39 +677,18 @@ namespace VkHook
                 std::string target = pass.render_target_names[i];
                 Logger::debug("render target:" + target);
 
-                VkAttachmentDescription attachmentDescription;
-                attachmentDescription.flags   = 0;
-                attachmentDescription.format  = pass.srgb_write_enable ? textureFormatsSRGB[target] : textureFormatsUNORM[target];
-                attachmentDescription.samples = VK_SAMPLE_COUNT_1_BIT;
-                attachmentDescription.loadOp  = pass.clear_render_targets ? VK_ATTACHMENT_LOAD_OP_CLEAR
-                                                                          : VK_ATTACHMENT_LOAD_OP_LOAD;
-
-                attachmentDescription.storeOp        = VK_ATTACHMENT_STORE_OP_STORE;
-                attachmentDescription.stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-                attachmentDescription.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-                attachmentDescription.initialLayout  = VK_IMAGE_LAYOUT_GENERAL;
-                attachmentDescription.finalLayout    = VK_IMAGE_LAYOUT_GENERAL;
-
-                if (target.empty() && i == 0)
-                {
-                    attachmentDescription.format        = pass.srgb_write_enable ? inputOutputFormatSRGB : inputOutputFormatUNORM;
-                    attachmentDescription.loadOp        = VK_ATTACHMENT_LOAD_OP_LOAD;
-                    attachmentDescription.storeOp       = VK_ATTACHMENT_STORE_OP_STORE;
-                    attachmentDescription.initialLayout = VK_IMAGE_LAYOUT_GENERAL;
-                    attachmentDescription.finalLayout   = VK_IMAGE_LAYOUT_GENERAL;
-                }
-                else if (target.empty())
+                if (target.empty() && i > 0)
                 {
                     break;
                 }
 
-                attachmentDescriptions.push_back(attachmentDescription);
-
-                VkAttachmentReference attachmentReference;
-                attachmentReference.attachment = i;
-                attachmentReference.layout     = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-
-                attachmentReferences.push_back(attachmentReference);
+                // Target 0 empty means the pass writes the effect's back buffer,
+                // which is always loaded (the seed copy is already in it).
+                const VkFormat format = target.empty() ? (pass.srgb_write_enable ? inputOutputFormatSRGB : inputOutputFormatUNORM)
+                                                       : (pass.srgb_write_enable ? textureFormatsSRGB[target] : textureFormatsUNORM[target]);
+                const VkAttachmentLoadOp loadOp = (!target.empty() && pass.clear_render_targets) ? VK_ATTACHMENT_LOAD_OP_CLEAR
+                                                                                                  : VK_ATTACHMENT_LOAD_OP_LOAD;
+                renderPassDesc.attachments.push_back(effectColorAttachment(format, loadOp));
 
                 VkPipelineColorBlendAttachmentState colorBlendAttachment;
                 colorBlendAttachment.blendEnable         = pass.blend_enable;
@@ -759,89 +724,15 @@ namespace VkHook
             viewport.minDepth = 0.0f;
             viewport.maxDepth = 1.0f;
 
-            uint32_t depthAttachmentCount = 0;
-
             if (scissor.extent.width == imageExtent.width && scissor.extent.height == imageExtent.height)
             {
-                depthAttachmentCount = 1;
-
+                renderPassDesc.hasDepthStencil = true;
+                renderPassDesc.attachments.push_back(effectStencilAttachment(stencilFormat, firstTimeStencilAccess));
                 attachmentImageViews.push_back(std::vector<VkImageView>(inputImages.size(), stencilImageView));
 
-                VkAttachmentReference attachmentReference;
-                attachmentReference.attachment = attachmentReferences.size();
-                attachmentReference.layout     = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-
-                attachmentReferences.push_back(attachmentReference);
-
-                VkAttachmentDescription attachmentDescription;
-                attachmentDescription.flags          = 0;
-                attachmentDescription.format         = stencilFormat;
-                attachmentDescription.samples        = VK_SAMPLE_COUNT_1_BIT;
-                attachmentDescription.loadOp         = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-                attachmentDescription.storeOp        = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-                attachmentDescription.stencilLoadOp  = firstTimeStencilAccess ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
-                attachmentDescription.stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE;
-                attachmentDescription.initialLayout  = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-                attachmentDescription.finalLayout    = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-
                 firstTimeStencilAccess = false;
-
-                attachmentDescriptions.push_back(attachmentDescription);
             }
-
-            VkSubpassDescription subpassDescription;
-            subpassDescription.flags                   = 0;
-            subpassDescription.pipelineBindPoint       = VK_PIPELINE_BIND_POINT_GRAPHICS;
-            subpassDescription.inputAttachmentCount    = 0;
-            subpassDescription.pInputAttachments       = nullptr;
-            subpassDescription.colorAttachmentCount    = attachmentReferences.size() - depthAttachmentCount;
-            subpassDescription.pColorAttachments       = attachmentReferences.data();
-            subpassDescription.pResolveAttachments     = nullptr;
-            subpassDescription.pDepthStencilAttachment = depthAttachmentCount ? &attachmentReferences.back() : nullptr;
-            subpassDescription.preserveAttachmentCount = 0;
-            subpassDescription.pPreserveAttachments    = nullptr;
-
-            VkSubpassDependency subpassDependencies[2] = {};
-            subpassDependencies[0].srcSubpass      = VK_SUBPASS_EXTERNAL;
-            subpassDependencies[0].dstSubpass      = 0;
-            subpassDependencies[0].srcStageMask    = VK_PIPELINE_STAGE_TRANSFER_BIT
-                                                  | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
-                                                  | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
-                                                  | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-            subpassDependencies[0].dstStageMask    = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-            subpassDependencies[0].srcAccessMask   = VK_ACCESS_TRANSFER_WRITE_BIT
-                                                  | VK_ACCESS_SHADER_READ_BIT
-                                                  | VK_ACCESS_SHADER_WRITE_BIT
-                                                  | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-            subpassDependencies[0].dstAccessMask   = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-            subpassDependencies[0].dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT;
-
-            subpassDependencies[1].srcSubpass      = 0;
-            subpassDependencies[1].dstSubpass      = VK_SUBPASS_EXTERNAL;
-            subpassDependencies[1].srcStageMask    = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-            subpassDependencies[1].dstStageMask    = VK_PIPELINE_STAGE_TRANSFER_BIT
-                                                  | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
-                                                  | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
-                                                  | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-            subpassDependencies[1].srcAccessMask   = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-            subpassDependencies[1].dstAccessMask   = VK_ACCESS_TRANSFER_READ_BIT
-                                                  | VK_ACCESS_TRANSFER_WRITE_BIT
-                                                  | VK_ACCESS_SHADER_READ_BIT
-                                                  | VK_ACCESS_SHADER_WRITE_BIT
-                                                  | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT
-                                                  | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-            subpassDependencies[1].dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT;
-
-            VkRenderPassCreateInfo renderPassCreateInfo;
-            renderPassCreateInfo.sType           = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-            renderPassCreateInfo.pNext           = nullptr;
-            renderPassCreateInfo.flags           = 0;
-            renderPassCreateInfo.attachmentCount = attachmentDescriptions.size();
-            renderPassCreateInfo.pAttachments    = attachmentDescriptions.data();
-            renderPassCreateInfo.subpassCount    = 1;
-            renderPassCreateInfo.pSubpasses      = &subpassDescription;
-            renderPassCreateInfo.dependencyCount = 2;
-            renderPassCreateInfo.pDependencies   = subpassDependencies;
+            const uint32_t attachmentCount = static_cast<uint32_t>(renderPassDesc.attachments.size());
 
             // Registered before any of its objects exist, so a failure below
             // still releases whatever this pass already created.
@@ -849,8 +740,9 @@ namespace VkHook
             PassRuntime& runtime = passRuntimes.back();
             runtime.renderTargets = std::move(currentRenderTargets);
             runtime.vertexCount = pass.num_vertices == 0 ? 3 : pass.num_vertices;
+            runtime.viewport = viewport;
 
-            VkResult result = logicalDevice->vkd.CreateRenderPass(logicalDevice->device, &renderPassCreateInfo, nullptr, &runtime.renderPass);
+            VkResult result = createEffectRenderPass(logicalDevice, renderPassDesc, runtime.renderPass);
             if (result != VK_SUCCESS)
             {
                 runtime.renderPass = VK_NULL_HANDLE;
@@ -861,7 +753,7 @@ namespace VkHook
             }
 
             runtime.renderArea = scissor;
-            runtime.clearValueCount = std::min<uint32_t>(attachmentDescriptions.size(), runtime.clearValues.size());
+            runtime.clearValueCount = std::min<uint32_t>(attachmentCount, runtime.clearValues.size());
 
             if (pass.render_target_names[0].empty())
             {
@@ -916,12 +808,12 @@ namespace VkHook
             inputAssemblyCreateInfo.topology               = topology;
             inputAssemblyCreateInfo.primitiveRestartEnable = VK_FALSE;
 
+            // Viewport and scissor are dynamic: the pipeline does not depend on the
+            // swapchain extent, and applyEffect sets both before each draw.
             VkPipelineViewportStateCreateInfo viewportStateCreateInfo = {};
             viewportStateCreateInfo.sType         = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
             viewportStateCreateInfo.viewportCount = 1;
-            viewportStateCreateInfo.pViewports    = &viewport;
             viewportStateCreateInfo.scissorCount  = 1;
-            viewportStateCreateInfo.pScissors     = &scissor;
 
             VkPipelineRasterizationStateCreateInfo rasterizationCreateInfo = {};
             rasterizationCreateInfo.sType                   = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
@@ -947,10 +839,11 @@ namespace VkHook
             colorBlendCreateInfo.attachmentCount = attachmentBlendStates.size();
             colorBlendCreateInfo.pAttachments    = attachmentBlendStates.data();
 
+            const VkDynamicState dynamicStates[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
             VkPipelineDynamicStateCreateInfo dynamicStateCreateInfo = {};
             dynamicStateCreateInfo.sType             = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-            dynamicStateCreateInfo.dynamicStateCount = 0;
-            dynamicStateCreateInfo.pDynamicStates    = nullptr;
+            dynamicStateCreateInfo.dynamicStateCount = 2;
+            dynamicStateCreateInfo.pDynamicStates    = dynamicStates;
 
             VkPipelineDepthStencilStateCreateInfo depthStencilStateCreateInfo = {};
             depthStencilStateCreateInfo.sType                 = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
@@ -1019,36 +912,50 @@ namespace VkHook
     // scanning effect then parameter name lists for every uniform of every
     // enabled effect. The registry bumps its generation when a reparse frees
     // params, so resolve once here and rebuild when that generation moves.
-    void ReshadeEffect::buildBindings()
+    //
+    // The shader defaults of the uniforms left without a parameter land in
+    // `uniformDefaults`, not in a slice: a slice may still be read by a frame in
+    // flight, so each one picks the new defaults up when its image next updates.
+    void ReshadeEffect::buildBindings(const reshadefx::module& module)
     {
         // Read the generation first: a bump that races this rebuild is then seen
         // by the next update and rebuilds again.
         bindingsGeneration = effectRegistry->parameterGeneration();
+        uniformDefaults.assign(bufferSize, 0);
         uniformBindings = buildUniformBindings(
-            module, bufferSize, stagingBufferMapped, [this](const std::string& uniformName) -> const EffectParam* {
+            module, bufferSize, uniformDefaults.data(), [this](const std::string& uniformName) -> const EffectParam* {
                 auto paramOpt = effectRegistry->getParameter(effectName, uniformName);
                 return paramOpt ? *paramOpt : nullptr;
             });
     }
 
-    void ReshadeEffect::updateEffect()
+    bool ReshadeEffect::updateFrame(uint32_t imageIndex)
     {
-        if (!stagingBufferMapped)
-            return;
+        if (!uniformBufferMapped || !uniformRing.contains(imageIndex))
+            return false;
 
         if (effectRegistry->parameterGeneration() != bindingsGeneration)
-            buildBindings();
+            buildBindings(*compiledModule);
 
-        applyUniformBindings(uniformBindings, stagingBufferMapped);
+        void* slice = uniformRing.slice(uniformBufferMapped, imageIndex);
+        if (uniformRing.needsDefaults(imageIndex, bindingsGeneration))
+        {
+            std::memcpy(slice, uniformDefaults.data(), bufferSize);
+            uniformRing.markDefaults(imageIndex, bindingsGeneration);
+        }
+
+        applyUniformBindings(uniformBindings, slice);
         for (auto& uniform : uniforms)
-            uniform->update(stagingBufferMapped);
+            uniform->update(slice);
         // HOST_COHERENT: no flush needed, GPU sees writes automatically
+        return false;
     }
 
     void ReshadeEffect::useDepthImage(uint32_t imageIndex, VkImageView depthImageView, VkImageLayout depthImageLayout)
     {
         if (imageIndex >= inputImages.size() || imageIndex >= inputDescriptorSets.size() || imageIndex >= inputImageViewsUNORM.size())
             return;
+        const reshadefx::module& module = *compiledModule;
 
         // Update DepthUniforms so bufready_depth reports correctly
         const bool hasDepth = (depthImageView != VK_NULL_HANDLE);
@@ -1156,7 +1063,8 @@ namespace VkHook
 
         // Seed output image from current input so backbuffer/load-based passes never start from undefined data.
         memoryBarrier.image = outputImages[imageIndex];
-        memoryBarrier.oldLayout = outputImageInitialized[imageIndex] ? VK_IMAGE_LAYOUT_PRESENT_SRC_KHR : VK_IMAGE_LAYOUT_UNDEFINED;
+        // The copy below overwrites the whole image, so what it held is never read.
+        memoryBarrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         memoryBarrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
         memoryBarrier.srcAccessMask = 0;
         memoryBarrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -1170,12 +1078,11 @@ namespace VkHook
                                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                                          1,
                                          &fullCopyRegion);
-        outputImageInitialized[imageIndex] = true;
 
         if (outputWrites > 1)
         {
             memoryBarrier.image = backBufferImages[imageIndex];
-            memoryBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            memoryBarrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; // fully overwritten by the copy
             memoryBarrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
             memoryBarrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
             memoryBarrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -1289,7 +1196,7 @@ namespace VkHook
                 if (bufferSize)
                 {
                     logicalDevice->vkd.CmdBindDescriptorSets(
-                        commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &bufferDescriptorSet, 0, nullptr);
+                        commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &bufferDescriptorSets[imageIndex], 0, nullptr);
                 }
 
                 logicalDevice->vkd.CmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, runtime.pipeline);
@@ -1302,7 +1209,7 @@ namespace VkHook
                 if (bufferSize)
                 {
                     logicalDevice->vkd.CmdBindDescriptorSets(
-                        commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0, 1, &bufferDescriptorSet, 0, nullptr);
+                        commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0, 1, &bufferDescriptorSets[imageIndex], 0, nullptr);
                 }
 
                 VkRenderPassBeginInfo renderPassBeginInfo = {};
@@ -1315,6 +1222,8 @@ namespace VkHook
 
                 logicalDevice->vkd.CmdBeginRenderPass(commandBuffer, &renderPassBeginInfo, VK_SUBPASS_CONTENTS_INLINE);
                 logicalDevice->vkd.CmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, runtime.pipeline);
+                logicalDevice->vkd.CmdSetViewport(commandBuffer, 0, 1, &runtime.viewport);
+                logicalDevice->vkd.CmdSetScissor(commandBuffer, 0, 1, &runtime.renderArea);
                 logicalDevice->vkd.CmdDraw(commandBuffer, runtime.vertexCount, 1, 0, 0);
                 logicalDevice->vkd.CmdEndRenderPass(commandBuffer);
 
@@ -1388,14 +1297,14 @@ namespace VkHook
             if (memory != VK_NULL_HANDLE)
                 retire(VK_OBJECT_TYPE_DEVICE_MEMORY, memory);
         }
-        const VkDeviceMemory stagingMemory = stagingBufferMemory;
+        const VkDeviceMemory uniformMemory = uniformBufferMemory;
 
         // the unmap has to happen before the memory goes, and it is a live call on
         // the device, so it stays inline rather than being retired
-        if (stagingBufferMapped)
-            vkd.UnmapMemory(device, stagingBufferMemory);
-        if (stagingMemory != VK_NULL_HANDLE)
-            retire(VK_OBJECT_TYPE_DEVICE_MEMORY, stagingMemory);
+        if (uniformBufferMapped)
+            vkd.UnmapMemory(device, uniformBufferMemory);
+        if (uniformMemory != VK_NULL_HANDLE)
+            retire(VK_OBJECT_TYPE_DEVICE_MEMORY, uniformMemory);
 
         for (auto image : collectOwnedImages())
             retire(VK_OBJECT_TYPE_IMAGE, image);
@@ -1409,7 +1318,7 @@ namespace VkHook
                 retire(VK_OBJECT_TYPE_SAMPLER, sampler);
         }
 
-        const VkBuffer     buffer     = stagingBuffer;
+        const VkBuffer     buffer     = uniformBuffer;
         const VkShaderModule module     = shaderModule;
         if (buffer != VK_NULL_HANDLE)
             retire(VK_OBJECT_TYPE_BUFFER, buffer);
@@ -1574,32 +1483,34 @@ namespace VkHook
                       " debug_info=" + std::to_string(runtimePolicy.emitDebugInfo ? 1 : 0) +
                       " disable_compute_opt=" + std::to_string(runtimePolicy.disableComputePipelineOptimization ? 1 : 0));
 
-        // The preprocessor output has every include and macro folded in, so its
-        // hash is a complete cache key: an edited include or a changed macro
-        // misses and recompiles, an unchanged effect is reused across reloads.
-        // That reuse is what keeps a chain rebuild from re-parsing every effect.
-        const uint64_t sourceHash = hashBytes(preprocessedSource.data(), preprocessedSource.size());
+        // The key is the preprocessed source (every include and macro already
+        // folded in) plus the macro digest, the codegen flags and the compiler
+        // tag; see ShaderCacheKey. Memory in front of disk: an unchanged effect is
+        // reused across chain rebuilds within a run and across runs.
         const uint32_t codegenFlags =
             (runtimePolicy.useLocalSizeId ? 1u : 0u) |
             (runtimePolicy.emitDebugInfo ? 4u : 0u);
+        const ShaderCacheKey cacheKey = makeShaderCacheKey(preprocessedSource, hashPreprocessSetup(setup), codegenFlags);
 
-        static CompileCache<reshadefx::module> s_moduleCache(64);
-        const CompileCache<reshadefx::module>::Key cacheKey{sourceHash, codegenFlags};
-
-        if (s_moduleCache.lookup(cacheKey, module))
+        ShaderCache& shaderCache = sharedShaderCache();
+        compiledModule = shaderCache.lookup(cacheKey);
+        if (compiledModule)
         {
             Logger::debug("reshade compile cache hit for " + effectName);
         }
         else
         {
             const ReshadeCodegenOptions options{runtimePolicy.emitDebugInfo, runtimePolicy.useLocalSizeId};
-            if (!compileReshadeSource(std::move(preprocessedSource), options, module, error))
+            auto fresh = std::make_shared<reshadefx::module>();
+            if (!compileReshadeSource(std::move(preprocessedSource), options, *fresh, error))
             {
                 Logger::err("failed to compile shader '" + effectName + "': " + error);
                 throw EffectBuildError("failed to compile shader: " + effectName + ": " + error);
             }
-            s_moduleCache.store(cacheKey, module);
+            compiledModule = fresh;
+            shaderCache.store(cacheKey, compiledModule);
         }
+        const reshadefx::module& module = *compiledModule;
 
         if (module.techniques.empty())
         {

@@ -17,7 +17,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <map>
+#include <mutex>
 #include <stdexcept>
+#include <utility>
 
 namespace VkHook
 {
@@ -60,6 +63,84 @@ namespace VkHook
         }
     }
 
+    namespace
+    {
+        // The loaded network and its weights on the GPU. The model is read from
+        // disk, hash-checked and uploaded once per (device, model path); every
+        // chain rebuild reuses it instead of paying that again. It owns the
+        // context its buffers were created through, so it stays valid however
+        // many effects come and go. An effect still builds its own context for
+        // its kernels, graph and descriptors, which die with the effect.
+        struct ModelEntry
+        {
+            std::unique_ptr<vk::Context> context;
+            std::unique_ptr<nr::Model>   model; // after the context: destroyed first
+            // The model uploads weights lazily while a graph is built.
+            std::mutex use;
+        };
+
+        using ModelKey = std::pair<VkDevice, std::string>;
+
+        struct ModelCache
+        {
+            std::mutex                                   mutex;
+            std::map<ModelKey, std::shared_ptr<ModelEntry>> entries;
+        };
+
+        // Deliberately never destroyed: at process exit the devices are already
+        // gone, and releasing GPU objects then would call into a dead driver.
+        // clearDlss5ModelCache is what releases an entry, at device destruction.
+        ModelCache& modelCache()
+        {
+            static ModelCache* cache = new ModelCache;
+            return *cache;
+        }
+
+        std::shared_ptr<ModelEntry> acquireModel(LogicalDevice* device, const std::string& modelPath)
+        {
+            ModelCache&    cache = modelCache();
+            const ModelKey key{device->device, modelPath};
+            {
+                std::lock_guard<std::mutex> lock(cache.mutex);
+                const auto                  found = cache.entries.find(key);
+                if (found != cache.entries.end())
+                    return found->second;
+            }
+
+            // Loaded outside the lock: reading and hashing the weights is slow
+            // and must not hold up another device's lookup.
+            auto entry = std::make_shared<ModelEntry>();
+            entry->context = std::make_unique<vk::Context>(device->instance, device->physicalDevice, device->device,
+                device->queueFamilyIndex, 0, device->downstreamGIPA, device->downstreamGDPA);
+            entry->model = std::make_unique<nr::Model>(*entry->context, modelPath);
+
+            std::lock_guard<std::mutex> lock(cache.mutex);
+            // A concurrent build may have won; keep one and drop the other.
+            return cache.entries.emplace(key, std::move(entry)).first->second;
+        }
+    } // namespace
+
+    void clearDlss5ModelCache(VkDevice device)
+    {
+        std::vector<std::shared_ptr<ModelEntry>> released;
+        {
+            ModelCache&                 cache = modelCache();
+            std::lock_guard<std::mutex> lock(cache.mutex);
+            for (auto it = cache.entries.begin(); it != cache.entries.end();)
+            {
+                if (it->first.first == device)
+                {
+                    released.push_back(std::move(it->second));
+                    it = cache.entries.erase(it);
+                }
+                else
+                    ++it;
+            }
+        }
+        // Destroyed here, outside the lock, while the device is still alive.
+        released.clear();
+    }
+
     struct Dlss5Effect::State
     {
         LogicalDevice* device = nullptr;
@@ -68,7 +149,7 @@ namespace VkHook
         VkExtent2D extent{};
         std::vector<VkImage> input, output;
         std::unique_ptr<vk::Context> context;
-        std::unique_ptr<nr::Model> model;
+        std::shared_ptr<ModelEntry> model;
         std::unique_ptr<nr::Kernels> kernels;
         std::unique_ptr<nr::Graph> graph;
         nr::Activation* features = nullptr;
@@ -142,14 +223,17 @@ namespace VkHook
                 device->downstreamGIPA, layerDeviceProcAddr());
         }
         else Logger::warn("DLSS5 temporal unavailable: no enabled NVIDIA optical-flow feature/usable queue; using no history");
-        s.model = std::make_unique<nr::Model>(*s.context, modelPath);
+        s.model = acquireModel(device, modelPath);
         s.kernels = std::make_unique<nr::Kernels>(*s.context, shaderPath, ptxPath);
         // A foreign renderer may overlap long graphics workloads with this pass.
         // Keep PTX fusions, but use Vulkan barriers instead of spinning counter
         // chains whose co-residency assumptions belong to the standalone demo.
         s.kernels->setChainEnabled(false);
         s.kernels->setSiluTable(ref::siluTable());
-        s.graph = std::make_unique<nr::Graph>(*s.context, *s.model, *s.kernels, geometry, nr::Graph::Options{});
+        {
+            std::lock_guard<std::mutex> lock(s.model->use);
+            s.graph = std::make_unique<nr::Graph>(*s.context, *s.model->model, *s.kernels, geometry, nr::Graph::Options{});
+        }
         s.features = s.graph->allocate("input features", geometry.fullWidth * geometry.fullHeight, 16, nr::Format::F32);
         const VkDeviceSize pixelBytes = VkDeviceSize(extent.width) * extent.height * sizeof(uint32_t);
         s.packedInput = s.context->createBuffer(pixelBytes, false, "DLSS5 packed input");
@@ -224,7 +308,7 @@ namespace VkHook
             updateFrame(index);
         }
         Logger::info("DLSS5: loaded the " + std::string(s.graph->layout().name) + " network ("
-                     + std::to_string(s.model->blockCount()) + " blocks, "
+                     + std::to_string(s.model->model->blockCount()) + " blocks, "
                      + std::to_string(s.graph->pooledBytes() >> 20) + " MiB of activations), PTX neural rendering at "
                      + std::to_string(extent.width) + "x" + std::to_string(extent.height)
                      + (s.flow ? " (SDR, bidirectional NVIDIA hardware optical flow)" : " (SDR, no temporal history)"));

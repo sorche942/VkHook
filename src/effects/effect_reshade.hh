@@ -18,6 +18,7 @@
 #include "effect_registry.hh"
 #include "reshade_uniforms.hh"
 #include "reshade_texture_pool.hh"
+#include "uniform_ring.hh"
 
 #include "logical_device.hh"
 
@@ -41,9 +42,13 @@ namespace VkHook
                       std::string          effectPath = "",  // Optional: explicit path to .fx file
                       std::vector<PreprocessorDefinition> customDefs = {});  // Custom preprocessor definitions
         void virtual applyEffect(uint32_t imageIndex, VkCommandBuffer commandBuffer) override;
-        void virtual updateEffect() override;
+        // Writes this image's slice of the uniform ring (see UniformRing).
+        bool updateFrame(uint32_t imageIndex) override;
         void virtual useDepthImage(uint32_t imageIndex, VkImageView depthImageView, VkImageLayout depthImageLayout) override;
         int getOutputWrites() const { return outputWrites; }
+        // True when the chain must follow this effect with a TransferEffect for
+        // its output image to hold the result (see reshadeOutputNeedsForward).
+        bool requiresOutputForward() const { return outputForwardRequired; }
         virtual ~ReshadeEffect();
 
         // Hands every GPU object this effect owns to the deferred destroy queue
@@ -110,6 +115,7 @@ namespace VkHook
             std::vector<std::string>    renderTargets;
             bool                        switchSamplers = false;
             uint32_t                    vertexCount = 3;
+            VkViewport                  viewport = {};
             uint32_t                    dispatchSizeX = 1;
             uint32_t                    dispatchSizeY = 1;
             uint32_t                    dispatchSizeZ = 1;
@@ -130,7 +136,9 @@ namespace VkHook
         std::string                           effectName;
         std::string                           effectPath;  // Path to .fx file (may differ from effectName)
         std::vector<PreprocessorDefinition>   customPreprocessorDefs;  // User-defined macros
-        reshadefx::module                     module;
+        // Shared with the compile cache and every other effect built from the
+        // same source; never modified after it is built.
+        std::shared_ptr<const reshadefx::module> compiledModule;
         std::vector<VkDeviceMemory>           textureMemory;
 
         VkFormat    inputOutputFormatUNORM = VK_FORMAT_UNDEFINED;
@@ -141,16 +149,24 @@ namespace VkHook
         // how often the shader writes to the reshade back buffer
         // we need to flip the "backbuffer" after each write if there is a next one
         int                      outputWrites = 0;
+        bool                     outputForwardRequired = false;
         std::vector<VkImage>     backBufferImages;
-        std::vector<bool>        outputImageInitialized;
         std::vector<VkImageView> backBufferImageViewsUNORM;
         std::vector<VkImageView> backBufferImageViewsSRGB;
-        // Effects without uniforms never allocate this buffer.
-        VkBuffer                 stagingBuffer = VK_NULL_HANDLE;
-        VkDeviceMemory           stagingBufferMemory = VK_NULL_HANDLE;
-        uint32_t                 bufferSize = 0;
-        void*                    stagingBufferMapped = nullptr;  // Persistent map (HOST_COHERENT)
-        VkDescriptorSet          bufferDescriptorSet = VK_NULL_HANDLE;
+        // One host-visible buffer holding one uniform slice per swapchain image
+        // (uniformRing), persistently mapped and HOST_COHERENT. Slice i is written
+        // by updateFrame(i) and bound by bufferDescriptorSets[i], so a frame in
+        // flight on another image never sees its uniforms change underneath it.
+        // Effects without uniforms never allocate any of this.
+        VkBuffer                 uniformBuffer = VK_NULL_HANDLE;
+        VkDeviceMemory           uniformBufferMemory = VK_NULL_HANDLE;
+        uint32_t                 bufferSize = 0;       // bytes of one slice
+        void*                    uniformBufferMapped = nullptr;
+        UniformRing              uniformRing;
+        std::vector<VkDescriptorSet> bufferDescriptorSets;
+        // Shader defaults of the uniforms without a live parameter, copied into a
+        // slice whenever the bindings are rebuilt (UniformRing::needsDefaults).
+        std::vector<uint8_t>     uniformDefaults;
         bool                     disableComputePipelineOptimization = false;
 
         std::vector<std::shared_ptr<ReshadeUniform>> uniforms;
@@ -161,7 +177,7 @@ namespace VkHook
         std::vector<UniformBinding> uniformBindings;
         uint64_t bindingsGeneration = 0;
 
-        void          buildBindings();
+        void          buildBindings(const reshadefx::module& module);
         void          createReshadeModule();
         VkFormat      convertReshadeFormat(reshadefx::texture_format texFormat);
         VkCompareOp   convertReshadeCompareOp(reshadefx::pass_stencil_func compareOp);

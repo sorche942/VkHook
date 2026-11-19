@@ -21,6 +21,39 @@ namespace VkHook
         return pipelineLayout;
     }
 
+    // Normally created at device creation (layer/pipeline_cache.cc, seeded from
+    // disk). This is the fallback when that failed. Effect construction runs
+    // with NO layer lock held, so two builds on one device can race here: the
+    // cache is published under stateLock and a loser destroys its unused cache.
+    VkPipelineCache devicePipelineCache(LogicalDevice* logicalDevice)
+    {
+        if (!logicalDevice)
+            return VK_NULL_HANDLE;
+        {
+            std::lock_guard<std::mutex> l(logicalDevice->stateLock);
+            if (logicalDevice->pipelineCache != VK_NULL_HANDLE)
+                return logicalDevice->pipelineCache;
+        }
+
+        VkPipelineCacheCreateInfo createInfo = {};
+        createInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+        VkPipelineCache created = VK_NULL_HANDLE;
+        if (logicalDevice->vkd.CreatePipelineCache(logicalDevice->device, &createInfo, nullptr, &created) != VK_SUCCESS)
+            return VK_NULL_HANDLE;
+
+        VkPipelineCache winner = created;
+        {
+            std::lock_guard<std::mutex> l(logicalDevice->stateLock);
+            if (logicalDevice->pipelineCache == VK_NULL_HANDLE)
+                logicalDevice->pipelineCache = created;
+            else
+                winner = logicalDevice->pipelineCache;
+        }
+        if (winner != created)
+            logicalDevice->vkd.DestroyPipelineCache(logicalDevice->device, created, nullptr);
+        return winner;
+    }
+
     VkPipeline createGraphicsPipeline(LogicalDevice*        logicalDevice,
                                       VkShaderModule        vertexModule,
                                       VkSpecializationInfo* vertexSpecializationInfo,
@@ -28,10 +61,8 @@ namespace VkHook
                                       VkShaderModule        fragmentModule,
                                       VkSpecializationInfo* fragmentSpecializationInfo,
                                       std::string           fragmentEntryPoint,
-                                      VkExtent2D            extent,
                                       VkRenderPass          renderPass,
                                       VkPipelineLayout      pipelineLayout,
-                                      bool                  flip,
                                       uint32_t              subpass)
     {
         VkResult result;
@@ -74,26 +105,15 @@ namespace VkHook
         inputAssemblyCreateInfo.topology               = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
         inputAssemblyCreateInfo.primitiveRestartEnable = VK_FALSE;
 
-        VkViewport viewport;
-        viewport.x        = 0.0f;
-        viewport.y        = flip ? static_cast<float>(extent.height) : 0.0f;
-        viewport.width    = static_cast<float>(extent.width);
-        viewport.height   = flip ? -static_cast<float>(extent.height) : static_cast<float>(extent.height);
-        viewport.minDepth = 0.0f;
-        viewport.maxDepth = 1.0f;
-
-        VkRect2D scissor;
-        scissor.offset = {0, 0};
-        scissor.extent = {extent.width, extent.height};
-
+        // Counts only: the values come from the command buffer.
         VkPipelineViewportStateCreateInfo viewportStateCreateInfo;
         viewportStateCreateInfo.sType         = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
         viewportStateCreateInfo.pNext         = nullptr;
         viewportStateCreateInfo.flags         = 0;
         viewportStateCreateInfo.viewportCount = 1;
-        viewportStateCreateInfo.pViewports    = &viewport;
+        viewportStateCreateInfo.pViewports    = nullptr;
         viewportStateCreateInfo.scissorCount  = 1;
-        viewportStateCreateInfo.pScissors     = &scissor;
+        viewportStateCreateInfo.pScissors     = nullptr;
 
         VkPipelineRasterizationStateCreateInfo rasterizationCreateInfo;
         rasterizationCreateInfo.sType                   = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
@@ -146,15 +166,13 @@ namespace VkHook
         colorBlendCreateInfo.blendConstants[2] = 0.0f;
         colorBlendCreateInfo.blendConstants[3] = 0.0f;
 
+        const VkDynamicState dynamicStates[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
         VkPipelineDynamicStateCreateInfo dynamicStateCreateInfo;
         dynamicStateCreateInfo.sType             = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
         dynamicStateCreateInfo.pNext             = nullptr;
         dynamicStateCreateInfo.flags             = 0;
-        dynamicStateCreateInfo.dynamicStateCount = 0;
-        // Vulkan requires pDynamicStates to be NULL when dynamicStateCount is 0.
-        // A zero-length array is a compiler extension, not valid C++, and yields a
-        // non-null pointer that the driver is allowed to dereference.
-        dynamicStateCreateInfo.pDynamicStates    = nullptr;
+        dynamicStateCreateInfo.dynamicStateCount = 2;
+        dynamicStateCreateInfo.pDynamicStates    = dynamicStates;
 
         VkGraphicsPipelineCreateInfo pipelineCreateInfo;
         pipelineCreateInfo.sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
@@ -177,7 +195,7 @@ namespace VkHook
         pipelineCreateInfo.basePipelineHandle  = VK_NULL_HANDLE;
         pipelineCreateInfo.basePipelineIndex   = -1;
 
-        result = logicalDevice->vkd.CreateGraphicsPipelines(logicalDevice->device, VK_NULL_HANDLE, 1, &pipelineCreateInfo, nullptr, &pipeline);
+        result = logicalDevice->vkd.CreateGraphicsPipelines(logicalDevice->device, devicePipelineCache(logicalDevice), 1, &pipelineCreateInfo, nullptr, &pipeline);
         ASSERT_VULKAN_VAL(result, VK_NULL_HANDLE);
 
         return pipeline;

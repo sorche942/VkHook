@@ -27,10 +27,17 @@ namespace VkHook
     {
     public:
         void virtual applyEffect(uint32_t imageIndex, VkCommandBuffer commandBuffer) = 0;
-        void virtual updateEffect(){};
-        // Called only after this swapchain image's previous submission completed.
-        // True requests fence-safe re-recording of this image's primary commands.
-        virtual bool updateFrame(uint32_t /* imageIndex */) { updateEffect(); return false; }
+        // Called once per present, for the swapchain image about to be submitted,
+        // and only after that image's previous submission has completed. It may
+        // therefore rewrite the CPU-visible state that submission read, but ONLY
+        // the state belonging to `imageIndex`: submissions of the other images
+        // may still be executing. Effects with per-frame data (ReShade uniforms)
+        // keep one copy of it per swapchain image and write copy `imageIndex`
+        // here.
+        //
+        // Returns true to request fence-safe re-recording of this image's primary
+        // commands (descriptor bindings changed).
+        virtual bool updateFrame(uint32_t /* imageIndex */) { return false; }
         // Called under the submission lock, after the depth-generation gate.
         // May submit auxiliary GPU work and replace this submission's waits.
         virtual VkResult prepareSubmission(uint32_t /* imageIndex */, uint64_t /* frameSerial */,

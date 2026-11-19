@@ -459,6 +459,18 @@ If an effect's auxiliary submission (DLSS5 optical flow) or the frame submission
 waiting on it fails, VkHook logs `VkHook panic: …` with the `VkResult` and turns
 effects off until restart. It no longer fails every later present silently.
 
+## shader compile cache
+
+Compiling a ReShade effect (parse and SPIR-V codegen) dominates the time it takes
+to enable an effect or rebuild a chain. The layer keeps compiled effects in memory
+and on disk in `${XDG_CACHE_HOME:-~/.cache}/VkHook/shaders/`, one `.vksc` file per
+compiled variant. An entry is keyed by the preprocessed source (every include and
+macro folded in), the macro set, the codegen flags and a compiler tag, so editing
+a shader, an include or a macro, or upgrading VkHook, simply compiles again.
+Entries are written by the persistence queue, never on the present thread; a
+truncated or corrupt file is ignored and overwritten. The directory keeps at most
+1024 entries (oldest written first). It is safe to delete at any time.
+
 ## diagnostic shaders
 
 These effects are used as diagnostics. Install them into
