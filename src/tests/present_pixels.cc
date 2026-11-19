@@ -43,6 +43,14 @@ constexpr uint32_t kHeight = 240;
 // swapchain depth plus the layer's own queued frames
 constexpr int kStaleWindow = 12;
 constexpr int kTolerance = 5;
+// how long the effect chain may take to come up before the run is failed
+constexpr int kEffectBudgetMs = 10000;
+// frames after a swapchain recreation in which plain output is still accepted (chain rebuild)
+constexpr int kRecreateGrace = 30;
+// frames at the very start that may show the window background before the first present lands
+constexpr int kStartFrames = 3;
+// consecutive inverted frames after which the effect counts as live
+constexpr int kSettleRun = 10;
 
 struct Rgb {
     int r, g, b;
@@ -125,7 +133,7 @@ private:
     void createInstanceAndDevice();
     void createSwapchain(const Generation& g);
     void destroySwapchainResources();
-    void renderAndPresent(int frame);
+    bool renderAndPresent(int frame);  // true when the present reported SUBOPTIMAL
     Rgb pixel(int x, int y);
     std::vector<Generation> plan();
 
@@ -415,7 +423,7 @@ void App::createSwapchain(const Generation& g) {
     std::printf("GENERATION mode=%s format=%s images=%u\n", modeName(g.mode), formatName(g.format), n);
 }
 
-void App::renderAndPresent(int frame) {
+bool App::renderAndPresent(int frame) {
     VK(vkWaitForFences(dev_, 1, &fence_, VK_TRUE, UINT64_MAX));
     uint32_t idx = 0;
     VkResult r = vkAcquireNextImageKHR(dev_, swapchain_, UINT64_MAX, acquire_, VK_NULL_HANDLE, &idx);
@@ -471,6 +479,7 @@ void App::renderAndPresent(int frame) {
         std::printf("FAIL present frame=%d result=%d\n", frame, static_cast<int>(r));
         presentFailed_ = true;
     }
+    return r == VK_SUBOPTIMAL_KHR;
 }
 
 Rgb App::pixel(int x, int y) {
@@ -509,19 +518,43 @@ void App::run(bool invert, int framesPerGeneration, int sleepMs) {
         std::printf(fmt, args...);
         std::printf("\n");
     };
-    const int warm = framesPerGeneration / 2;
+    // For expect=invert the effect chain (shader compile, pipelines) may legitimately take
+    // a while to come up on a real GPU, so generation 0 keeps rendering until the first
+    // run of inverted frames is seen, for at most kEffectBudgetMs. From then on every frame must be
+    // inverted, except the first kRecreateGrace frames after a swapchain recreation, where
+    // the chain rebuilds and plain frames are accepted. A stale or unmatched colour is never
+    // accepted (apart from the first kStartFrames, before anything was presented).
+    bool settled = !invert;
+    int invertedRun = 0;
+    const auto start = std::chrono::steady_clock::now();
 
     for (size_t gi = 0; gi < gens.size(); ++gi) {
         createSwapchain(gens[gi]);
-        for (int k = 0; k < framesPerGeneration; ++k, ++frame) {
-            renderAndPresent(frame);
+        // frames since the swapchain was (re)created; -1 for the very first one, where the
+        // plain-until-settled rule already covers startup
+        int sinceRecreate = gi > 0 ? 0 : -1;
+        int suboptimalRebuilds = 0;
+        for (int k = 0;; ++k, ++frame) {
+            if (k >= framesPerGeneration) {
+                const bool waiting = gi == 0 && !settled;
+                const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::steady_clock::now() - start).count();
+                if (!waiting) break;
+                if (ms > kEffectBudgetMs) {
+                    note("NOEFFECT inverted colour never appeared within %d ms (%d frames)", kEffectBudgetMs, frame);
+                    ++failures;
+                    break;
+                }
+            }
+            const bool suboptimal = renderAndPresent(frame);
             std::this_thread::sleep_for(std::chrono::milliseconds(sleepMs));
             XSync(dpy_, False);
 
             Frame f{};
             f.index = frame;
             f.generation = static_cast<int>(gi);
-            f.strict = k >= warm;
+            const bool acceptPlain = !invert || !settled || (sinceRecreate >= 0 && sinceRecreate < kRecreateGrace);
+            f.strict = !acceptPlain;
             f.captured = pixel(kWidth / 2, kHeight / 2);
             const Rgb a = pixel(kWidth / 8, kHeight / 8);
             const Rgb b = pixel(kWidth - kWidth / 8, kHeight - kHeight / 8);
@@ -533,23 +566,25 @@ void App::run(bool invert, int framesPerGeneration, int sleepMs) {
             for (int back = 0; back < kStaleWindow && frame - back >= 0 && f.matchedFrame < 0; ++back) {
                 const Rgb w = wanted(frame - back);
                 const Rgb inv{255 - w.r, 255 - w.g, 255 - w.b};
-                if (near(f.captured, invert ? inv : w)) {
+                if (invert && near(f.captured, inv)) {
                     f.matchedFrame = frame - back;
-                    f.inverted = invert;
-                } else if (!f.strict && near(f.captured, invert ? w : inv)) {
-                    // before the layer settles the other rendering is tolerated
+                    f.inverted = true;
+                } else if (acceptPlain && near(f.captured, w)) {
                     f.matchedFrame = frame - back;
-                    f.inverted = !invert;
                 }
             }
+            // the layer drops to pass-through while it debounces window resizes, so a few early
+            // inverted frames prove nothing; settled needs an unbroken run of them
+            invertedRun = f.inverted ? invertedRun + 1 : 0;
+            if (invertedRun >= kSettleRun) settled = true;
             const char* verdict = "ok";
             if (f.matchedFrame < 0) {
-                verdict = f.strict ? "UNMATCHED" : "unmatched-warmup";
-                if (f.strict) ++failures;
+                verdict = frame < kStartFrames ? "unmatched-start" : "UNMATCHED";
+                if (frame >= kStartFrames) ++failures;
             } else if (f.matchedFrame < lastMatched) {
                 verdict = "WENT-BACKWARDS";
                 ++failures;
-            } else if (!f.consistent && f.strict) {
+            } else if (!f.consistent) {
                 verdict = "INCONSISTENT";
                 ++failures;
             }
@@ -563,6 +598,15 @@ void App::run(bool invert, int framesPerGeneration, int sleepMs) {
                  invert ? 255 - wanted(frame).g : wanted(frame).g, invert ? 255 - wanted(frame).b : wanted(frame).b,
                  f.matchedFrame, f.inverted ? 1 : 0, verdict);
             log.push_back(f);
+            if (sinceRecreate >= 0) ++sinceRecreate;
+            // a real app recreates on SUBOPTIMAL (the compositor wants a different surface
+            // configuration); do the same, a bounded number of times per generation
+            if (suboptimal && suboptimalRebuilds < 3) {
+                ++suboptimalRebuilds;
+                note("SUBOPTIMAL after frame %d: recreating swapchain", frame);
+                createSwapchain(gens[gi]);
+                sinceRecreate = 0;
+            }
         }
         // staleness at the end of a generation: the last frame must be (nearly) the newest
         const Frame& last = log.back();
