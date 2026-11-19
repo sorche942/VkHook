@@ -1022,9 +1022,11 @@ The smoke test only proves the process survives. `src/tests/present_pixels.cc` i
 Each captured frame must match one of the last frames the app rendered (or its inverse) and must never move backwards; for the `invert` variants the effect chain may take up to 10 s to build on a real driver, after which every frame must be inverted (`NOEFFECT` if it never is); the app recreates its swapchain when a present returns `SUBOPTIMAL`, as a game would; the window must not be stale at the end of a swapchain generation; enough distinct frames must appear. One run goes through several swapchain generations created with `oldSwapchain`: FIFO, a present-mode change that alters the image count, a surface-format change, and back (a variant the surface does not offer is logged and skipped). Depth capture off with an app that has no depth buffer is the combination that hid defect C2 (the layer presented the never-rendered real images); the baseline layer from before the overhaul fails every variant here.
 
 ```bash
-meson test -C build 'present pixels' --print-errorlogs
+meson test -C build 'present pixels' 'present pixels without recreate' --print-errorlogs
 # or by hand, on any X11 display or Xvfb:
-python3 src/tests/present_pixels.py build/src/present-pixels build/src/libvkhook.so [variant...]
+python3 src/tests/present_pixels.py build/src/present-pixels build/src/libvkhook.so [--no-recreate] [variant...]
 ```
+
+`--no-recreate` (the second meson test) makes the app keep its swapchain when a present reports `SUBOPTIMAL` instead of recreating it, as an app may: `SUBOPTIMAL` is a success code and the layer must keep processing frames. On NVIDIA the first present of a window reports it.
 
 The test uses X11 only (it unsets `WAYLAND_DISPLAY`; on a Wayland desktop it runs through Xwayland) because there is no layer-independent way to read back a native Wayland surface. It re-executes itself under `xvfb-run` when no display exists and exits 77 (skip) when it cannot get one or finds no usable Vulkan device.
