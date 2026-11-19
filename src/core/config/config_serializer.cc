@@ -277,21 +277,77 @@ namespace VkHook
         }
     }
 
+    namespace
+    {
+        // Shader-path caches
+        //
+        // What: the two memoised results of scanning the shader tree.
+        //   includePaths  expandShaderIncludePaths(): root set -> every directory
+        //                 below the roots, in discovery order.
+        //   manager       loadShaderManagerConfig(): the parsed shader_manager.conf
+        //                 with its discovered paths refreshed by a directory scan.
+        //
+        // Owner: this translation unit. One process-wide instance, because the
+        // inputs are process-wide (the user's config directory and shader packs),
+        // not per device or swapchain. Nothing outside the two functions above
+        // and saveShaderManagerConfig() touches it.
+        //
+        // Keys: includePaths is keyed by the newline-joined root list. manager
+        // holds a single entry keyed by (config path, file exists, file mtime).
+        //
+        // Invalidation:
+        //   - a manager hit needs the same path, existence and mtime; a changed
+        //     file reloads and, because the shader tree may have changed with it,
+        //     also drops includePaths;
+        //   - saveShaderManagerConfig() drops both (the UI's rescan is a save);
+        //   - otherwise entries live for the process. A shader pack installed
+        //     without touching shader_manager.conf is picked up on the next save
+        //     or the next restart, as before.
+        //
+        // Threads: any (compile workers, the present thread, the persistence
+        // writer, the UI). `mutex` guards every field; there is no unlocked access.
+        //
+        // Lock order: `mutex` is a leaf. It is never held across file I/O, a
+        // directory scan, a Logger call or another lock (AGENTS.md invariant 1).
+        // Readers compute outside the lock and publish under it; two threads
+        // that miss together both compute and the last publication wins, which is
+        // harmless because the computation is deterministic for equal inputs.
+        struct ShaderPathCaches
+        {
+            std::mutex mutex;
+            std::map<std::string, std::vector<std::string>> includePaths;
+
+            struct Manager
+            {
+                ShaderManagerConfig config;
+                std::filesystem::file_time_type modifiedTime{};
+                std::string path;
+                bool exists = false;
+                bool valid = false;
+            } manager;
+        };
+
+        ShaderPathCaches& shaderPathCaches()
+        {
+            static ShaderPathCaches caches;
+            return caches;
+        }
+    }
+
     std::vector<std::string> ConfigSerializer::expandShaderIncludePaths(const std::vector<std::string>& roots)
     {
         // one expansion per compile would mean rescanning the whole shader tree
-        // each time, so memoise by the root set
-        static std::mutex cacheMutex;
-        static std::map<std::string, std::vector<std::string>> cache;
+        // each time, so memoise by the root set (see ShaderPathCaches)
+        ShaderPathCaches& caches = shaderPathCaches();
 
         std::string key;
         for (const std::string& root : roots)
             key += root + "\n";
 
         {
-            std::lock_guard<std::mutex> lock(cacheMutex);
-            auto it = cache.find(key);
-            if (it != cache.end())
+            std::lock_guard<std::mutex> lock(caches.mutex);
+            auto it = caches.includePaths.find(key);
+            if (it != caches.includePaths.end())
                 return it->second;
         }
 
@@ -326,8 +382,8 @@ namespace VkHook
         }
 
         {
-            std::lock_guard<std::mutex> lock(cacheMutex);
-            cache[key] = result;
+            std::lock_guard<std::mutex> lock(caches.mutex);
+            caches.includePaths[key] = result;
         }
         return result;
     }
@@ -337,16 +393,8 @@ namespace VkHook
         // Loading is a pure read: it never writes the file or creates
         // directories. Callers that want a refreshed scan persisted call
         // saveShaderManagerConfig through the PersistenceQueue.
-        struct Cache
-        {
-            std::mutex mutex;
-            ShaderManagerConfig config;
-            std::filesystem::file_time_type modifiedTime{};
-            std::string path;
-            bool exists = false;
-            bool valid = false;
-        };
-        static Cache cache;
+        // The memoised result is described at ShaderPathCaches.
+        ShaderPathCaches& caches = shaderPathCaches();
 
         const std::string configPath = getBaseConfigDir() + "/shader_manager.conf";
         std::error_code timestampError;
@@ -354,10 +402,11 @@ namespace VkHook
         const bool exists = !timestampError;
 
         {
-            std::lock_guard<std::mutex> lock(cache.mutex);
-            if (cache.valid && cache.path == configPath && cache.exists == exists
-                && (!exists || cache.modifiedTime == modifiedTime))
-                return cache.config;
+            std::lock_guard<std::mutex> lock(caches.mutex);
+            const ShaderPathCaches::Manager& cached = caches.manager;
+            if (cached.valid && cached.path == configPath && cached.exists == exists
+                && (!exists || cached.modifiedTime == modifiedTime))
+                return cached.config;
         }
 
         ShaderManagerConfig config;
@@ -422,12 +471,16 @@ namespace VkHook
         refreshDiscoveredPaths();
 
         {
-            std::lock_guard<std::mutex> lock(cache.mutex);
-            cache.config = config;
-            cache.path = configPath;
-            cache.exists = exists;
-            cache.modifiedTime = exists ? modifiedTime : std::filesystem::file_time_type{};
-            cache.valid = true;
+            std::lock_guard<std::mutex> lock(caches.mutex);
+            ShaderPathCaches::Manager& cached = caches.manager;
+            // the file changed, so the shader tree it describes may have too
+            if (cached.valid)
+                caches.includePaths.clear();
+            cached.config = config;
+            cached.path = configPath;
+            cached.exists = exists;
+            cached.modifiedTime = exists ? modifiedTime : std::filesystem::file_time_type{};
+            cached.valid = true;
         }
         return config;
     }
@@ -467,6 +520,13 @@ namespace VkHook
         {
             Logger::err("Could not write shader_manager.conf: " + configPath);
             return false;
+        }
+
+        {
+            ShaderPathCaches& caches = shaderPathCaches();
+            std::lock_guard<std::mutex> lock(caches.mutex);
+            caches.manager = {};
+            caches.includePaths.clear();
         }
 
         Logger::debug("Saved shader manager config to: " + configPath);

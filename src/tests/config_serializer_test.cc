@@ -5,6 +5,7 @@
 #include "util.hh"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -423,6 +424,47 @@ int main()
         expect(!std::filesystem::exists(managerConf), "loading shader manager config does not write it");
         expect(std::filesystem::exists(VkHook::ConfigSerializer::getBaseConfigDir() + "/reshade") == before,
                "loading shader manager config does not create directories");
+    }
+
+    // The shader-path caches are shared by compile workers, the present thread
+    // and the persistence writer: hammer load, expand and save together. Run
+    // under TSan this is the data-race check; here it also proves every reader
+    // sees a complete, self-consistent result while saves invalidate the caches.
+    {
+        const std::string base = VkHook::ConfigSerializer::getBaseConfigDir();
+        const std::filesystem::path packs = std::filesystem::path(base) / "cache-hammer";
+        std::filesystem::create_directories(packs / "Shaders" / "a");
+        std::filesystem::create_directories(packs / "Shaders" / "b");
+        VkHook::ShaderManagerConfig seed;
+        seed.parentDirectories = {packs.string()};
+        expect(VkHook::ConfigSerializer::saveShaderManagerConfig(seed), "seed shader manager config for the hammer");
+
+        std::atomic<int> bad{0};
+        std::vector<std::thread> workers;
+        for (int t = 0; t < 6; ++t)
+        {
+            workers.emplace_back([&, t] {
+                for (int i = 0; i < 200; ++i)
+                {
+                    if (t == 0 && i % 10 == 0)
+                    {
+                        if (!VkHook::ConfigSerializer::saveShaderManagerConfig(seed))
+                            ++bad;
+                        continue;
+                    }
+                    const auto config = VkHook::ConfigSerializer::loadShaderManagerConfig();
+                    if (config.parentDirectories.size() != 1 || config.parentDirectories[0] != packs.string())
+                        ++bad;
+                    const auto paths = VkHook::ConfigSerializer::expandShaderIncludePaths({(packs / "Shaders").string()});
+                    // the root and its two subdirectories, never a partial list
+                    if (paths.size() != 3)
+                        ++bad;
+                }
+            });
+        }
+        for (std::thread& worker : workers)
+            worker.join();
+        expect(bad == 0, "shader-path caches stay consistent under concurrent load/expand/save");
     }
 
     std::filesystem::remove_all(root);
