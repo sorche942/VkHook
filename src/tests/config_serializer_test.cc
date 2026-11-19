@@ -1,6 +1,8 @@
 #include "config.hh"
 #include "config_serializer.hh"
 #include "default_config.hh"
+#include "ini.hh"
+#include "util.hh"
 
 #include <algorithm>
 #include <cstdlib>
@@ -8,7 +10,9 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <chrono>
 #include <string>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -45,10 +49,11 @@ int main()
     setenv("XDG_CONFIG_HOME", root.c_str(), 1);
     setenv("HOME", root.c_str(), 1);
 
-    // A missing global config inherits launch effects enabled and writes that default.
-    VkHook::ConfigSerializer::ensureConfigExists();
+    // A missing global config inherits launch effects enabled, and saving writes that default.
     expect(VkHook::ConfigSerializer::loadSettings().enableOnLaunch,
            "missing global config defaults enableOnLaunch to true");
+    expect(VkHook::ConfigSerializer::saveSettings(VkHook::ConfigSerializer::loadSettings()),
+           "save defaults into a missing config");
     expect(readFile(VkHook::ConfigSerializer::getBaseConfigDir() + "/VkHook.conf")
                    .find("enableOnLaunch = true") != std::string::npos,
            "generated global config writes enableOnLaunch as true");
@@ -396,6 +401,128 @@ int main()
                                         "/configs/shaders/global-rename-dst.ini";
     expect(std::filesystem::exists(globalRenameDst) && !std::filesystem::exists(globalRenameSrc),
            "global rename keeps the file global (no game prefix)");
+
+
+    // Saving settings is read-modify-write: keys VkHook does not own and the
+    // user's comments survive, in their original order.
+    {
+        const std::string confPath = VkHook::ConfigSerializer::getBaseConfigDir() + "/VkHook.conf";
+        {
+            std::ofstream user(confPath);
+            user << "# my notes about this setup\n"
+                    "reshadeIncludePath = /opt/my shaders/include\n"
+                    "maxEffects = 5\n"
+                    "# keep this too\n"
+                    "someFutureKey = \"a # b\"\n";
+        }
+        VkHook::VkBasaltSettings s = VkHook::ConfigSerializer::loadSettings();
+        s.maxEffects = 31;
+        expect(VkHook::ConfigSerializer::saveSettings(s), "save over a hand-edited VkHook.conf");
+        const std::string text = readFile(confPath);
+        const auto at = [&](const char* needle) { return text.find(needle); };
+        expect(at("# my notes about this setup") == 0, "leading comment preserved in place");
+        expect(at("reshadeIncludePath = /opt/my shaders/include") != std::string::npos,
+               "unknown key preserved verbatim");
+        expect(at("# keep this too") != std::string::npos && at("someFutureKey = \"a # b\"") != std::string::npos,
+               "later comment and unknown key preserved");
+        expect(at("maxEffects = 31") != std::string::npos && at("maxEffects = 5") == std::string::npos,
+               "owned key updated in place");
+        expect(at("reshadeIncludePath") < at("maxEffects = 31") && at("maxEffects = 31") < at("someFutureKey"),
+               "key order preserved");
+        expect(VkHook::ConfigSerializer::loadSettings().maxEffects == 31, "updated value reads back");
+        const std::string before = text;
+        expect(VkHook::ConfigSerializer::saveSettings(VkHook::ConfigSerializer::loadSettings()),
+               "re-save unchanged settings");
+        expect(readFile(confPath) == before, "saving unchanged settings is idempotent");
+        std::filesystem::remove(confPath);
+    }
+
+    // One tokenizer: values with blanks, '#', quotes, '=' and backslashes survive write->read.
+    {
+        const std::vector<std::string> values = {
+            "plain", "with space", "has # hash", "say \"hi\"", "back\\slash", " leading", "trailing ",
+            "a=b=c", "", "\"quoted\"", "tab\there", "/path with spaces/#1/file \"x\".fx",
+        };
+        for (const auto& value : values)
+        {
+            const auto line = VkHook::Ini::tokenize("key = " + VkHook::Ini::formatValue(value) + "   # trailing comment");
+            expect(line.kind == VkHook::Ini::LineKind::Pair && line.key == "key" && line.value == value,
+                   "ini round trip: [" + value + "] came back as [" + line.value + "]");
+        }
+        expect(VkHook::Ini::tokenize("  # hello").kind == VkHook::Ini::LineKind::Comment, "comment line");
+        expect(VkHook::Ini::tokenize("   ").kind == VkHook::Ini::LineKind::Blank, "blank line");
+        expect(VkHook::Ini::tokenize("a = b = c").value == "b = c", "second '=' belongs to the value");
+        expect(VkHook::Ini::tokenize("a = x y").value == "x y", "unquoted inner blank kept");
+        expect(VkHook::Ini::parseBool("True") == true && VkHook::Ini::parseBool("off") == false &&
+                   !VkHook::Ini::parseBool("maybe").has_value(),
+               "bool parser");
+
+        // the same file means the same thing to Config and to loadSettings
+        const std::string confPath = VkHook::ConfigSerializer::getBaseConfigDir() + "/VkHook.conf";
+        {
+            std::ofstream f(confPath);
+            f << "maxEffects = \"17\"   # quoted number\n"
+                 "toggleKey = \"Home\"\n"
+                 "enableOnLaunch = Off # comment\n"
+                 "depthManualPin = \"pin # one\"\n";
+        }
+        VkHook::Config config(confPath);
+        const auto settingsFromFile = VkHook::ConfigSerializer::loadSettings();
+        expect(config.getOption<int>("maxEffects") == 17 && settingsFromFile.maxEffects == 17,
+               "Config and loadSettings agree on a quoted number with a comment");
+        expect(config.getOption<std::string>("toggleKey") == settingsFromFile.toggleKey &&
+                   settingsFromFile.toggleKey == "Home",
+               "Config and loadSettings agree on a quoted string");
+        expect(config.getOption<bool>("enableOnLaunch") == false && !settingsFromFile.enableOnLaunch,
+               "Config and loadSettings agree on a bool");
+        expect(config.getOption<std::string>("depthManualPin") == "pin # one" &&
+                   settingsFromFile.depthManualPin == "pin # one",
+               "a '#' inside quotes is not a comment in either reader");
+
+        // The hot-reload watcher ignores VkHook's own writes but sees external edits.
+        VkHook::Config watched(confPath);
+        expect(!watched.hasConfigChanged(), "fresh config reports no change");
+        std::this_thread::sleep_for(std::chrono::milliseconds(650));
+        expect(VkHook::writeAtomically(confPath, "maxEffects = 9\n"), "own write");
+        expect(!watched.hasConfigChanged(), "the watcher ignores VkHook's own write");
+        std::this_thread::sleep_for(std::chrono::milliseconds(650));
+        {
+            std::ofstream external(confPath);
+            external << "maxEffects = 10\n";
+        }
+        expect(watched.hasConfigChanged(), "the watcher sees an external edit");
+        std::filesystem::remove(confPath);
+    }
+
+    // A disabled effect's macro value containing commas survives the sidecar.
+    {
+        const std::string path = VkHook::ConfigSerializer::getShaderProfilePath("macro-game", "commas");
+        std::filesystem::create_directories(std::filesystem::path(path).parent_path());
+        const std::map<std::string, std::string> paths = {{"Tint", "tint.fx"}};
+        const std::vector<VkHook::ConfigParam> disabledMacros = {
+            {"Tint", "@COLOR", "float3(1,0,0)"},
+            {"Tint", "Strength", "0.5"},
+        };
+        expect(VkHook::ConfigSerializer::saveShaderProfile(path, {}, {"Tint"}, {"Tint"}, paths, {}, {}, disabledMacros),
+               "save profile with a disabled comma macro");
+        const auto data = VkHook::ConfigSerializer::loadShaderProfileData(
+            VkHook::ConfigSerializer::getShaderProfileSidecarPath(path));
+        const bool ok = std::any_of(data.params.begin(), data.params.end(), [](const auto& p) {
+            return p.paramName == "@COLOR" && p.value == "float3(1,0,0)";
+        });
+        expect(ok, "disabled macro value float3(1,0,0) round-trips through the sidecar");
+    }
+
+    // Loading the shader-manager config never writes or creates anything.
+    {
+        const std::string managerConf = VkHook::ConfigSerializer::getBaseConfigDir() + "/shader_manager.conf";
+        std::filesystem::remove(managerConf);
+        const auto before = std::filesystem::exists(VkHook::ConfigSerializer::getBaseConfigDir() + "/reshade");
+        (void)VkHook::ConfigSerializer::loadShaderManagerConfig();
+        expect(!std::filesystem::exists(managerConf), "loading shader manager config does not write it");
+        expect(std::filesystem::exists(VkHook::ConfigSerializer::getBaseConfigDir() + "/reshade") == before,
+               "loading shader manager config does not create directories");
+    }
 
     std::filesystem::remove_all(root);
     if (failures != 0)

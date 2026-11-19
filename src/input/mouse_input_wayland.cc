@@ -165,6 +165,24 @@ namespace VkHook
         highResolutionScroll -= static_cast<float>(value120) / 120.0f;
     }
 
+    // wl_pointer v9: which way the compositor flipped the axis ("natural
+    // scrolling"). The overlay scrolls with the delta it is given.
+    static void pointerAxisRelativeDirection(void* /*data*/, wl_pointer* /*pointer*/,
+                                             uint32_t /*axis*/, uint32_t /*direction*/)
+    {
+    }
+
+    // wl_pointer v11: the compositor moved the pointer itself
+    static void pointerWarp(void* /*data*/, wl_pointer* /*pointer*/, wl_fixed_t sx, wl_fixed_t sy)
+    {
+        const bool onInputSurface =
+            getWaylandInputSurface() != nullptr && pointerFocusSurface == getWaylandInputSurface();
+        pointerX = wl_fixed_to_int(sx) + (onInputSurface ? static_cast<int>(getWaylandInputSurfaceX()) : 0);
+        pointerY = wl_fixed_to_int(sy) + (onInputSurface ? static_cast<int>(getWaylandInputSurfaceY()) : 0);
+    }
+
+    // Every event libwayland 1.26 defines has an entry: a pointer bound at the
+    // seat's version can be sent any of them.
     static const wl_pointer_listener pointerListener = {
         .enter = pointerEnter,
         .leave = pointerLeave,
@@ -176,7 +194,8 @@ namespace VkHook
         .axis_stop = pointerAxisStop,
         .axis_discrete = pointerAxisDiscrete,
         .axis_value120 = pointerAxisValue120,
-        // .axis_relative_direction removed in newer wayland-protocols
+        .axis_relative_direction = pointerAxisRelativeDirection,
+        .warp = pointerWarp,
     };
 
     // Called by shared seat listener when pointer capability is available

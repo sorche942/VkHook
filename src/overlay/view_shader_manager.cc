@@ -1,4 +1,5 @@
 #include "imgui_overlay.hh"
+#include "persist.hh"
 #include "config_serializer.hh"
 #include "logger.hh"
 #include "overlay/ui_theme.hh"
@@ -15,21 +16,6 @@
 
 namespace VkHook
 {
-    // Defined in view_shader_test.cpp
-    void renderShaderTestResultsUI(
-        const std::vector<std::tuple<std::string, std::string, bool, std::string>>& results,
-        const std::set<std::string>& depthShaderNames);
-}
-
-namespace VkHook
-{
-    // Static file browser for adding directories
-    static ImGui::FileBrowser dirBrowser(
-        ImGuiFileBrowserFlags_SelectDirectory |
-        ImGuiFileBrowserFlags_HideRegularFiles |
-        ImGuiFileBrowserFlags_CloseOnEsc |
-        ImGuiFileBrowserFlags_CreateNewDir);
-
     // Case-insensitive string comparison
     static bool equalsIgnoreCase(const std::string& a, const std::string& b)
     {
@@ -73,6 +59,12 @@ namespace VkHook
 
     void ImGuiOverlay::renderShaderManagerView()
     {
+        if (!dirBrowser)
+            dirBrowser = std::make_shared<ImGui::FileBrowser>(
+                ImGuiFileBrowserFlags_SelectDirectory | ImGuiFileBrowserFlags_HideRegularFiles |
+                ImGuiFileBrowserFlags_CloseOnEsc | ImGuiFileBrowserFlags_CreateNewDir);
+        ImGui::FileBrowser& browser = *dirBrowser;
+
         // Load config on first open
         if (!shaderMgrInitialized)
         {
@@ -89,7 +81,10 @@ namespace VkHook
             config.parentDirectories = shaderMgrParentDirs;
             config.discoveredShaderPaths = shaderMgrShaderPaths;
             config.discoveredTexturePaths = shaderMgrTexturePaths;
-            ConfigSerializer::saveShaderManagerConfig(config);
+            PersistenceQueue::instance().write(ConfigSerializer::getBaseConfigDir() + "/shader_manager.conf",
+                                               [config = std::move(config)] {
+                                                   return ConfigSerializer::saveShaderManagerConfig(config);
+                                               });
             shaderPathsChanged = true;
         };
 
@@ -115,10 +110,10 @@ namespace VkHook
                 else if (result == FileDialogResult::Unavailable)
                 {
                     // No portal: fall back to the in-overlay browser.
-                    dirBrowser.SetTitle("Select Parent Directory");
+                    browser.SetTitle("Select Parent Directory");
                     const char* home = std::getenv("HOME");
-                    dirBrowser.SetPwd(home ? home : "/");
-                    dirBrowser.Open();
+                    browser.SetPwd(home ? home : "/");
+                    browser.Open();
                 }
             }
         }
@@ -137,10 +132,10 @@ namespace VkHook
             if (!settingsManager.getUsePortalIntegration()
                 || !startOpenDirectoryDialog("Select Parent Directory"))
             {
-                dirBrowser.SetTitle("Select Parent Directory");
+                browser.SetTitle("Select Parent Directory");
                 const char* home = std::getenv("HOME");
-                dirBrowser.SetPwd(home ? home : "/");
-                dirBrowser.Open();
+                browser.SetPwd(home ? home : "/");
+                browser.Open();
             }
         }
         ImGui::EndDisabled();
@@ -234,15 +229,15 @@ namespace VkHook
         ImGui::SeparatorText("Shader Test");
         renderShaderTestSection();
         if (shaderTestComplete)
-            renderShaderTestResultsUI(shaderTestResults, depthShaders);
+            renderShaderTestResults(shaderTestResults, depthShaders);
 
         ImGui::EndChild();
 
         // Display file browser (must be called every frame when open)
-        dirBrowser.Display();
-        if (dirBrowser.HasSelected())
+        browser.Display();
+        if (browser.HasSelected())
         {
-            std::string selectedPath = dirBrowser.GetSelected().string();
+            std::string selectedPath = browser.GetSelected().string();
             // Avoid duplicates
             bool exists = false;
             for (const auto& dir : shaderMgrParentDirs)
@@ -258,7 +253,7 @@ namespace VkHook
                 shaderMgrParentDirs.push_back(selectedPath);
                 saveConfig();
             }
-            dirBrowser.ClearSelected();
+            browser.ClearSelected();
         }
 
     }

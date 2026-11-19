@@ -190,7 +190,7 @@ namespace VkHook
 
     // Render detailed test results in collapsible sections
     // Call this separately after the main shader manager content
-    static void renderShaderTestResults(
+    void renderShaderTestResults(
         const std::vector<std::tuple<std::string, std::string, bool, std::string>>& results,
         const std::set<std::string>& depthShaderNames)
     {
@@ -249,14 +249,3 @@ namespace VkHook
     }
 
 } // namespace VkHook
-
-// Expose renderShaderTestResults for use by view_shader_manager.cpp
-namespace VkHook
-{
-    void renderShaderTestResultsUI(
-        const std::vector<std::tuple<std::string, std::string, bool, std::string>>& results,
-        const std::set<std::string>& depthShaderNames)
-    {
-        renderShaderTestResults(results, depthShaderNames);
-    }
-}

@@ -805,7 +805,9 @@ Each test is a small `main()` that prints `N checks, M failures` and exits non-z
 
 **vk handle ordering** (`src/render/vk_handle_test.cc`). Exercises `DeferredDestroyQueue`: releases run in ascending phase order, within a phase in reverse registration order, `flush` drains exactly once, and `discard` drops without running. Tells you that a view is destroyed before the image it was made from and device memory is freed last — the order that keeps a driver from faulting during teardown, which a headless test cannot observe through a real GPU.
 
-**async writer** (`src/core/async_writer_test.cc`). Exercises the background `AsyncWriter`: jobs run FIFO, a throwing job does not poison the queue, a null job is dropped, `waitForIdle` returns on an unused writer, and concurrent submitters lose nothing. Tells you that profile and settings writes leave the present thread without being dropped or reordered.
+**persistence queue** (`src/tests/persist_test.cc`). Exercises `PersistenceQueue`, the one writer for every user-file mutation: jobs run FIFO, repeated writes to one key coalesce to the newest, a throwing job does not poison the queue, shutdown drains and later submits resolve `false`, and a queued autosave can never resurrect a deleted preset. Also checks the `SettingsManager` snapshot and queued save. Tells you that profile and settings writes leave the present thread without being dropped, reordered or undone.
+
+**field parse** (`src/tests/field_parse_test.cc`). Pins the `std::from_chars` grammar of the overlay numeric field editors: exact component count, no partial application, no negatives for unsigned, no trailing junk.
 
 **compile cache** (`src/effects/compile_cache_test.cc`). Exercises `CompileCache`: store/lookup round-trip, source and flag partitioning, re-store is a no-op, FIFO eviction at capacity, `clear`, hash determinism, and a threaded store/lookup. Tells you the cache that keeps a chain reload from re-parsing every ReShade effect is keyed correctly and bounded.
 

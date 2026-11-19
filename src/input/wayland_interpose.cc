@@ -35,6 +35,9 @@ namespace VkHook { void mirrorButtonState(uint32_t button, bool pressed); }
 #include <string>
 #include <algorithm>
 #include <cstdlib>
+#include <memory>
+#include <unistd.h>
+#include <vector>
 
 namespace VkHook
 {
@@ -93,81 +96,172 @@ static bool pointerBlocked()
 }
 
 // ── Game listener storage ────────────────────────────────────────────────────
+//
+// The game's listener table is copied when it registers, only as far as the
+// version the game bound: a client built against older headers owns a shorter
+// table, and reading the full current struct would run past it. Entries for
+// events the game never knew stay null and are skipped.
+//
+// Registered with the game's own user data, so wl_proxy_get_user_data returns
+// what the game stored and the wrappers can hand `data` straight back.
+//
+// Nothing here calls into the game while gameDataMutex is held: handlers run
+// arbitrary game code, which may itself add listeners (re-entering this
+// module) or block. Wrappers look an entry up under the lock, then call out
+// with a shared_ptr snapshot after releasing it.
 
-// Per-proxy data for wrapped game listeners. We store the game's original
-// listener and user_data so we can forward events when not blocking.
-struct GamePointerData
+struct GamePointer
 {
-    wl_pointer_listener original;
-    void* userData;
+    wl_pointer_listener listener{};
 };
 
-struct GameKeyboardData
+struct GameKeyboard
 {
-    wl_keyboard_listener original;
-    void* userData;
+    wl_keyboard_listener listener{};
+};
+
+struct GameDispatcher
+{
+    wl_dispatcher_func_t original = nullptr;
+    const void* dispatcherData = nullptr;
 };
 
 static std::mutex gameDataMutex;
-static std::unordered_map<wl_pointer*, GamePointerData> gamePointers;
-static std::unordered_map<wl_keyboard*, GameKeyboardData> gameKeyboards;
+static std::unordered_map<wl_proxy*, std::shared_ptr<const GamePointer>> gamePointers;
+static std::unordered_map<wl_proxy*, std::shared_ptr<const GameKeyboard>> gameKeyboards;
+static std::unordered_map<wl_proxy*, std::shared_ptr<const GameDispatcher>> gamePointerDispatchers;
+static std::unordered_map<wl_proxy*, std::shared_ptr<const GameDispatcher>> gameKeyboardDispatchers;
 
 // Keys the game currently holds, tracked even while blocked so a hitbox
 // crossing can release exactly those and re-press whatever is still held.
-static std::unordered_map<wl_keyboard*, std::unordered_set<uint32_t>> gameHeldKeys;
+static std::unordered_map<wl_proxy*, std::unordered_set<uint32_t>> gameHeldKeys;
 
-struct GamePointerDispatcherData
+template <typename Map>
+static auto lookupEntry(Map& map, wl_proxy* proxy) -> typename Map::mapped_type
 {
-    wl_dispatcher_func_t original;
-    const void* dispatcherData;
-};
+    std::lock_guard<std::mutex> lock(gameDataMutex);
+    auto it = map.find(proxy);
+    return it == map.end() ? typename Map::mapped_type{} : it->second;
+}
 
-struct GameKeyboardDispatcherData
+// ── Withheld keys ────────────────────────────────────────────────────────────
+//
+// The input blocker asks, from the present thread, for the game's held keys to
+// be released (overlay took the keyboard) or re-pressed (it gave it back). The
+// game's key handlers belong to the thread that dispatches the game's event
+// queue, so they must not run on the present thread. The request is parked in
+// an atomic and carried out by whichever wrapper runs next on the game's
+// dispatch thread, before that event is processed. The cost is a bounded delay:
+// the release lands with the next event the compositor sends the game, which
+// while the pointer or keyboard is in use is immediate.
+
+static std::atomic<bool> g_withholdWanted{false};
+static std::atomic<bool> g_withholdApplied{false};
+
+static void synthesizeKey(wl_proxy* kb, uint32_t key, uint32_t state)
 {
-    wl_dispatcher_func_t original;
-    const void* dispatcherData;
-};
+    std::shared_ptr<const GameKeyboard> listener;
+    std::shared_ptr<const GameDispatcher> dispatcher;
+    {
+        std::lock_guard<std::mutex> lock(gameDataMutex);
+        if (auto it = gameKeyboards.find(kb); it != gameKeyboards.end())
+            listener = it->second;
+        if (auto it = gameKeyboardDispatchers.find(kb); it != gameKeyboardDispatchers.end())
+            dispatcher = it->second;
+    }
+    // serial and time are zero: these are not compositor events
+    if (listener && listener->listener.key)
+        listener->listener.key(wl_proxy_get_user_data(kb), reinterpret_cast<wl_keyboard*>(kb), 0, 0, key, state);
+    if (dispatcher && dispatcher->original)
+    {
+        union wl_argument args[4] = {};
+        args[2].u = key;
+        args[3].u = state;
+        dispatcher->original(dispatcher->dispatcherData, kb, 3, &wl_keyboard_interface.events[3], args);
+    }
+}
 
-static std::unordered_map<wl_proxy*, GamePointerDispatcherData> gamePointerDispatchers;
-static std::unordered_map<wl_proxy*, GameKeyboardDispatcherData> gameKeyboardDispatchers;
+static void applyPendingWithhold()
+{
+    bool wanted = g_withholdWanted.load(std::memory_order_acquire);
+    bool applied = g_withholdApplied.load(std::memory_order_acquire);
+    if (wanted == applied)
+        return;
+    // one thread carries out each transition
+    if (!g_withholdApplied.compare_exchange_strong(applied, wanted, std::memory_order_acq_rel))
+        return;
+
+    std::vector<std::pair<wl_proxy*, uint32_t>> keys;
+    {
+        std::lock_guard<std::mutex> lock(gameDataMutex);
+        for (const auto& [kb, held] : gameHeldKeys)
+            for (uint32_t key : held)
+                keys.emplace_back(kb, key);
+    }
+
+    const uint32_t state = wanted ? WL_KEYBOARD_KEY_STATE_RELEASED : WL_KEYBOARD_KEY_STATE_PRESSED;
+    for (const auto& [kb, key] : keys)
+        synthesizeKey(kb, key, state);
+
+    if (!keys.empty())
+        VkHook::Logger::debug(std::string("Wayland interpose: ") + (wanted ? "released " : "re-pressed ")
+                              + std::to_string(keys.size()) + " held game key(s)");
+}
+
+static void noteKey(wl_proxy* kb, uint32_t key, uint32_t state)
+{
+    std::lock_guard<std::mutex> lock(gameDataMutex);
+    std::unordered_set<uint32_t>& held = gameHeldKeys[kb];
+    if (state == WL_KEYBOARD_KEY_STATE_PRESSED)
+        held.insert(key);
+    else
+        held.erase(key);
+}
+
+static void forgetKeys(wl_proxy* kb)
+{
+    std::lock_guard<std::mutex> lock(gameDataMutex);
+    gameHeldKeys.erase(kb);
+}
 
 // ── Wrapper pointer listener ─────────────────────────────────────────────────
 
 static void wp_enter(void* data, wl_pointer* p, uint32_t serial, wl_surface* s, wl_fixed_t x, wl_fixed_t y)
 {
+    applyPendingWithhold();
     g_lastPointerX.store(wl_fixed_to_double(x), std::memory_order_release);
     g_lastPointerY.store(wl_fixed_to_double(y), std::memory_order_release);
-    std::lock_guard<std::mutex> lock(gameDataMutex);
-    auto it = gamePointers.find(p);
-    if (it != gamePointers.end() && it->second.original.enter)
-        it->second.original.enter(it->second.userData, p, serial, s, x, y);
+    auto game = lookupEntry(gamePointers, (wl_proxy*)p);
+    if (game && game->listener.enter)
+        game->listener.enter(data, p, serial, s, x, y);
 }
 
 static void wp_leave(void* data, wl_pointer* p, uint32_t serial, wl_surface* s)
 {
+    applyPendingWithhold();
     // Always forward leave — the game needs to know it lost focus
-    std::lock_guard<std::mutex> lock(gameDataMutex);
-    auto it = gamePointers.find(p);
-    if (it != gamePointers.end() && it->second.original.leave)
-        it->second.original.leave(it->second.userData, p, serial, s);
+    auto game = lookupEntry(gamePointers, (wl_proxy*)p);
+    if (game && game->listener.leave)
+        game->listener.leave(data, p, serial, s);
 }
 
 static void wp_motion(void* data, wl_pointer* p, uint32_t time, wl_fixed_t x, wl_fixed_t y)
 {
+    applyPendingWithhold();
     const double fx = wl_fixed_to_double(x);
     const double fy = wl_fixed_to_double(y);
     g_lastPointerX.store(fx, std::memory_order_release);
     g_lastPointerY.store(fy, std::memory_order_release);
     if (VkHook::isInputBlockedAt((float)fx, (float)fy))
         return;
-    std::lock_guard<std::mutex> lock(gameDataMutex);
-    auto it = gamePointers.find(p);
-    if (it != gamePointers.end() && it->second.original.motion)
-        it->second.original.motion(it->second.userData, p, time, x, y);
+    auto game = lookupEntry(gamePointers, (wl_proxy*)p);
+    if (game && game->listener.motion)
+        game->listener.motion(data, p, time, x, y);
 }
 
 static void wp_button(void* data, wl_pointer* p, uint32_t serial, uint32_t time, uint32_t button, uint32_t state)
 {
+    applyPendingWithhold();
     // Always mirror button state to overlay — the game's pointer receives
     // releases via Wayland's implicit grab that our overlay pointer never sees.
     if (VkHook::isWayland())
@@ -175,72 +269,98 @@ static void wp_button(void* data, wl_pointer* p, uint32_t serial, uint32_t time,
 
     if (pointerBlocked())
         return;
-    std::lock_guard<std::mutex> lock(gameDataMutex);
-    auto it = gamePointers.find(p);
-    if (it != gamePointers.end() && it->second.original.button)
-        it->second.original.button(it->second.userData, p, serial, time, button, state);
+    auto game = lookupEntry(gamePointers, (wl_proxy*)p);
+    if (game && game->listener.button)
+        game->listener.button(data, p, serial, time, button, state);
 }
 
 static void wp_axis(void* data, wl_pointer* p, uint32_t time, uint32_t axis, wl_fixed_t value)
 {
+    applyPendingWithhold();
     if (pointerBlocked())
         return;
-    std::lock_guard<std::mutex> lock(gameDataMutex);
-    auto it = gamePointers.find(p);
-    if (it != gamePointers.end() && it->second.original.axis)
-        it->second.original.axis(it->second.userData, p, time, axis, value);
+    auto game = lookupEntry(gamePointers, (wl_proxy*)p);
+    if (game && game->listener.axis)
+        game->listener.axis(data, p, time, axis, value);
 }
 
 static void wp_frame(void* data, wl_pointer* p)
 {
+    applyPendingWithhold();
     if (pointerBlocked())
         return;
-    std::lock_guard<std::mutex> lock(gameDataMutex);
-    auto it = gamePointers.find(p);
-    if (it != gamePointers.end() && it->second.original.frame)
-        it->second.original.frame(it->second.userData, p);
+    auto game = lookupEntry(gamePointers, (wl_proxy*)p);
+    if (game && game->listener.frame)
+        game->listener.frame(data, p);
 }
 
 static void wp_axis_source(void* data, wl_pointer* p, uint32_t source)
 {
+    applyPendingWithhold();
     if (pointerBlocked())
         return;
-    std::lock_guard<std::mutex> lock(gameDataMutex);
-    auto it = gamePointers.find(p);
-    if (it != gamePointers.end() && it->second.original.axis_source)
-        it->second.original.axis_source(it->second.userData, p, source);
+    auto game = lookupEntry(gamePointers, (wl_proxy*)p);
+    if (game && game->listener.axis_source)
+        game->listener.axis_source(data, p, source);
 }
 
 static void wp_axis_stop(void* data, wl_pointer* p, uint32_t time, uint32_t axis)
 {
+    applyPendingWithhold();
     if (pointerBlocked())
         return;
-    std::lock_guard<std::mutex> lock(gameDataMutex);
-    auto it = gamePointers.find(p);
-    if (it != gamePointers.end() && it->second.original.axis_stop)
-        it->second.original.axis_stop(it->second.userData, p, time, axis);
+    auto game = lookupEntry(gamePointers, (wl_proxy*)p);
+    if (game && game->listener.axis_stop)
+        game->listener.axis_stop(data, p, time, axis);
 }
 
 static void wp_axis_discrete(void* data, wl_pointer* p, uint32_t axis, int32_t discrete)
 {
+    applyPendingWithhold();
     if (pointerBlocked())
         return;
-    std::lock_guard<std::mutex> lock(gameDataMutex);
-    auto it = gamePointers.find(p);
-    if (it != gamePointers.end() && it->second.original.axis_discrete)
-        it->second.original.axis_discrete(it->second.userData, p, axis, discrete);
+    auto game = lookupEntry(gamePointers, (wl_proxy*)p);
+    if (game && game->listener.axis_discrete)
+        game->listener.axis_discrete(data, p, axis, discrete);
 }
 
 static void wp_axis_value120(void* data, wl_pointer* p, uint32_t axis, int32_t value120)
 {
+    applyPendingWithhold();
     if (pointerBlocked())
         return;
-    std::lock_guard<std::mutex> lock(gameDataMutex);
-    auto it = gamePointers.find(p);
-    if (it != gamePointers.end() && it->second.original.axis_value120)
-        it->second.original.axis_value120(it->second.userData, p, axis, value120);
+    auto game = lookupEntry(gamePointers, (wl_proxy*)p);
+    if (game && game->listener.axis_value120)
+        game->listener.axis_value120(data, p, axis, value120);
 }
 
+// wl_pointer v9
+static void wp_axis_relative_direction(void* data, wl_pointer* p, uint32_t axis, uint32_t direction)
+{
+    applyPendingWithhold();
+    if (pointerBlocked())
+        return;
+    auto game = lookupEntry(gamePointers, (wl_proxy*)p);
+    if (game && game->listener.axis_relative_direction)
+        game->listener.axis_relative_direction(data, p, axis, direction);
+}
+
+// wl_pointer v11: a compositor-initiated warp of the pointer position
+static void wp_warp(void* data, wl_pointer* p, wl_fixed_t x, wl_fixed_t y)
+{
+    applyPendingWithhold();
+    g_lastPointerX.store(wl_fixed_to_double(x), std::memory_order_release);
+    g_lastPointerY.store(wl_fixed_to_double(y), std::memory_order_release);
+    if (VkHook::isInputBlockedAt((float)wl_fixed_to_double(x), (float)wl_fixed_to_double(y)))
+        return;
+    auto game = lookupEntry(gamePointers, (wl_proxy*)p);
+    if (game && game->listener.warp)
+        game->listener.warp(data, p, x, y);
+}
+
+// Every event of every version libwayland 1.26 knows has an entry: a missing
+// one is a null (or out-of-table) function pointer that libwayland calls or
+// aborts on as soon as the compositor sends that event to a newer client.
 static const wl_pointer_listener wrapperPointerListener = {
     .enter = wp_enter,
     .leave = wp_leave,
@@ -252,75 +372,74 @@ static const wl_pointer_listener wrapperPointerListener = {
     .axis_stop = wp_axis_stop,
     .axis_discrete = wp_axis_discrete,
     .axis_value120 = wp_axis_value120,
-    // .axis_relative_direction removed in newer wayland-protocols
+    .axis_relative_direction = wp_axis_relative_direction,
+    .warp = wp_warp,
 };
 
 // ── Wrapper keyboard listener ────────────────────────────────────────────────
 
 static void wk_keymap(void* data, wl_keyboard* kb, uint32_t format, int32_t fd, uint32_t size)
 {
+    applyPendingWithhold();
     // Always forward keymap — needed for initialization
-    std::lock_guard<std::mutex> lock(gameDataMutex);
-    auto it = gameKeyboards.find(kb);
-    if (it != gameKeyboards.end() && it->second.original.keymap)
-        it->second.original.keymap(it->second.userData, kb, format, fd, size);
+    auto game = lookupEntry(gameKeyboards, (wl_proxy*)kb);
+    if (game && game->listener.keymap)
+        game->listener.keymap(data, kb, format, fd, size);
+    else
+        close(fd);  // the protocol hands us ownership of the descriptor
 }
 
 static void wk_enter(void* data, wl_keyboard* kb, uint32_t serial, wl_surface* s, wl_array* keys)
 {
+    applyPendingWithhold();
     // Forward enter so the game's keyboard state stays consistent; individual
     // keys are withheld in wk_key while the pointer is over the overlay.
-    std::lock_guard<std::mutex> lock(gameDataMutex);
-    auto it = gameKeyboards.find(kb);
-    if (it != gameKeyboards.end() && it->second.original.enter)
-        it->second.original.enter(it->second.userData, kb, serial, s, keys);
+    auto game = lookupEntry(gameKeyboards, (wl_proxy*)kb);
+    if (game && game->listener.enter)
+        game->listener.enter(data, kb, serial, s, keys);
 }
 
 static void wk_leave(void* data, wl_keyboard* kb, uint32_t serial, wl_surface* s)
 {
+    applyPendingWithhold();
     // Always forward leave
-    std::lock_guard<std::mutex> lock(gameDataMutex);
-    auto it = gameKeyboards.find(kb);
-    if (it != gameKeyboards.end() && it->second.original.leave)
-        it->second.original.leave(it->second.userData, kb, serial, s);
+    auto game = lookupEntry(gameKeyboards, (wl_proxy*)kb);
+    if (game && game->listener.leave)
+        game->listener.leave(data, kb, serial, s);
+    // the compositor releases every key on focus loss; so must our record of
+    // them, or a later withhold would "release" keys the game never saw held
+    forgetKeys((wl_proxy*)kb);
 }
 
 static void wk_key(void* data, wl_keyboard* kb, uint32_t serial, uint32_t time, uint32_t key, uint32_t state)
 {
-    {
-        std::lock_guard<std::mutex> lock(gameDataMutex);
-        std::unordered_set<uint32_t>& held = gameHeldKeys[kb];
-        if (state == WL_KEYBOARD_KEY_STATE_PRESSED)
-            held.insert(key);
-        else
-            held.erase(key);
-    }
+    applyPendingWithhold();
+    noteKey((wl_proxy*)kb, key, state);
 
     // keys follow the pointer hitbox plus the overlay's own key consumption
     if (pointerBlocked() || VkHook::isOverlayConsumingKeys())
         return;
-    std::lock_guard<std::mutex> lock(gameDataMutex);
-    auto it = gameKeyboards.find(kb);
-    if (it != gameKeyboards.end() && it->second.original.key)
-        it->second.original.key(it->second.userData, kb, serial, time, key, state);
+    auto game = lookupEntry(gameKeyboards, (wl_proxy*)kb);
+    if (game && game->listener.key)
+        game->listener.key(data, kb, serial, time, key, state);
 }
 
 static void wk_modifiers(void* data, wl_keyboard* kb, uint32_t serial, uint32_t depressed, uint32_t latched, uint32_t locked, uint32_t group)
 {
+    applyPendingWithhold();
     // Always forward modifiers — games need modifier state for keybinds
-    std::lock_guard<std::mutex> lock(gameDataMutex);
-    auto it = gameKeyboards.find(kb);
-    if (it != gameKeyboards.end() && it->second.original.modifiers)
-        it->second.original.modifiers(it->second.userData, kb, serial, depressed, latched, locked, group);
+    auto game = lookupEntry(gameKeyboards, (wl_proxy*)kb);
+    if (game && game->listener.modifiers)
+        game->listener.modifiers(data, kb, serial, depressed, latched, locked, group);
 }
 
 static void wk_repeat_info(void* data, wl_keyboard* kb, int32_t rate, int32_t delay)
 {
+    applyPendingWithhold();
     // Always forward repeat info
-    std::lock_guard<std::mutex> lock(gameDataMutex);
-    auto it = gameKeyboards.find(kb);
-    if (it != gameKeyboards.end() && it->second.original.repeat_info)
-        it->second.original.repeat_info(it->second.userData, kb, rate, delay);
+    auto game = lookupEntry(gameKeyboards, (wl_proxy*)kb);
+    if (game && game->listener.repeat_info)
+        game->listener.repeat_info(data, kb, rate, delay);
 }
 
 static const wl_keyboard_listener wrapperKeyboardListener = {
@@ -337,9 +456,10 @@ static const wl_keyboard_listener wrapperKeyboardListener = {
 static int wd_pointer(const void* data, void* target, uint32_t opcode, const struct wl_message* msg, union wl_argument* args)
 {
     auto* proxy = static_cast<wl_proxy*>(target);
+    applyPendingWithhold();
 
-    // enter/motion carry surface coords; remember the latest for the events
-    // that do not (button, axis, frame).
+    // enter/motion/warp carry surface coords; remember the latest for the
+    // events that do not (button, axis, frame).
     if (opcode == 0) // enter: serial, surface, x, y
     {
         g_lastPointerX.store(wl_fixed_to_double(args[2].f), std::memory_order_release);
@@ -350,45 +470,44 @@ static int wd_pointer(const void* data, void* target, uint32_t opcode, const str
         g_lastPointerX.store(wl_fixed_to_double(args[1].f), std::memory_order_release);
         g_lastPointerY.store(wl_fixed_to_double(args[2].f), std::memory_order_release);
     }
+    else if (opcode == 11) // warp: x, y
+    {
+        g_lastPointerX.store(wl_fixed_to_double(args[0].f), std::memory_order_release);
+        g_lastPointerY.store(wl_fixed_to_double(args[1].f), std::memory_order_release);
+    }
 
     if (opcode == 3 && VkHook::isWayland())
         VkHook::mirrorButtonState(args[2].u, args[3].u == WL_POINTER_BUTTON_STATE_PRESSED);
 
     // forward enter/leave so the game tracks the pointer, withhold everything
-    // positional while it sits over the overlay.
-    if (opcode >= 2 && opcode <= 10 && pointerBlocked())
+    // positional while it sits over the overlay (motion .. warp).
+    if (opcode >= 2 && opcode <= 11 && pointerBlocked())
         return 0;
 
-    std::lock_guard<std::mutex> lock(gameDataMutex);
-    auto it = gamePointerDispatchers.find(proxy);
-    if (it != gamePointerDispatchers.end() && it->second.original)
-        return it->second.original(it->second.dispatcherData, target, opcode, msg, args);
+    auto game = lookupEntry(gamePointerDispatchers, proxy);
+    if (game && game->original)
+        return game->original(game->dispatcherData, target, opcode, msg, args);
     return 0;
 }
 
 static int wd_keyboard(const void* data, void* target, uint32_t opcode, const struct wl_message* msg, union wl_argument* args)
 {
     auto* proxy = static_cast<wl_proxy*>(target);
+    applyPendingWithhold();
 
     if (opcode == 3) // key: serial, time, key, state
-    {
-        std::lock_guard<std::mutex> lock(gameDataMutex);
-        std::unordered_set<uint32_t>& held = gameHeldKeys[(wl_keyboard*)proxy];
-        if (args[3].u == WL_KEYBOARD_KEY_STATE_PRESSED)
-            held.insert(args[2].u);
-        else
-            held.erase(args[2].u);
-    }
+        noteKey(proxy, args[2].u, args[3].u);
+    else if (opcode == 2) // leave
+        forgetKeys(proxy);
 
     // keyboard has no coordinates; it follows the hitbox and the overlay's
     // own key consumption
     if (opcode == 3 && (pointerBlocked() || VkHook::isOverlayConsumingKeys()))
         return 0;
 
-    std::lock_guard<std::mutex> lock(gameDataMutex);
-    auto it = gameKeyboardDispatchers.find(proxy);
-    if (it != gameKeyboardDispatchers.end() && it->second.original)
-        return it->second.original(it->second.dispatcherData, target, opcode, msg, args);
+    auto game = lookupEntry(gameKeyboardDispatchers, proxy);
+    if (game && game->original)
+        return game->original(game->dispatcherData, target, opcode, msg, args);
     return 0;
 }
 
@@ -507,36 +626,35 @@ int wl_proxy_add_listener(struct wl_proxy* proxy,
 
     if (std::strcmp(cls, "wl_pointer") == 0)
     {
-        auto* gameListener = (const wl_pointer_listener*)implementation;
-        auto* ptr = (wl_pointer*)proxy;
-
+        auto game = std::make_shared<GamePointer>();
+        // only the entries the bound version defines are the game's to read
+        const uint32_t version = wl_proxy_get_version(proxy);
+        const size_t entries = version >= 11 ? 12 : version >= 9 ? 11 : version >= 8 ? 10 : version >= 5 ? 9 : 5;
+        std::memcpy(&game->listener, implementation, entries * sizeof(void (*)(void)));
         {
             std::lock_guard<std::mutex> lock(gameDataMutex);
-            GamePointerData gpd;
-            gpd.original = *gameListener;
-            gpd.userData = data;
-            gamePointers[ptr] = gpd;
+            gamePointers[proxy] = std::move(game);
         }
 
-        VkHook::Logger::debug("Wayland interpose: wrapped game pointer listener");
-        return real(proxy, (void (**)(void))&wrapperPointerListener, nullptr);
+        VkHook::Logger::debug("Wayland interpose: wrapped game pointer listener (v" + std::to_string(version) + ")");
+        // the game's own user data stays on the proxy
+        return real(proxy, (void (**)(void))&wrapperPointerListener, data);
     }
 
     if (std::strcmp(cls, "wl_keyboard") == 0)
     {
-        auto* gameListener = (const wl_keyboard_listener*)implementation;
-        auto* kb = (wl_keyboard*)proxy;
-
+        auto game = std::make_shared<GameKeyboard>();
+        const uint32_t version = wl_proxy_get_version(proxy);
+        const size_t entries = version >= 4 ? 6 : 5;
+        std::memcpy(&game->listener, implementation, entries * sizeof(void (*)(void)));
         {
             std::lock_guard<std::mutex> lock(gameDataMutex);
-            GameKeyboardData gkd;
-            gkd.original = *gameListener;
-            gkd.userData = data;
-            gameKeyboards[kb] = gkd;
+            gameKeyboards[proxy] = std::move(game);
+            gameHeldKeys.erase(proxy);  // a recycled address must not inherit old keys
         }
 
-        VkHook::Logger::debug("Wayland interpose: wrapped game keyboard listener");
-        return real(proxy, (void (**)(void))&wrapperKeyboardListener, nullptr);
+        VkHook::Logger::debug("Wayland interpose: wrapped game keyboard listener (v" + std::to_string(version) + ")");
+        return real(proxy, (void (**)(void))&wrapperKeyboardListener, data);
     }
 
     return real(proxy, implementation, data);
@@ -560,14 +678,35 @@ wl_proxy* wl_proxy_marshal_array_flags(struct wl_proxy* proxy,
     if (!real)
         return nullptr;
 
-    // hold window commits while Mesa's present may have explicit-sync points
-    // in flight on this surface (see wayland_syncobj_gate.hh); outside a
-    // present the gate is closed and this whole block is one atomic load
-    if (opcode == 6 && VkHook::WaylandSyncobjGate::anyPresentOpen())
+    // a destroying request (wl_keyboard.release, wl_pointer.release) ends the
+    // proxy: forget the game's listener and held keys before the address can be
+    // reused
+    if (flags & WL_MARSHAL_FLAG_DESTROY)
+    {
+        const char* cls = wl_proxy_get_class(proxy);
+        if (cls && (std::strcmp(cls, "wl_keyboard") == 0 || std::strcmp(cls, "wl_pointer") == 0))
+        {
+            std::lock_guard<std::mutex> lock(gameDataMutex);
+            gamePointers.erase(proxy);
+            gamePointerDispatchers.erase(proxy);
+            gameKeyboards.erase(proxy);
+            gameKeyboardDispatchers.erase(proxy);
+            gameHeldKeys.erase(proxy);
+        }
+    }
+
+    // A window commit must not interleave with a present's explicit-sync
+    // points (see wayland_syncobj_gate.hh). The gate's shared lock is held for
+    // the whole send, so a present cannot open between the check and the
+    // marshal; there is no unlocked window to race.
+    if (opcode == 6)
     {
         const char* cls = wl_proxy_get_class(proxy);
         if (cls && std::strcmp(cls, "wl_surface") == 0)
-            VkHook::WaylandSyncobjGate::beginCommit(wl_proxy_get_id(proxy));
+        {
+            VkHook::WaylandSyncobjGate::CommitScope commit(wl_proxy_get_id(proxy));
+            return real(proxy, opcode, iface, version, flags, args);
+        }
     }
 
     return real(proxy, opcode, iface, version, flags, args);
@@ -638,14 +777,12 @@ int wl_proxy_add_dispatcher(struct wl_proxy* proxy,
 
     if (std::strcmp(cls, "wl_pointer") == 0)
     {
-        auto* ptr = static_cast<wl_proxy*>(proxy);
-
+        auto game = std::make_shared<GameDispatcher>();
+        game->original = dispatcher_func;
+        game->dispatcherData = dispatcher_data;
         {
             std::lock_guard<std::mutex> lock(gameDataMutex);
-            GamePointerDispatcherData gpd;
-            gpd.original = dispatcher_func;
-            gpd.dispatcherData = dispatcher_data;
-            gamePointerDispatchers[ptr] = gpd;
+            gamePointerDispatchers[proxy] = std::move(game);
         }
 
         VkHook::Logger::debug("Wayland interpose: wrapped game pointer dispatcher");
@@ -654,14 +791,13 @@ int wl_proxy_add_dispatcher(struct wl_proxy* proxy,
 
     if (std::strcmp(cls, "wl_keyboard") == 0)
     {
-        auto* kb = static_cast<wl_proxy*>(proxy);
-
+        auto game = std::make_shared<GameDispatcher>();
+        game->original = dispatcher_func;
+        game->dispatcherData = dispatcher_data;
         {
             std::lock_guard<std::mutex> lock(gameDataMutex);
-            GameKeyboardDispatcherData gkd;
-            gkd.original = dispatcher_func;
-            gkd.dispatcherData = dispatcher_data;
-            gameKeyboardDispatchers[kb] = gkd;
+            gameKeyboardDispatchers[proxy] = std::move(game);
+            gameHeldKeys.erase(proxy);
         }
 
         VkHook::Logger::debug("Wayland interpose: wrapped game keyboard dispatcher");
@@ -675,44 +811,10 @@ namespace VkHook
 {
     void withholdGameKeys(bool withhold)
     {
-        std::lock_guard<std::mutex> lock(gameDataMutex);
-
-        size_t changed = 0;
-        const uint32_t state = withhold ? WL_KEYBOARD_KEY_STATE_RELEASED : WL_KEYBOARD_KEY_STATE_PRESSED;
-
-        for (auto& [kb, data] : gameKeyboards)
-        {
-            auto heldIt = gameHeldKeys.find(kb);
-            if (heldIt == gameHeldKeys.end())
-                continue;
-            for (uint32_t key : heldIt->second)
-            {
-                if (data.original.key)
-                    data.original.key(data.userData, kb, 0, 0, key, state);
-                changed++;
-            }
-        }
-
-        for (auto& [proxy, data] : gameKeyboardDispatchers)
-        {
-            auto heldIt = gameHeldKeys.find((wl_keyboard*)proxy);
-            if (heldIt == gameHeldKeys.end() || !data.original)
-                continue;
-            for (uint32_t key : heldIt->second)
-            {
-                union wl_argument args[4] = {};
-                args[0].u = 0; // serial
-                args[1].u = 0; // time
-                args[2].u = key;
-                args[3].u = state;
-                data.original(data.dispatcherData, proxy, 3, &wl_keyboard_interface.events[3], args);
-                changed++;
-            }
-        }
-
-        if (changed > 0)
-            Logger::debug(std::string("Wayland interpose: ") + (withhold ? "released " : "re-pressed ")
-                          + std::to_string(changed) + " held game key(s)");
+        // Only records the request. The game's handlers must run on the thread
+        // that dispatches the game's queue, never here on the present thread,
+        // so the next wrapper to run there carries it out.
+        g_withholdWanted.store(withhold, std::memory_order_release);
     }
 } // namespace VkHook
 

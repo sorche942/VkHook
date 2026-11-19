@@ -10,10 +10,9 @@
 #include "keyboard_input.hh"
 #include "input_blocker.hh"
 #include "config_serializer.hh"
-#include "async_writer.hh"
+#include "persist.hh"
 #include "wayland_display.hh"
 #include "x11_display.hh"
-#include "wayland_pointer_constraints.hh"
 #include "wayland_input_common.hh"
 
 #include <algorithm>
@@ -127,11 +126,48 @@ namespace VkHook
         return (PFN_vkVoidFunction)dummyVulkanFunc;
     }
 
+    static ImGuiKey toImGuiKey(NavKey key)
+    {
+        switch (key)
+        {
+            case NavKey::Backspace: return ImGuiKey_Backspace;
+            case NavKey::Delete: return ImGuiKey_Delete;
+            case NavKey::Enter: return ImGuiKey_Enter;
+            case NavKey::Left: return ImGuiKey_LeftArrow;
+            case NavKey::Right: return ImGuiKey_RightArrow;
+            case NavKey::Up: return ImGuiKey_UpArrow;
+            case NavKey::Down: return ImGuiKey_DownArrow;
+            case NavKey::Home: return ImGuiKey_Home;
+            case NavKey::End: return ImGuiKey_End;
+            case NavKey::PageUp: return ImGuiKey_PageUp;
+            case NavKey::PageDown: return ImGuiKey_PageDown;
+            case NavKey::Tab: return ImGuiKey_Tab;
+            case NavKey::Escape: return ImGuiKey_Escape;
+            case NavKey::Count: break;
+        }
+        return ImGuiKey_None;
+    }
+
+    ImGuiOverlay::ContextScope::ContextScope(ImGuiContext* context) : previous(ImGui::GetCurrentContext())
+    {
+        ImGui::SetCurrentContext(context);
+    }
+
+    ImGuiOverlay::ContextScope::~ContextScope()
+    {
+        ImGui::SetCurrentContext(previous);
+    }
+
     ImGuiOverlay::ImGuiOverlay(LogicalDevice* device, VkFormat swapchainFormat, uint32_t imageCount, OverlayPersistentState* persistentState)
         : logicalDevice(device), pPersistentState(persistentState)
     {
         IMGUI_CHECKVERSION();
-        ImGui::CreateContext();
+        // Each overlay owns its context. CreateContext makes it current; the
+        // scope puts back whatever the host (or another overlay) had.
+        ContextScope previous(ImGui::GetCurrentContext());
+        imguiContext = ImGui::CreateContext();
+        ImGui::SetCurrentContext(imguiContext);
+
         // imconfig disables ImGui's default shell handler, so TextLinkOpenURL
         // would silently do nothing. route it through our xdg-open helper.
         ImGui::GetPlatformIO().Platform_OpenInShellFn = [](ImGuiContext*, const char* url) -> bool
@@ -148,7 +184,7 @@ namespace VkHook
                                 std::istreambuf_iterator<char>());
 
         if (!iniContent.empty())
-            ImGui::LoadIniSettingsFromDisk(iniPath.c_str());
+            ImGui::LoadIniSettingsFromMemory(iniContent.c_str(), iniContent.size());
 
         ImGui::StyleColorsDark();
         ImFontConfig fontConfig;
@@ -156,6 +192,7 @@ namespace VkHook
         io.Fonts->AddFontDefault(&fontConfig);
         Logger::info("ImGui: standard dark style and default font");
 
+        depthCaptureAtStartup = settingsManager.getDepthCapture();
         initVulkanBackend(swapchainFormat, imageCount);
 
         // Restore UI preferences from persistent state
@@ -170,29 +207,36 @@ namespace VkHook
 
     ImGuiOverlay::~ImGuiOverlay()
     {
-        if (!initialized) return;
+        ImGuiContext* const previousContext = ImGui::GetCurrentContext();
+        ImGui::SetCurrentContext(imguiContext);
 
         // Auto-save profile on shutdown (before GPU cleanup)
-        if ((profileDirty || paramsDirty) && (!activeProfilePath.empty() || !activeShaderProfilePath.empty()))
+        if (initialized && (profileDirty || paramsDirty) && (!activeProfilePath.empty() || !activeShaderProfilePath.empty()))
             autoSaveProfile();
 
-        // the auto-save is queued on the writer thread; make sure it lands before
+        if (initialized)
+        {
+            const std::string iniPath = ConfigSerializer::getBaseConfigDir() + "/imgui.ini";
+            std::string iniText = ImGui::SaveIniSettingsToMemory();
+            PersistenceQueue::instance().write(iniPath, [iniPath, iniText = std::move(iniText)] {
+                return writeAtomically(iniPath, iniText);
+            });
+        }
+
+        // the saves are queued on the writer thread; make sure they land before
         // the layer tears down rather than racing process exit.
-        AsyncWriter::instance().waitForIdle();
+        PersistenceQueue::instance().waitForIdle();
 
         logicalDevice->vkd.QueueWaitIdle(logicalDevice->queue);
-
-        // Clean up Wayland resources before destroying the event queue
-        if (isWayland())
-            cleanupPointerConstraints();
-
-        std::string iniPath = ConfigSerializer::getBaseConfigDir() + "/imgui.ini";
-        ImGui::SaveIniSettingsToDisk(iniPath.c_str());
 
         // Release ImGui's descriptor references before the deferred pool teardown.
         if (backendInitialized)
             ImGui_ImplVulkan_Shutdown();
-        ImGui::DestroyContext();
+        ImGuiContext* const owned = imguiContext;
+        ImGui::DestroyContext(owned);
+        imguiContext = nullptr;
+        // hand back whichever context the host had, unless that was ours
+        ImGui::SetCurrentContext(previousContext == owned ? nullptr : previousContext);
 
         // Deferred, like every other owner. The QueueWaitIdle above already makes
         // this a safe moment, but inline destruction still meant that an overlay
@@ -240,10 +284,6 @@ namespace VkHook
         Logger::debug(std::string("overlay toggled ") + (visible ? "on" : "off"));
         setInputBlocked(visible);
 
-        // Pointer confinement was removed: the overlay renders inside the game's
-        // surface, so confining the pointer doesn't prevent the compositor from
-        // interpreting clicks as window-move grabs.
-
         saveToPersistentState();
     }
 
@@ -265,16 +305,25 @@ namespace VkHook
                 : (shaderProfiles.empty() ? std::string() : shaderProfiles.front());
         }
         activeShaderProfilePath = ConfigSerializer::getShaderProfilePath(activeGameName, activeShaderProfileName);
-        if (!activeGameName.empty() && !activeShaderProfileName.empty())
-            ConfigSerializer::setLastShaderProfile(activeGameName, activeShaderProfileName);
+        queueLastShaderProfile();
+    }
+
+    void ImGuiOverlay::queueLastShaderProfile()
+    {
+        if (activeGameName.empty() || activeShaderProfileName.empty())
+            return;
+        PersistenceQueue::instance().other(
+            "last-profile:" + activeGameName,
+            [game = activeGameName, profile = activeShaderProfileName] {
+                return ConfigSerializer::setLastShaderProfile(game, profile);
+            });
     }
 
     void ImGuiOverlay::setActiveShaderProfile(const std::string& profileName)
     {
         activeShaderProfileName = profileName;
         activeShaderProfilePath = ConfigSerializer::getShaderProfilePath(activeGameName, activeShaderProfileName);
-        if (!activeGameName.empty() && !activeShaderProfileName.empty())
-            ConfigSerializer::setLastShaderProfile(activeGameName, activeShaderProfileName);
+        queueLastShaderProfile();
     }
 
     bool ImGuiOverlay::switchShaderProfile(const std::string& profileName)
@@ -416,7 +465,7 @@ namespace VkHook
 
     const std::vector<std::string>& ImGuiOverlay::getSelectedEffects() const
     {
-        static std::vector<std::string> empty;
+        static const std::vector<std::string> empty;  // immutable, so sharing it is harmless
         return effectRegistry ? effectRegistry->getSelectedEffects() : empty;
     }
 
@@ -482,7 +531,13 @@ namespace VkHook
         std::vector<PreprocessorDefinition> allDefs;
         collectSaveData(effects, disabledEffects, params, effectPaths, allDefs, disabledEffectParams);
 
-        ConfigSerializer::saveConfig(saveConfigName, effects, disabledEffects, params, effectPaths, allDefs);
+        const std::string configName = saveConfigName;
+        const std::string path = ConfigSerializer::getConfigsDir() + "/" + configName + ".conf";
+        auto saved = PersistenceQueue::instance().create(path,
+            [configName, effects, disabledEffects, params, effectPaths, allDefs] {
+                return ConfigSerializer::saveConfig(configName, effects, disabledEffects, params, effectPaths, allDefs);
+            });
+        saved.wait();  // an explicit user save: the config list is re-read next
         configListRefreshPending = true;
         profileDirty = false;
     }
@@ -541,13 +596,13 @@ namespace VkHook
             }
         }
 
-        // the job records whether the write succeeded so a blocking caller can
-        // still fail the operation; an async caller only sees the log line.
-        auto ok = std::make_shared<std::atomic<bool>>(true);
-
-        AsyncWriter::instance().submit(
+        // Keyed by the preset file: repeated autosaves coalesce to the newest, and
+        // a delete or rename of that preset cancels them instead of letting a
+        // queued save bring the file back.
+        const std::string queueKey = shaderPath.empty() ? profilePath : shaderPath;
+        std::future<bool> saved = PersistenceQueue::instance().write(queueKey,
             [profilePath, shaderPath, effects, disabledEffects, params, effectPaths,
-             allDefs, disabledEffectParams, disabledFiles, enabledTechniques, techniqueSorting, ok]() mutable
+             allDefs, disabledEffectParams, disabledFiles, enabledTechniques, techniqueSorting]() mutable
             {
                 bool configSaved = true;
                 if (!profilePath.empty())
@@ -603,16 +658,13 @@ namespace VkHook
                     Logger::debug("Auto-saved profile: " + profilePath);
                 else
                     Logger::err("Auto-save failed for profile: " + profilePath);
-                ok->store(shaderSaved && configSaved, std::memory_order_relaxed);
+                return shaderSaved && configSaved;
             });
 
         // the write is queued; mark clean now so the debounce does not re-arm.
         profileDirty = false;
         if (block)
-        {
-            AsyncWriter::instance().waitForIdle();
-            return ok->load(std::memory_order_relaxed);
-        }
+            return saved.get();
         return true;
     }
 
@@ -635,37 +687,8 @@ namespace VkHook
         }
     }
 
-    void ImGuiOverlay::initVulkanBackend(VkFormat swapchainFormat, uint32_t imageCount)
+    bool ImGuiOverlay::createRenderPass(VkFormat swapchainFormat)
     {
-        // Load Vulkan functions for ImGui using VkHook's dispatch tables
-        bool loaded = ImGui_ImplVulkan_LoadFunctions(VK_API_VERSION_1_3, imguiVulkanLoaderDummy, logicalDevice);
-        if (!loaded)
-        {
-            Logger::err("Failed to load Vulkan functions for ImGui");
-            return;
-        }
-        Logger::debug("ImGui Vulkan functions loaded");
-
-        // Create descriptor pool for ImGui
-        VkDescriptorPoolSize poolSizes[] = {
-            { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 100 }
-        };
-
-        VkDescriptorPoolCreateInfo poolInfo = {};
-        poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-        poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-        poolInfo.maxSets = 100;
-        poolInfo.poolSizeCount = 1;
-        poolInfo.pPoolSizes = poolSizes;
-
-        VkResult vr = logicalDevice->vkd.CreateDescriptorPool(logicalDevice->device, &poolInfo, nullptr, &descriptorPool);
-        if (vr != VK_SUCCESS)
-        {
-            Logger::err("Failed to create ImGui descriptor pool: " + std::to_string(vr));
-            return;
-        }
-
-        // Create render pass for ImGui
         VkAttachmentDescription attachment = {};
         attachment.format = swapchainFormat;
         attachment.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -720,12 +743,147 @@ namespace VkHook
         renderPassInfo.dependencyCount = 2;
         renderPassInfo.pDependencies = dependencies;
 
-        vr = logicalDevice->vkd.CreateRenderPass(logicalDevice->device, &renderPassInfo, nullptr, &renderPass);
+        const VkResult vr = logicalDevice->vkd.CreateRenderPass(logicalDevice->device, &renderPassInfo, nullptr, &renderPass);
         if (vr != VK_SUCCESS)
         {
             Logger::err("Failed to create ImGui render pass: " + std::to_string(vr));
-            return;
+            renderPass = VK_NULL_HANDLE;
+            return false;
         }
+        framebufferFormat = swapchainFormat;
+        return true;
+    }
+
+    // Command buffers, fences and framebuffer slots, one per swapchain image.
+    // The command pool must already exist.
+    bool ImGuiOverlay::createImageResources(uint32_t imageCount)
+    {
+        commandBuffers.assign(imageCount, VK_NULL_HANDLE);
+        VkCommandBufferAllocateInfo allocInfo = {};
+        allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        allocInfo.commandPool = commandPool;
+        allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        allocInfo.commandBufferCount = imageCount;
+        VkResult vr = logicalDevice->vkd.AllocateCommandBuffers(logicalDevice->device, &allocInfo, commandBuffers.data());
+        if (vr != VK_SUCCESS)
+        {
+            Logger::err("Failed to allocate ImGui command buffers: " + std::to_string(vr));
+            commandBuffers.clear();
+            return false;
+        }
+
+        // signalled initially so the first frame doesn't wait; getCommandBufferFence
+        // resets one only at the moment it is handed to a submit
+        commandBufferFences.assign(imageCount, VK_NULL_HANDLE);
+        VkFenceCreateInfo fenceInfo = {};
+        fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+        for (uint32_t i = 0; i < imageCount; i++)
+        {
+            vr = logicalDevice->vkd.CreateFence(logicalDevice->device, &fenceInfo, nullptr, &commandBufferFences[i]);
+            if (vr != VK_SUCCESS)
+            {
+                Logger::err("Failed to create ImGui fence " + std::to_string(i) + ": " + std::to_string(vr));
+                destroyImageResources();
+                return false;
+            }
+        }
+
+        framebuffers.assign(imageCount, VK_NULL_HANDLE);
+        framebufferImageViews.assign(imageCount, VK_NULL_HANDLE);
+        framebufferWidth = 0;
+        framebufferHeight = 0;
+        imageResourceCount = imageCount;
+        return true;
+    }
+
+    // Immediate destruction: callers guarantee none of it is in flight (the
+    // fences are signalled) or that the device is being rolled back.
+    void ImGuiOverlay::destroyImageResources()
+    {
+        for (auto fence : commandBufferFences)
+        {
+            if (fence != VK_NULL_HANDLE)
+                logicalDevice->vkd.DestroyFence(logicalDevice->device, fence, nullptr);
+        }
+        commandBufferFences.clear();
+
+        if (!commandBuffers.empty() && commandPool != VK_NULL_HANDLE)
+        {
+            logicalDevice->vkd.FreeCommandBuffers(
+                logicalDevice->device, commandPool, static_cast<uint32_t>(commandBuffers.size()), commandBuffers.data());
+        }
+        commandBuffers.clear();
+
+        for (auto fb : framebuffers)
+        {
+            if (fb != VK_NULL_HANDLE)
+                logicalDevice->vkd.DestroyFramebuffer(logicalDevice->device, fb, nullptr);
+        }
+        framebuffers.clear();
+        framebufferImageViews.clear();
+        imageResourceCount = 0;
+    }
+
+    bool ImGuiOverlay::initVulkanBackend(VkFormat swapchainFormat, uint32_t imageCount)
+    {
+        // Load Vulkan functions for ImGui using VkHook's dispatch tables
+        bool loaded = ImGui_ImplVulkan_LoadFunctions(VK_API_VERSION_1_3, imguiVulkanLoaderDummy, logicalDevice);
+        if (!loaded)
+        {
+            Logger::err("Failed to load Vulkan functions for ImGui");
+            return false;
+        }
+        Logger::debug("ImGui Vulkan functions loaded");
+
+        // Create descriptor pool for ImGui
+        VkDescriptorPoolSize poolSizes[] = {
+            { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 100 }
+        };
+
+        VkDescriptorPoolCreateInfo poolInfo = {};
+        poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+        poolInfo.maxSets = 100;
+        poolInfo.poolSizeCount = 1;
+        poolInfo.pPoolSizes = poolSizes;
+
+        VkResult vr = logicalDevice->vkd.CreateDescriptorPool(logicalDevice->device, &poolInfo, nullptr, &descriptorPool);
+        if (vr != VK_SUCCESS)
+        {
+            Logger::err("Failed to create ImGui descriptor pool: " + std::to_string(vr));
+            descriptorPool = VK_NULL_HANDLE;
+            return false;
+        }
+
+        if (!createRenderPass(swapchainFormat))
+        {
+            logicalDevice->vkd.DestroyDescriptorPool(logicalDevice->device, descriptorPool, nullptr);
+            descriptorPool = VK_NULL_HANDLE;
+            return false;
+        }
+
+        auto rollbackBackendInit = [&]() {
+            destroyImageResources();
+            if (commandPool != VK_NULL_HANDLE)
+            {
+                logicalDevice->vkd.DestroyCommandPool(logicalDevice->device, commandPool, nullptr);
+                commandPool = VK_NULL_HANDLE;
+            }
+            if (renderPass != VK_NULL_HANDLE)
+            {
+                logicalDevice->vkd.DestroyRenderPass(logicalDevice->device, renderPass, nullptr);
+                renderPass = VK_NULL_HANDLE;
+            }
+            if (descriptorPool != VK_NULL_HANDLE)
+            {
+                logicalDevice->vkd.DestroyDescriptorPool(logicalDevice->device, descriptorPool, nullptr);
+                descriptorPool = VK_NULL_HANDLE;
+            }
+            if (backendInitialized)
+                ImGui_ImplVulkan_Shutdown();
+            backendInitialized = false;
+        };
 
         // Initialize ImGui Vulkan backend
         ImGui_ImplVulkan_InitInfo initInfo = {};
@@ -746,51 +904,7 @@ namespace VkHook
         initInfo.PipelineInfoMain.RenderPass = renderPass;
 
         ImGui_ImplVulkan_Init(&initInfo);
-
-        bool commandBuffersAllocated = false;
-
-        auto rollbackBackendInit = [&]() {
-            for (auto fence : commandBufferFences)
-            {
-                if (fence != VK_NULL_HANDLE)
-                    logicalDevice->vkd.DestroyFence(logicalDevice->device, fence, nullptr);
-            }
-            commandBufferFences.clear();
-
-            if (commandBuffersAllocated && !commandBuffers.empty() && commandPool != VK_NULL_HANDLE)
-            {
-                logicalDevice->vkd.FreeCommandBuffers(
-                    logicalDevice->device, commandPool, static_cast<uint32_t>(commandBuffers.size()), commandBuffers.data());
-            }
-            commandBuffers.clear();
-
-            for (auto fb : framebuffers)
-            {
-                if (fb != VK_NULL_HANDLE)
-                    logicalDevice->vkd.DestroyFramebuffer(logicalDevice->device, fb, nullptr);
-            }
-            framebuffers.clear();
-            framebufferImageViews.clear();
-
-            if (commandPool != VK_NULL_HANDLE)
-            {
-                logicalDevice->vkd.DestroyCommandPool(logicalDevice->device, commandPool, nullptr);
-                commandPool = VK_NULL_HANDLE;
-            }
-            if (renderPass != VK_NULL_HANDLE)
-            {
-                logicalDevice->vkd.DestroyRenderPass(logicalDevice->device, renderPass, nullptr);
-                renderPass = VK_NULL_HANDLE;
-            }
-            if (descriptorPool != VK_NULL_HANDLE)
-            {
-                logicalDevice->vkd.DestroyDescriptorPool(logicalDevice->device, descriptorPool, nullptr);
-                descriptorPool = VK_NULL_HANDLE;
-            }
-
-            ImGui_ImplVulkan_Shutdown();
-            backendInitialized = false;
-        };
+        backendInitialized = true;
 
         // Create command pool
         VkCommandPoolCreateInfo poolCreateInfo = {};
@@ -801,44 +915,117 @@ namespace VkHook
         if (vr != VK_SUCCESS)
         {
             Logger::err("Failed to create ImGui command pool: " + std::to_string(vr));
+            commandPool = VK_NULL_HANDLE;
             rollbackBackendInit();
-            return;
+            return false;
         }
 
-        // Allocate command buffers
-        commandBuffers.resize(imageCount);
-        VkCommandBufferAllocateInfo allocInfo = {};
-        allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-        allocInfo.commandPool = commandPool;
-        allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        allocInfo.commandBufferCount = imageCount;
-        vr = logicalDevice->vkd.AllocateCommandBuffers(logicalDevice->device, &allocInfo, commandBuffers.data());
-        if (vr != VK_SUCCESS)
+        if (!createImageResources(imageCount))
         {
-            Logger::err("Failed to allocate ImGui command buffers: " + std::to_string(vr));
             rollbackBackendInit();
-            return;
+            return false;
         }
-        commandBuffersAllocated = true;
 
-        // Create fences for command buffer synchronization (signaled initially so first frame doesn't wait)
-        commandBufferFences.resize(imageCount);
-        VkFenceCreateInfo fenceInfo = {};
-        fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-        fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-        for (uint32_t i = 0; i < imageCount; i++)
+        Logger::debug("ImGui Vulkan backend initialized");
+        return true;
+    }
+
+    void ImGuiOverlay::flushSettingsSave()
+    {
+        if (!settingsDirty)
+            return;
+        settingsDirty = false;
+        settingsManager.save();
+    }
+
+    VkFence ImGuiOverlay::getCommandBufferFence(uint32_t imageIndex)
+    {
+        if (imageIndex >= commandBufferFences.size())
+            return VK_NULL_HANDLE;
+        VkFence fence = commandBufferFences[imageIndex];
+        const VkResult reset = logicalDevice->vkd.ResetFences(logicalDevice->device, 1, &fence);
+        if (reset != VK_SUCCESS)
         {
-            vr = logicalDevice->vkd.CreateFence(logicalDevice->device, &fenceInfo, nullptr, &commandBufferFences[i]);
-            if (vr != VK_SUCCESS)
+            // submitting with a signalled fence is a validation error, so submit without one
+            Logger::err("Failed to reset ImGui fence: " + std::to_string(reset));
+            return VK_NULL_HANDLE;
+        }
+        return fence;
+    }
+
+    bool ImGuiOverlay::onSwapchainChanged(VkFormat swapchainFormat, uint32_t imageCount)
+    {
+        if (imageCount == 0)
+            return false;
+
+        ContextScope scope(imguiContext);
+
+        if (!backendInitialized)
+        {
+            // an earlier init failed; the new swapchain is a fresh chance
+            const bool ok = initVulkanBackend(swapchainFormat, imageCount);
+            if (ok)
+                imageResourceCount = imageCount;
+            return ok;
+        }
+        if (swapchainFormat == framebufferFormat && imageCount == imageResourceCount)
+            return true;
+
+        // Everything the overlay submitted is tracked by its per-image fences.
+        // Wait them out (bounded) before touching ImGui's pipeline or ours.
+        if (!commandBufferFences.empty())
+        {
+            const VkResult waited = logicalDevice->vkd.WaitForFences(
+                logicalDevice->device, static_cast<uint32_t>(commandBufferFences.size()),
+                commandBufferFences.data(), VK_TRUE, 1'000'000'000ull);
+            if (waited != VK_SUCCESS)
             {
-                Logger::err("Failed to create ImGui fence " + std::to_string(i) + ": " + std::to_string(vr));
-                rollbackBackendInit();
-                return;
+                Logger::err("ImGui: overlay work still in flight after a swapchain change; keeping old resources ("
+                            + std::to_string(waited) + ")");
+                return false;
             }
         }
 
+        Logger::info("ImGui: rebuilding overlay resources for format " + std::to_string(swapchainFormat)
+                     + ", " + std::to_string(imageCount) + " images");
+
+        // ImGui's pipeline is bound to the render pass and its ring buffers to the
+        // image count, so the backend is rebuilt along with them. Pool and
+        // descriptor pool survive; ImGui frees what it allocated from the latter.
+        ImGui_ImplVulkan_Shutdown();
+        backendInitialized = false;
+        destroyImageResources();
+        if (renderPass != VK_NULL_HANDLE)
+        {
+            logicalDevice->vkd.DestroyRenderPass(logicalDevice->device, renderPass, nullptr);
+            renderPass = VK_NULL_HANDLE;
+        }
+
+        if (!createRenderPass(swapchainFormat))
+            return false;
+
+        ImGui_ImplVulkan_InitInfo initInfo = {};
+        initInfo.ApiVersion = VK_API_VERSION_1_3;
+        initInfo.Instance = logicalDevice->instance;
+        initInfo.PhysicalDevice = logicalDevice->physicalDevice;
+        initInfo.Device = logicalDevice->device;
+        initInfo.QueueFamily = logicalDevice->queueFamilyIndex;
+        initInfo.Queue = logicalDevice->queue;
+        initInfo.DescriptorPool = descriptorPool;
+        initInfo.MinImageCount = imageCount;
+        initInfo.ImageCount = imageCount;
+        initInfo.PipelineInfoMain.RenderPass = renderPass;
+        ImGui_ImplVulkan_Init(&initInfo);
         backendInitialized = true;
-        Logger::debug("ImGui Vulkan backend initialized");
+
+        if (!createImageResources(imageCount))
+        {
+            Logger::err("ImGui: could not rebuild per-image resources; overlay disabled until the next swapchain");
+            ImGui_ImplVulkan_Shutdown();
+            backendInitialized = false;
+            return false;
+        }
+        return true;
     }
 
 
@@ -858,6 +1045,22 @@ namespace VkHook
             return VK_NULL_HANDLE;
         }
 
+        // A swapchain with more images than the overlay was built for (until the
+        // layer reports the change through onSwapchainChanged) must not index
+        // past the per-image arrays.
+        if (imageIndex >= commandBuffers.size() || imageIndex >= commandBufferFences.size())
+        {
+            if (!warnedImageIndex)
+            {
+                warnedImageIndex = true;
+                Logger::warn("ImGui overlay: image index " + std::to_string(imageIndex) + " outside the "
+                             + std::to_string(commandBuffers.size()) + " images it was built for; skipping its frame");
+            }
+            return VK_NULL_HANDLE;
+        }
+
+        ContextScope contextScope(imguiContext);
+
         // Publish input ownership before sampling this frame's pointer.
         frameInputRects.clear();
         const bool captureInput = visible && settingsManager.getOverlayBlockInput();
@@ -875,7 +1078,6 @@ namespace VkHook
         // Adaptive timeout: 4x the measured frame time (generous margin for GPU
         // scheduling jitter), clamped to [2ms, 50ms].  With triple buffering the
         // fence was submitted 2-3 frames ago and is almost always already signaled.
-        static float avgFrameTimeMs = 8.0f;  // Seed at ~120 FPS
         VkFence fence = commandBufferFences[imageIndex];
         uint64_t timeoutNs = static_cast<uint64_t>(
             std::clamp(avgFrameTimeMs * 4.0f, 2.0f, 50.0f) * 1'000'000.0f);
@@ -890,12 +1092,8 @@ namespace VkHook
             Logger::err("ImGui fence wait failed: " + std::to_string(fenceResult));
             return VK_NULL_HANDLE;
         }
-        VkResult resetResult = logicalDevice->vkd.ResetFences(logicalDevice->device, 1, &fence);
-        if (resetResult != VK_SUCCESS)
-        {
-            Logger::err("Failed to reset ImGui fence: " + std::to_string(resetResult));
-            return VK_NULL_HANDLE;
-        }
+        // The fence stays signalled here. getCommandBufferFence resets it right before
+        // the submit, so none of the early returns below can strand it unsignalled.
 
         VkCommandBuffer cmd = commandBuffers[imageIndex];
 
@@ -969,8 +1167,6 @@ namespace VkHook
 
         // DeltaTime for ImGui's internal timing (drag thresholds, animations).
         // Uses last known good value as fallback instead of hardcoded 1/60.
-        static auto lastFrameTime = std::chrono::steady_clock::now();
-        static float lastGoodDt = 0.008f;  // Seed at ~120 FPS
         auto now = std::chrono::steady_clock::now();
         float dt = std::chrono::duration<float>(now - lastFrameTime).count();
         lastFrameTime = now;
@@ -1021,16 +1217,24 @@ namespace VkHook
 
         // Keyboard input for text fields
         // Keys are one-shot events, so we send press and release in same frame
+        // Navigation keys arrive as one-shot presses, so each one is sent as a
+        // press and a release. Text arrives as UTF-8 and goes in whole.
         KeyboardState keyboard = getKeyboardState();
-        for (char c : keyboard.typedChars)
-            io.AddInputCharacter(c);
-        if (keyboard.backspace) { io.AddKeyEvent(ImGuiKey_Backspace, true); io.AddKeyEvent(ImGuiKey_Backspace, false); }
-        if (keyboard.del) { io.AddKeyEvent(ImGuiKey_Delete, true); io.AddKeyEvent(ImGuiKey_Delete, false); }
-        if (keyboard.enter) { io.AddKeyEvent(ImGuiKey_Enter, true); io.AddKeyEvent(ImGuiKey_Enter, false); }
-        if (keyboard.left) { io.AddKeyEvent(ImGuiKey_LeftArrow, true); io.AddKeyEvent(ImGuiKey_LeftArrow, false); }
-        if (keyboard.right) { io.AddKeyEvent(ImGuiKey_RightArrow, true); io.AddKeyEvent(ImGuiKey_RightArrow, false); }
-        if (keyboard.home) { io.AddKeyEvent(ImGuiKey_Home, true); io.AddKeyEvent(ImGuiKey_Home, false); }
-        if (keyboard.end) { io.AddKeyEvent(ImGuiKey_End, true); io.AddKeyEvent(ImGuiKey_End, false); }
+        io.AddKeyEvent(ImGuiMod_Shift, keyboard.shift);
+        io.AddKeyEvent(ImGuiMod_Ctrl, keyboard.ctrl);
+        io.AddKeyEvent(ImGuiMod_Alt, keyboard.alt);
+        io.AddKeyEvent(ImGuiMod_Super, keyboard.super);
+        if (visible)
+        {
+            if (!keyboard.typedChars.empty())
+                io.AddInputCharactersUTF8(keyboard.typedChars.c_str());
+            for (const NavKey key : keyboard.navPresses)
+            {
+                const ImGuiKey imguiKey = toImGuiKey(key);
+                io.AddKeyEvent(imguiKey, true);
+                io.AddKeyEvent(imguiKey, false);
+            }
+        }
 
         // ImGui frame
         ImGui_ImplVulkan_NewFrame();

@@ -1,60 +1,50 @@
 #ifndef CONFIG_HPP_INCLUDED
 #define CONFIG_HPP_INCLUDED
-#include <vector>
-#include <fstream>
-#include <string>
-#include <iostream>
-#include <vector>
-#include <unordered_map>
 #include <chrono>
 #include <cstdlib>
+#include <fstream>
+#include <iostream>
+#include <string>
+#include <unordered_map>
+#include <vector>
 #include <sys/stat.h>
 
 #include "vulkan_include.hh"
 
 namespace VkHook
 {
+    // A key/value file in the format ini.hh describes, plus in-memory overrides
+    // and an optional fallback config for keys this one does not define.
     class Config
     {
     public:
         Config();  // Finds and loads VkHook.conf
         Config(const std::string& path);  // Loads specific config file
-        Config(const Config& other);
+        Config(const Config&) = delete;
+        Config& operator=(const Config&) = delete;
 
         // Set a fallback config for options not found in this config
         void setFallback(Config* fallbackConfig) { fallback = fallbackConfig; }
         void setOption(const std::string& option, const std::string& value) { options[option] = value; }
 
         template<typename T>
-        T getOption(const std::string& option, const T& defaultValue = {})
+        T getOption(const std::string& option, const T& defaultValue = {}) const
         {
-            // Check overrides first (in-memory values take precedence)
-            auto it = overrides.find(option);
-            if (it != overrides.end())
+            // In-memory overrides win, then this file, then the fallback
+            if (const std::string* text = findLocal(option))
             {
                 T result = defaultValue;
-                parseOverride(it->second, result);
+                parseValue(*text, result, option);
                 return result;
             }
-
-            // Check this config's options
-            if (options.find(option) != options.end())
-            {
-                T result = defaultValue;
-                parseOption(option, result);
-                return result;
-            }
-
-            // Check fallback config if set
             if (fallback)
                 return fallback->getOption(option, defaultValue);
-
             return defaultValue;
         }
 
         // Effect parameter lookup: looks for "effectName.paramName"
         template<typename T>
-        T getInstanceOption(const std::string& effectName, const std::string& paramName, const T& defaultValue = {})
+        T getInstanceOption(const std::string& effectName, const std::string& paramName, const T& defaultValue = {}) const
         {
             const std::string dotKey = effectName + "." + paramName;
             if (hasOptionKey(dotKey))
@@ -72,7 +62,8 @@ namespace VkHook
         void clearOverrides();
         bool hasOverrides() const { return !overrides.empty(); }
 
-        // Hot-reload support
+        // Hot-reload support. VkHook's own writes (see isOwnWrite) are not
+        // changes: the in-memory state they came from is already current.
         bool        hasConfigChanged();
         void        reload();
         std::string getConfigFilePath() const { return configFilePath; }
@@ -87,29 +78,21 @@ namespace VkHook
         std::unordered_map<std::string, std::string> options;
         std::unordered_map<std::string, std::string> overrides;  // In-memory overrides
         std::string                                  configFilePath;
-        time_t                                       lastModifiedTime = 0;
+        timespec                                     lastModified{};  // st_mtim, nanosecond resolution
         Config*                                      fallback = nullptr;
         std::chrono::steady_clock::time_point        lastConfigCheckTime{};  // Throttle stat() calls
 
-        void readConfigLine(std::string line);
-        void readConfigFile(std::ifstream& stream);
+        bool load(const std::string& path);
         void updateLastModifiedTime();
         bool hasOptionKey(const std::string& option) const;
+        const std::string* findLocal(const std::string& option) const;
 
-        void parseOption(const std::string& option, int32_t& result);
-        void parseOption(const std::string& option, uint32_t& result);
-        void parseOption(const std::string& option, float& result);
-        void parseOption(const std::string& option, bool& result);
-        void parseOption(const std::string& option, std::string& result);
-        void parseOption(const std::string& option, std::vector<std::string>& result);
-
-        // Parse override value directly from string
-        void parseOverride(const std::string& value, int32_t& result);
-        void parseOverride(const std::string& value, uint32_t& result);
-        void parseOverride(const std::string& value, float& result);
-        void parseOverride(const std::string& value, bool& result);
-        void parseOverride(const std::string& value, std::string& result);
-        void parseOverride(const std::string& value, std::vector<std::string>& result);
+        static void parseValue(const std::string& text, int32_t& result, const std::string& option);
+        static void parseValue(const std::string& text, uint32_t& result, const std::string& option);
+        static void parseValue(const std::string& text, float& result, const std::string& option);
+        static void parseValue(const std::string& text, bool& result, const std::string& option);
+        static void parseValue(const std::string& text, std::string& result, const std::string& option);
+        static void parseValue(const std::string& text, std::vector<std::string>& result, const std::string& option);
     };
 } // namespace VkHook
 

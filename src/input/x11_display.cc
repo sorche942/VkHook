@@ -9,6 +9,7 @@
 #include <X11/extensions/XTest.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <vector>
 
@@ -45,6 +46,23 @@ namespace VkHook
         // what gets handed back. Same idea as the Wayland interpose's held keys.
         std::vector<unsigned int> g_handedKeys;
         std::vector<unsigned int> g_handedButtons;
+
+        // Whether the game window has the keyboard focus. Answering takes
+        // XGetInputFocus plus an XQueryTree walk, each a blocking round trip, and
+        // it is asked several times per frame. The answer is cached and dropped
+        // when a FocusIn/FocusOut arrives on the game window or one of its
+        // ancestors (selected below); the TTL only covers focus moves those
+        // events cannot see, such as a window manager reparenting.
+        struct FocusCache
+        {
+            bool valid = false;
+            bool focused = false;
+            Window window = 0;
+            std::chrono::steady_clock::time_point at{};
+        };
+        FocusCache g_focus;
+        std::vector<Window> g_focusWatched;  // windows with FocusChangeMask selected
+        constexpr std::chrono::milliseconds kFocusTtl{250};
 
         void initX11()
         {
@@ -244,7 +262,9 @@ namespace VkHook
     }
 
 
-    static bool gameFocused(Window gameWindow)
+    // The slow path: queries the server. Also (re)selects focus events on the
+    // game window and its ancestors, so the next change invalidates the cache.
+    static bool queryGameFocused(Window gameWindow)
     {
         Window focus = None;
         int revert = 0;
@@ -259,37 +279,64 @@ namespace VkHook
                 return false;
             focus = child;
         }
-        const Window focusWindow = focus;
-        while (focus != None && focus != DefaultRootWindow(g_display))
+
+        auto watch = [](Window window) {
+            if (std::find(g_focusWatched.begin(), g_focusWatched.end(), window) != g_focusWatched.end())
+                return;
+            XSelectInput(g_display, window, FocusChangeMask);
+            g_focusWatched.push_back(window);
+        };
+
+        // ancestors of the game window, nearest first
+        std::vector<Window> gameChain;
+        for (Window w = gameWindow; w != None && w != DefaultRootWindow(g_display);)
         {
-            if (focus == gameWindow)
-                return true;
+            gameChain.push_back(w);
+            watch(w);
             Window root, parent, *children = nullptr;
             unsigned int count = 0;
-            if (!XQueryTree(g_display, focus, &root, &parent, &children, &count))
+            if (!XQueryTree(g_display, w, &root, &parent, &children, &count))
                 break;
             if (children)
                 XFree(children);
-            focus = parent;
+            w = parent;
         }
-        // A Vulkan surface may be a child of Wine's focused top-level window.
-        // Accept that ancestor too, but never a root/PointerRoot desktop focus.
+
+        // the focused window is the game window or one of its descendants
+        // (a Vulkan surface child of Wine's focused top-level counts too)
+        const Window focusWindow = focus;
+        for (Window f = focus; f != None && f != DefaultRootWindow(g_display);)
+        {
+            if (f == gameWindow)
+                return true;
+            Window root, parent, *children = nullptr;
+            unsigned int count = 0;
+            if (!XQueryTree(g_display, f, &root, &parent, &children, &count))
+                break;
+            if (children)
+                XFree(children);
+            f = parent;
+        }
+        // ... or one of its ancestors, but never a root/PointerRoot desktop focus
         if (focusWindow != None && focusWindow != DefaultRootWindow(g_display))
         {
-            while (gameWindow != None && gameWindow != DefaultRootWindow(g_display))
-            {
-                if (gameWindow == focusWindow)
-                    return true;
-                Window root, parent, *children = nullptr;
-                unsigned int count = 0;
-                if (!XQueryTree(g_display, gameWindow, &root, &parent, &children, &count))
-                    break;
-                if (children)
-                    XFree(children);
-                gameWindow = parent;
-            }
+            if (std::find(gameChain.begin(), gameChain.end(), focusWindow) != gameChain.end())
+                return true;
         }
         return false;
+    }
+
+    static bool gameFocused(Window gameWindow)
+    {
+        const auto now = std::chrono::steady_clock::now();
+        if (g_focus.valid && g_focus.window == gameWindow && now - g_focus.at < kFocusTtl)
+            return g_focus.focused;
+
+        g_focus.focused = gameWindow != None && queryGameFocused(gameWindow);
+        g_focus.window = gameWindow;
+        g_focus.at = now;
+        g_focus.valid = true;
+        return g_focus.focused;
     }
 
     static void initializeCapturedPointer(Window window)
@@ -325,6 +372,13 @@ namespace VkHook
         // request must not silently do nothing just because no frame has run.
         if (x11Display() == nullptr)
             return;
+
+        // Nothing wanted and nothing held: no query, no work. This runs on
+        // every input-state change, several times a frame.
+        if (!wantPointer && !wantKeyboard && !g_pointerGrabActive && !g_keyboardGrabActive
+            && !g_pointerHandoff && !g_keyboardHandoff)
+            return;
+
         const Window gameWindow = (Window)x11GameWindow();
         const bool focused = gameWindow != None && gameFocused(gameWindow);
         if (!focused)
@@ -508,6 +562,11 @@ namespace VkHook
                     break;
                 }
                 XFreeEventData(g_display, &ev.xcookie);
+            }
+            else if (ev.type == FocusIn || ev.type == FocusOut)
+            {
+                // focus moved on the game window or an ancestor: re-ask next time
+                g_focus.valid = false;
             }
             else if (ev.type == KeyPress || ev.type == KeyRelease)
             {

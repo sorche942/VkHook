@@ -3,6 +3,8 @@
 #include "input_blocker.hh"
 #include "logger.hh"
 
+#include "viewporter-client-protocol.h"
+
 #include <atomic>
 #include <algorithm>
 #include <cstring>
@@ -27,6 +29,9 @@ namespace VkHook
     static wl_compositor* compositor = nullptr;
     static wl_subcompositor* subcompositor = nullptr;
     static wl_shm* shm = nullptr;
+    // optional: scales a 1x1 buffer to the hitbox, so no per-size pixel buffer is needed
+    static wp_viewporter* viewporter = nullptr;
+    static wp_viewport* inputViewport = nullptr;
     static wl_surface* inputSurface = nullptr;
     static wl_subsurface* inputSubsurface = nullptr;
     static wl_region* inputRegion = nullptr;
@@ -115,6 +120,11 @@ namespace VkHook
             if (!shm)
                 shm = (wl_shm*)wl_registry_bind(reg, name, &wl_shm_interface, 1);
         }
+        else if (strcmp(interface, wp_viewporter_interface.name) == 0)
+        {
+            if (!viewporter)
+                viewporter = (wp_viewporter*)wl_registry_bind(reg, name, &wp_viewporter_interface, 1);
+        }
     }
 
     static void registryGlobalRemove(void* /*data*/, wl_registry* /*registry*/, uint32_t /*name*/)
@@ -155,11 +165,14 @@ namespace VkHook
         inputBufferHeight = 0;
     }
 
-    // A fully transparent ARGB buffer, sized to the hitbox. It exists only so
-    // the surface is mapped (an unmapped surface receives no input); nothing is
-    // ever drawn into it.
-    static bool ensureInputBuffer(int width, int height)
+    // A fully transparent ARGB buffer. It exists only so the surface is mapped
+    // (an unmapped surface receives no input); nothing is ever drawn into it.
+    // With wp_viewporter it is a single pixel scaled up to the hitbox; without
+    // it the buffer is allocated at the hitbox size.
+    static bool ensureInputBuffer(int hitboxWidth, int hitboxHeight)
     {
+        const int width = inputViewport ? 1 : hitboxWidth;
+        const int height = inputViewport ? 1 : hitboxHeight;
         if (inputBuffer && inputBufferWidth == width && inputBufferHeight == height)
             return true;
 
@@ -238,6 +251,9 @@ namespace VkHook
         // apply our commits on their own rather than waiting on the parent's
         wl_subsurface_set_desync(inputSubsurface);
 
+        if (viewporter)
+            inputViewport = wp_viewporter_get_viewport(viewporter, inputSurface);
+
         // start with an empty region: everything passes through until the
         // overlay publishes a hitbox.
         inputRegion = wl_compositor_create_region(compositor);
@@ -294,7 +310,10 @@ namespace VkHook
         {
             inputSurfaceX = 0.0f;
             inputSurfaceY = 0.0f;
-            wl_surface_set_input_region(inputSurface, inputRegion); // empty => pass-through
+            // nothing to capture: unmap the surface outright (and keep the
+            // region empty) so the pointer passes straight through to the game
+            wl_surface_attach(inputSurface, nullptr, 0, 0);
+            wl_surface_set_input_region(inputSurface, inputRegion);
             wl_surface_commit(inputSurface);
             if (wl_display* display = getWaylandDisplay())
                 wl_display_flush(display);
@@ -329,6 +348,8 @@ namespace VkHook
                           static_cast<int>(r.width), static_cast<int>(r.height));
         }
         wl_subsurface_set_position(inputSubsurface, static_cast<int>(minX), static_cast<int>(minY));
+        if (inputViewport)
+            wp_viewport_set_destination(inputViewport, w, h);
         wl_surface_set_input_region(inputSurface, inputRegion);
         wl_surface_attach(inputSurface, inputBuffer, 0, 0);
         wl_surface_commit(inputSurface);
@@ -436,6 +457,16 @@ namespace VkHook
     void cleanupWaylandInputCommon()
     {
         destroyInputBuffer();
+        if (inputViewport)
+        {
+            wp_viewport_destroy(inputViewport);
+            inputViewport = nullptr;
+        }
+        if (viewporter)
+        {
+            wp_viewporter_destroy(viewporter);
+            viewporter = nullptr;
+        }
         if (inputRegion)
         {
             wl_region_destroy(inputRegion);

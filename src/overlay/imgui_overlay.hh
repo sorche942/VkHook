@@ -10,6 +10,7 @@
 #include <map>
 #include <set>
 #include <cstdint>
+#include <tuple>
 
 #include "vulkan_include.hh"
 #include "logical_device.hh"
@@ -20,10 +21,14 @@
 #include "settings_manager.hh"
 #include "logger.hh"
 
+struct ImGuiContext;
+namespace ImGui { class FileBrowser; }
+
 namespace VkHook
 {
     class Effect;
     class EffectRegistry;
+    struct DiagnosticsState;
 
     struct OverlayState
     {
@@ -92,6 +97,11 @@ namespace VkHook
         uint32_t    gpuApiVersion = 0;
         uint32_t    gpuVendorId = 0;
     };
+
+    // Detailed shader-test results in collapsible groups (view_shader_test.cc)
+    void renderShaderTestResults(
+        const std::vector<std::tuple<std::string, std::string, bool, std::string>>& results,
+        const std::set<std::string>& depthShaderNames);
 
     class ImGuiOverlay
     {
@@ -170,19 +180,50 @@ namespace VkHook
         void setSelectedEffects(const std::vector<std::string>& effects,
                                 const std::vector<std::string>& disabledEffects = {});
 
+        // Records this frame's UI into a command buffer, or returns
+        // VK_NULL_HANDLE when there is nothing to draw (or imageIndex is outside
+        // the per-image resources). On a non-null result the caller submits the
+        // command buffer with the fence from getCommandBufferFence().
         VkCommandBuffer recordFrame(uint32_t imageIndex, VkImageView imageView, uint32_t width, uint32_t height);
 
-        // Get fence for command buffer synchronization (used by vkhook.cpp submit)
-        VkFence getCommandBufferFence(uint32_t imageIndex) const
-        {
-            return (imageIndex < commandBufferFences.size()) ? commandBufferFences[imageIndex] : VK_NULL_HANDLE;
-        }
+        // The fence to pass to the QueueSubmit that executes recordFrame's
+        // command buffer. It is RESET here, immediately before the submit, so
+        // every early return in recordFrame leaves it signalled. Call exactly
+        // once per submit, right before vkQueueSubmit, and only for a non-null
+        // recordFrame result.
+        VkFence getCommandBufferFence(uint32_t imageIndex);
+
+        // The swapchain the overlay draws on changed format or image count.
+        // Rebuilds the render pass and the per-image resources to match; a
+        // no-op when neither changed. Returns false if the old resources could
+        // not be retired safely (they are kept and drawing is refused for the
+        // out-of-range images).
+        bool onSwapchainChanged(VkFormat swapchainFormat, uint32_t imageCount);
 
         // Collect all in-flight command buffer fences (for drain before depth image destroy)
         void collectCommandFences(std::vector<VkFence>& out) const;
 
     private:
-        void initVulkanBackend(VkFormat swapchainFormat, uint32_t imageCount);
+        // Makes this overlay's ImGuiContext current for the scope, restoring
+        // the previous one on exit. Every entry point that touches ImGui holds one.
+        class ContextScope
+        {
+        public:
+            explicit ContextScope(ImGuiContext* context);
+            ~ContextScope();
+            ContextScope(const ContextScope&) = delete;
+            ContextScope& operator=(const ContextScope&) = delete;
+        private:
+            ImGuiContext* previous;
+        };
+
+        bool initVulkanBackend(VkFormat swapchainFormat, uint32_t imageCount);
+        bool createRenderPass(VkFormat swapchainFormat);
+        bool createImageResources(uint32_t imageCount);
+        void destroyImageResources();
+        void queueLastShaderProfile();
+        // Queues one settings write for every change made since the last flush.
+        void flushSettingsSave();
         void saveToPersistentState();
         void saveCurrentConfig();
 
@@ -219,6 +260,9 @@ namespace VkHook
         // input blocker so only pointer events over the overlay are withheld.
         std::vector<InputRect> frameInputRects;
 
+        ImGuiContext* imguiContext = nullptr;  // owned: created in the constructor, destroyed in the destructor
+        VkFormat framebufferFormat = VK_FORMAT_UNDEFINED;
+        uint32_t imageResourceCount = 0;
         LogicalDevice* logicalDevice;
         OverlayPersistentState* pPersistentState;
         EffectRegistry* effectRegistry = nullptr;  // Single source of truth for enabled states
@@ -314,6 +358,26 @@ namespace VkHook
         std::chrono::steady_clock::time_point lastChangeTime;
         bool visible = false;
         bool initialized = false;
+        bool settingsDirty = false;           // a setting changed; flushed once per frame
+        bool depthCaptureAtStartup = false;   // value the depth hooks were armed with
+        // frame pacing for ImGui's DeltaTime and the adaptive fence timeout
+        float avgFrameTimeMs = 8.0f;
+        float lastGoodDt = 0.008f;
+        std::chrono::steady_clock::time_point lastFrameTime = std::chrono::steady_clock::now();
+        bool warnedImageIndex = false;
+        std::shared_ptr<DiagnosticsState> diagnostics;  // sampled stats and history (view_diagnostics.cc)
+        // file pickers used when the XDG portal is unavailable; created on first use
+        std::shared_ptr<ImGui::FileBrowser> presetBrowser;
+        std::shared_ptr<ImGui::FileBrowser> dirBrowser;
+
+        // view state that used to live in function-local statics
+        std::vector<std::string> recentEffects;   // add-effects: session recents
+        std::string addEffectsFilterPackage;      // add-effects: selected package tab, empty = All
+        std::string deleteProfileTarget;
+        std::string renameProfileTarget;
+        char renameShaderProfileName[64] = "";
+        char newShaderProfileName[64] = "";
+        std::string paramsActiveEffect;
         float appliedUiScale = -1.0f;
         int activeView = 0;
         bool backendInitialized = false;

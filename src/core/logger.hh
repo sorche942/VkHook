@@ -2,15 +2,17 @@
 #define LOGGER_HPP_INCLUDED
 
 #include <array>
+#include <atomic>
+#include <cstdint>
 #include <fstream>
+#include <functional>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <string>
-#include <memory>
-#include <functional>
+#include <string_view>
+#include <type_traits>
 #include <vector>
-#include <deque>
-#include <cstdint>
 
 namespace VkHook
 {
@@ -23,13 +25,6 @@ namespace VkHook
         Warn  = 3,
         Error = 4,
         None  = 5,
-    };
-
-    // Log entry for history
-    struct LogEntry
-    {
-        LogLevel level;
-        std::string message;
     };
 
     // The log target has two possible owners: stdout and stderr belong to the C
@@ -51,72 +46,79 @@ namespace VkHook
         }
     };
 
+    // Process-wide log. The instance is created on first use and never
+    // destroyed, so a log line from a static destructor, an atexit handler or a
+    // detached thread during teardown is always safe. Every line carries the
+    // pid and the thread id, which is what makes a multi-process (Proton) or
+    // multi-threaded log readable.
+    //
+    // Messages arrive as string_view and are only formatted (timestamp, pid,
+    // tid) after the level check. A caller that must also avoid *building* the
+    // message passes a callable, or uses the VKHOOK_LOG_* macros below.
     class Logger
     {
-
     public:
-        Logger();
-        ~Logger();
+        static void trace(std::string_view message) { log(LogLevel::Trace, message); }
+        static void debug(std::string_view message) { log(LogLevel::Debug, message); }
+        static void info(std::string_view message) { log(LogLevel::Info, message); }
+        static void warn(std::string_view message) { log(LogLevel::Warn, message); }
+        static void err(std::string_view message) { log(LogLevel::Error, message); }
 
-        static void trace(const std::string& message);
-        static void debug(const std::string& message);
-        static void info(const std::string& message);
-        static void warn(const std::string& message);
-        static void err(const std::string& message);
-        static void log(LogLevel level, const std::string& message);
+        // The callable builds the message and only runs when the level is on.
+        template<typename F, typename = std::enable_if_t<std::is_invocable_r_v<std::string, F>>>
+        static void trace(F&& build) { log(LogLevel::Trace, std::forward<F>(build)); }
+        template<typename F, typename = std::enable_if_t<std::is_invocable_r_v<std::string, F>>>
+        static void debug(F&& build) { log(LogLevel::Debug, std::forward<F>(build)); }
+
+        static void log(LogLevel level, std::string_view message)
+        {
+            if (isLevelEnabled(level))
+                instance().emit(level, message);
+        }
+
+        template<typename F, typename = std::enable_if_t<std::is_invocable_r_v<std::string, F>>>
+        static void log(LogLevel level, F&& build)
+        {
+            if (isLevelEnabled(level))
+                instance().emit(level, build());
+        }
 
         static LogLevel logLevel()
         {
-            return s_instance.minLevel;
+            return static_cast<LogLevel>(instance().minLevel.load(std::memory_order_relaxed));
         }
 
-        // Cheap level check for lazy logging macros. Reads the const min level
-        // without taking the mutex. Use VKHOOK_LOG_DEBUG / VKHOOK_LOG_TRACE
-        // macros (defined below) to avoid constructing the message string when
-        // the level is filtered out.
+        static void setLogLevel(LogLevel level)
+        {
+            instance().minLevel.store(static_cast<uint32_t>(level), std::memory_order_relaxed);
+        }
+
+        // Cheap level check for lazy logging macros: one relaxed atomic load.
         static bool isLevelEnabled(LogLevel level)
         {
-            return level >= s_instance.minLevel || s_instance.historyEnabled;
+            return static_cast<uint32_t>(level) >= instance().minLevel.load(std::memory_order_relaxed);
         }
-
-        // Get log history (thread-safe copy)
-        static std::vector<LogEntry> getHistory();
-
-        // Monotonic counter bumped on every history mutation. Callers that
-        // cache a history snapshot compare this instead of copying each frame.
-        static uint64_t historyVersion();
-
-        // Clear log history
-        static void clearHistory();
-
-        // Enable/disable history storage (disabled by default to save memory)
-        static void setHistoryEnabled(bool enabled);
-        static bool isHistoryEnabled();
 
         // Get level name string
         static const char* levelName(LogLevel level);
 
     private:
-        static Logger s_instance;
-        static constexpr size_t MAX_HISTORY_SIZE = 1000;
+        Logger();
+        ~Logger() = default;  // never run: the instance is leaked on purpose
 
-        const LogLevel minLevel;
+        static Logger& instance();
 
-        std::mutex mutex;
+        void emit(LogLevel level, std::string_view message);
+
+        std::atomic<uint32_t> minLevel;
+
+        std::mutex mutex;  // serialises writes to the stream
 
         // see LogStreamDeleter above: owned=false for the borrowed standard
         // streams, owned=true for the file stream this Logger opened
         std::unique_ptr<std::ostream, LogStreamDeleter> outStream;
 
-        std::deque<LogEntry> history;
-        bool historyEnabled = false;  // Disabled by default to save memory
-        uint64_t historyVersionCounter = 0;
-
-        void emitMsg(LogLevel level, const std::string& message);
-
         static LogLevel getMinLogLevel();
-
-        static std::string getFileName();
     };
 
 } // namespace VkHook

@@ -7,6 +7,11 @@
 #include <chrono>
 #include <cstdio>
 #include <fcntl.h>
+#include <fstream>
+#include <mutex>
+#include <string_view>
+#include <sys/stat.h>
+#include <unordered_map>
 #include <iostream>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -30,52 +35,6 @@ namespace VkHook
         stringVector.push_back(addString);
     }
 
-    void outputInColor(std::string output, Color foreground, Color background)
-    {
-        std::vector<std::string> magicNumbers;
-        switch (foreground)
-        {
-            case Color::black: magicNumbers.push_back("30"); break;
-            case Color::red: magicNumbers.push_back("31"); break;
-            case Color::green: magicNumbers.push_back("32"); break;
-            case Color::yellow: magicNumbers.push_back("33"); break;
-            case Color::blue: magicNumbers.push_back("34"); break;
-            case Color::magenta: magicNumbers.push_back("35"); break;
-            case Color::cyan: magicNumbers.push_back("36"); break;
-            case Color::white: magicNumbers.push_back("37"); break;
-            default: break;
-        }
-        switch (background)
-        {
-            case Color::black: magicNumbers.push_back("40"); break;
-            case Color::red: magicNumbers.push_back("41"); break;
-            case Color::green: magicNumbers.push_back("42"); break;
-            case Color::yellow: magicNumbers.push_back("43"); break;
-            case Color::blue: magicNumbers.push_back("44"); break;
-            case Color::magenta: magicNumbers.push_back("45"); break;
-            case Color::cyan: magicNumbers.push_back("46"); break;
-            case Color::white: magicNumbers.push_back("47"); break;
-            default: break;
-        }
-        std::string magicString = "";
-        for (bool first = true; auto& magicNumber : magicNumbers)
-        {
-            if (!first)
-            {
-                magicString += ";";
-            }
-            magicString += magicNumber;
-            first = false;
-        }
-        if (magicString.size() == 0 || !isatty(fileno(stdout)))
-        {
-            std::cout << output << std::endl;
-        }
-        else
-        {
-            std::cout << "\033[" << magicString << "m" << output << "\033[0m" << std::endl;
-        }
-    }
     bool openInShell(const char* url)
     {
         if (url == nullptr || *url == '\0')
@@ -116,6 +75,50 @@ namespace VkHook
         return true;
     }
 
+    namespace
+    {
+        struct OwnWrite
+        {
+            timespec mtime{};
+            uint64_t hash = 0;
+        };
+
+        std::mutex g_ownWritesMutex;
+        std::unordered_map<std::string, OwnWrite> g_ownWrites;
+
+        uint64_t fnv1a(std::string_view bytes)
+        {
+            uint64_t hash = 1469598103934665603ull;
+            for (const unsigned char c : bytes)
+            {
+                hash ^= c;
+                hash *= 1099511628211ull;
+            }
+            return hash;
+        }
+    } // namespace
+
+    bool isOwnWrite(const std::string& path)
+    {
+        OwnWrite recorded;
+        {
+            std::lock_guard<std::mutex> lock(g_ownWritesMutex);
+            const auto it = g_ownWrites.find(path);
+            if (it == g_ownWrites.end())
+                return false;
+            recorded = it->second;
+        }
+
+        struct stat st;
+        if (stat(path.c_str(), &st) != 0 || st.st_mtim.tv_sec != recorded.mtime.tv_sec
+            || st.st_mtim.tv_nsec != recorded.mtime.tv_nsec)
+            return false;
+
+        std::ifstream file(path, std::ios::binary);
+        const std::string contents((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+        return !file.bad() && fnv1a(contents) == recorded.hash;
+    }
+
     bool writeAtomically(const std::string& path, const std::string& contents)
     {
         std::string temporary = path + ".tmp-XXXXXX";
@@ -150,7 +153,16 @@ namespace VkHook
             success = false;
 
         if (success && std::rename(name.data(), path.c_str()) == 0)
+        {
+            // stamp what we just wrote so a watcher can recognise it as ours
+            struct stat st;
+            if (stat(path.c_str(), &st) == 0)
+            {
+                std::lock_guard<std::mutex> lock(g_ownWritesMutex);
+                g_ownWrites[path] = {st.st_mtim, fnv1a(contents)};
+            }
             return true;
+        }
         unlink(name.data());
         return false;
     }
