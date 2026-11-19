@@ -1,2 +1,2 @@
 [VKHOOK]
-Effects=SMAA@SMAA.fx, Tonemap@Tonemap.fx
+Effects=SMAA.fx|SMAA, Tonemap.fx|Tonemap

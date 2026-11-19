@@ -79,28 +79,23 @@ int main()
     // Shader-profile files: serialize() (covered in preset_model_test) writes
     // both files; the serializer places, reads, copies and deletes them.
     const auto resolveAny = [](std::string_view key) {
-        return key == "cas" ? std::string("cas") : "/shaders/" + std::string(key);
+        return key == "DLSS5" ? std::string("DLSS5") : "/shaders/" + std::string(key);
     };
     const auto hasInstance = [](const VkHook::EffectStack& stack, const std::string& name) {
         return std::any_of(stack.instances.begin(), stack.instances.end(),
-                           [&](const VkHook::EffectInstance& instance) { return instance.name == name; });
+                           [&](const VkHook::EffectInstance& instance) { return instance.name() == name; });
     };
     VkHook::EffectInstance simple;
-    simple.name = "Simple";
-    simple.type = "simple.fx";
-    simple.techniques = {{"SimplePass", true}};
+    simple.id = {"simple.fx", "SimplePass", 1};
     simple.params = {{"Strength", {"0.75"}}, {"Tint", {"0.1", "0.2"}}};
     simple.macros = {{"QUALITY", "high,fast"}};
     VkHook::EffectInstance custom;
-    custom.name = "Custom";
-    custom.type = "custom.fx";
+    custom.id = {"custom.fx", "CustomPass", 1};
     custom.enabled = false;
-    custom.techniques = {{"CustomPass", true}};
     custom.params = {{"Strength", {"0.25"}}};
     custom.macros = {{"QUALITY", "low"}};
     VkHook::EffectInstance builtin;
-    builtin.name = "cas";
-    builtin.type = "cas";
+    builtin.id = {"DLSS5", "", 1};
 
     const std::string shaderPath = VkHook::ConfigSerializer::getShaderProfilePath("roundtrip-game", "source");
     VkHook::EffectStack sourceStack;
@@ -132,7 +127,7 @@ int main()
     expect(shaderText.find("Strength=0.25") == std::string::npos && shaderText.find("custom.fx]") == std::string::npos &&
                shaderText.find("QUALITY=low") == std::string::npos,
            "disabled effect values are omitted from main preset");
-    expect(shaderSidecar.find("[Custom]\nPreprocessorDefinitions=QUALITY=low\n") != std::string::npos &&
+    expect(shaderSidecar.find("[custom.fx|CustomPass]\nPreprocessorDefinitions=QUALITY=low\n") != std::string::npos &&
                shaderSidecar.find("Strength=0.25") != std::string::npos,
            "disabled effect values are saved in the sidecar in normal INI syntax");
     expect(VkHook::parse(shaderIni, shaderSidecar, resolveAny) == sourceStack,
@@ -142,13 +137,11 @@ int main()
     // values live in the sidecar by instance name.
     const std::string dupPath = VkHook::ConfigSerializer::getShaderProfilePath("roundtrip-game", "dups");
     VkHook::EffectInstance bloom;
-    bloom.name = "Bloom";
-    bloom.type = "bloom.fx";
-    bloom.techniques = {{"Bloom", true}};
+    bloom.id = {"bloom.fx", "Bloom", 1};
     bloom.params = {{"Strength", {"0.5"}}};
     bloom.macros = {{"QUALITY", "high"}};
     VkHook::EffectInstance bloom2 = bloom;
-    bloom2.name = "Bloom.2";
+    bloom2.id.ordinal = 2;
     bloom2.params = {{"Strength", {"0.9"}}};
     bloom2.macros = {{"QUALITY", "low"}};
     VkHook::EffectStack dupStack;
@@ -184,12 +177,11 @@ int main()
     const auto ownedRead = VkHook::parse(ownedIni, ownedSidecar, resolveAny);
     expect(ownedRead.authoritative && ownedRead.instances.size() == 3,
            "sidecar marks the profile owned and lists every instance");
-    expect(ownedRead.instances[0].name == "Simple" && ownedRead.instances[0].type == "simple.fx" &&
-               ownedRead.instances[0].enabled,
-           "reshade instance round-trips with its filename");
-    expect(ownedRead.instances[1].name == "cas" && ownedRead.instances[1].type == "cas",
-           "built-in instance round-trips as its bare type");
-    expect(ownedRead.instances[2].name == "Custom" && !ownedRead.instances[2].enabled,
+    expect(ownedRead.instances[0].name() == "simple.fx|SimplePass" && ownedRead.instances[0].enabled,
+           "reshade instance round-trips with its file and technique");
+    expect(ownedRead.instances[1].name() == "DLSS5" && ownedRead.instances[1].id.isBuiltin(),
+           "built-in instance round-trips as its id");
+    expect(ownedRead.instances[2].name() == "custom.fx|CustomPass" && !ownedRead.instances[2].enabled,
            "disabled flag survives the sidecar round-trip");
     expect(readFile(ownedPath).find("[VKHOOK]") == std::string::npos,
            "the main ini stays vkhook-free for ReShade");
@@ -205,8 +197,8 @@ int main()
                !std::filesystem::exists(copyPath) &&
                !std::filesystem::exists(VkHook::ConfigSerializer::getShaderProfileSidecarPath(copyPath)),
            "deleting a profile also deletes its sidecar");
-    expect(!hasInstance(VkHook::parse(ownedIni, "", resolveAny), "cas") &&
-               !hasInstance(VkHook::parse(shaderIni, "", resolveAny), "Custom"),
+    expect(!hasInstance(VkHook::parse(ownedIni, "", resolveAny), "DLSS5") &&
+               !hasInstance(VkHook::parse(shaderIni, "", resolveAny), "custom.fx|CustomPass"),
            "a preset's main ini is never mistaken for the vkhook instance list");
 
     // Imported, unprefixed ReShade presets should be discoverable and readable.
@@ -233,14 +225,15 @@ int main()
     VkHook::ConfigSerializer::readShaderProfile(importedPath, importedIni, importedSidecar);
     expect(importedSidecar.empty(), "imported preset without a sidecar stays foreign");
     const auto importedStack = VkHook::parse(importedIni, importedSidecar, resolveAny);
-    expect(importedStack.instances.size() == 1 && importedStack.instances[0].name == "Example" &&
-               importedStack.instances[0].techniques.size() == 2,
-           "ReShade preset lists parse with standard comma-separated spacing");
-    expect(importedStack.instances.size() == 1 && importedStack.instances[0].params.size() == 1 &&
+    expect(importedStack.instances.size() == 2 && importedStack.instances[0].name() == "Example.fx|BloomPass" &&
+               importedStack.instances[1].name() == "Example.fx|ColorPass",
+           "ReShade preset lists parse with standard comma-separated spacing, one instance per technique");
+    expect(importedStack.instances.size() == 2 && importedStack.instances[0].params.size() == 1 &&
                importedStack.instances[0].params[0].name == "Strength" &&
-               importedStack.instances[0].params[0].values == std::vector<std::string>{"0.5"},
+               importedStack.instances[0].params[0].values == std::vector<std::string>{"0.5"} &&
+               importedStack.instances[1].params == importedStack.instances[0].params,
            "ReShade shader-filename sections parse");
-    expect(importedStack.instances.size() == 1 && importedStack.instances[0].macros.size() == 1 &&
+    expect(importedStack.instances.size() == 2 && importedStack.instances[0].macros.size() == 1 &&
                importedStack.instances[0].macros[0].name == "QUALITY" &&
                importedStack.instances[0].macros[0].value == "2,4",
            "ReShade preprocessor definitions preserve escaped commas");
@@ -268,8 +261,7 @@ int main()
     std::string disabledTechniqueIni, disabledTechniqueSidecar;
     VkHook::ConfigSerializer::readShaderProfile(disabledTechniquePath, disabledTechniqueIni, disabledTechniqueSidecar);
     const auto disabledTechniqueStack = VkHook::parse(disabledTechniqueIni, disabledTechniqueSidecar, resolveAny);
-    expect(disabledTechniqueStack.instances.size() == 1 && disabledTechniqueStack.instances[0].name == "Example" &&
-               disabledTechniqueStack.instances[0].techniques.size() == 1,
+    expect(disabledTechniqueStack.instances.size() == 1 && disabledTechniqueStack.instances[0].name() == "Example.fx|EnabledPass",
            "a technique listed only in the sorting is not imported");
 
     // New shader profiles inherit the exact active profile contents.
@@ -395,10 +387,8 @@ int main()
         const std::string path = VkHook::ConfigSerializer::getShaderProfilePath("macro-game", "commas");
         std::filesystem::create_directories(std::filesystem::path(path).parent_path());
         VkHook::EffectInstance tint;
-        tint.name = "Tint";
-        tint.type = "tint.fx";
+        tint.id = {"tint.fx", "Tint", 1};
         tint.enabled = false;
-        tint.techniques = {{"Tint", true}};
         tint.params = {{"Strength", {"0.5"}}};
         tint.macros = {{"COLOR", "float3(1,0,0)"}};
         VkHook::EffectStack stack;

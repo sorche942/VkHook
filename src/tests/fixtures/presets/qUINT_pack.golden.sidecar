@@ -1,2 +1,2 @@
 [VKHOOK]
-Effects=qUINT_mxao@qUINT_mxao.fx, qUINT_bloom@qUINT_bloom.fx, LumaSharpen@LumaSharpen.fx, Vibrance@Vibrance.fx
+Effects=qUINT_mxao.fx|MXAO, qUINT_bloom.fx|Bloom, LumaSharpen.fx|LumaSharpen, Vibrance.fx|Vibrance

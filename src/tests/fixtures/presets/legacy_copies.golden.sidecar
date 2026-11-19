@@ -1,0 +1,11 @@
+[VKHOOK]
+Effects=LumaStack.fx|LumaPre, LumaStack.fx|LumaPre|2, *LumaStack.fx|LumaPre|3, Vibrance.fx|Vibrance
+
+[LumaStack.fx|LumaPre]
+Strength=0.400000
+
+[LumaStack.fx|LumaPre|2]
+Strength=0.900000
+
+[LumaStack.fx|LumaPre|3]
+Strength=0.100000

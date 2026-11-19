@@ -1,0 +1,8 @@
+[VKHOOK]
+Effects=Luma@LumaStack.fx, Luma.2@LumaStack.fx, *Luma.3@LumaStack.fx, Vibrance
+
+[Luma.2]
+Strength=0.900000
+
+[Luma.3]
+Strength=0.100000

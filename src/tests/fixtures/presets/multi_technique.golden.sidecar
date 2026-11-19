@@ -1,2 +1,2 @@
 [VKHOOK]
-Effects=LumaStack@LumaStack.fx, Vibrance@Vibrance.fx
+Effects=LumaStack.fx|LumaPre, Vibrance.fx|Vibrance, LumaStack.fx|LumaPost

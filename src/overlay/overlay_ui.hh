@@ -16,6 +16,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <filesystem>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -189,9 +190,18 @@ namespace VkHook
         std::vector<OverlayRenderer*> renderers;
 
         // add-effects page: the queued edit
-        std::vector<std::pair<std::string, std::string>> pendingAddEffects;  // {instanceName, effectType}
+        std::vector<std::pair<std::string, std::string>> pendingAddEffects;  // {EffectId text, effectType}; effectType resolves the shader file
         std::map<std::string, int> addEffectsDuplicateCount;  // effectType -> extra copies to add per queue action
-        std::set<std::string> addEffectsRemoved;  // instances queued for removal
+
+        // The techniques a shader file declares, scanned once per file version.
+        struct TechniqueScan
+        {
+            std::filesystem::file_time_type mtime{};
+            std::vector<std::string> names;
+        };
+        std::map<std::string, TechniqueScan> techniqueScans;  // by path
+        const std::vector<std::string>& techniquesOf(const std::string& path);
+        std::set<std::string> addEffectsRemoved;  // effectTypes queued for removal (every chain entry of the file)
         bool inSelectionMode = false;
         int insertPosition = -1;  // chain position to insert at (-1 = append)
         char addEffectsSearch[64] = "";

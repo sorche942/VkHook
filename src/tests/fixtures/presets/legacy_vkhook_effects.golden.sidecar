@@ -1,5 +1,5 @@
 [VKHOOK]
-Effects=qUINT_mxao@qUINT_mxao.fx, *Vibrance@Vibrance.fx
+Effects=qUINT_mxao.fx, *Vibrance.fx
 
-[Vibrance]
+[Vibrance.fx]
 Vibrance=0.300000
