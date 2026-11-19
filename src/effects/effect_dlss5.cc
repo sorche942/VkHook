@@ -1,6 +1,7 @@
 #include "effect_dlss5.hh"
 #include "effect_registry.hh"
 #include "logical_device.hh"
+#include "layer/registry.hh"
 #include "config.hh"
 #include "config_serializer.hh"
 #include "logger.hh"
@@ -133,12 +134,12 @@ namespace VkHook
         s.input = input;
         s.output = output;
         s.context = std::make_unique<vk::Context>(device->instance, device->physicalDevice, device->device,
-            device->queueFamilyIndex, 0, device->downstreamGIPA, device->downstreamGDPA);
+            device->queueFamilyIndex, 0, device->downstreamGIPA, layerDeviceProcAddr());
         if (device->dlss5OpticalFlowQueue)
         {
             s.flow = std::make_unique<Dlss5OpticalFlow>(*s.context, device->dlss5OpticalFlowQueueFamily,
                 device->dlss5OpticalFlowQueue, extent, format, motionSources, shaderPath,
-                device->downstreamGIPA, device->downstreamGDPA);
+                device->downstreamGIPA, layerDeviceProcAddr());
         }
         else Logger::warn("DLSS5 temporal unavailable: no enabled NVIDIA optical-flow feature/usable queue; using no history");
         s.model = std::make_unique<nr::Model>(*s.context, modelPath);

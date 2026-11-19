@@ -1,9 +1,7 @@
 #include "control/frontend.hh"
 
 #include "control/preset_import.hh"
-#include "layer/state.hh"
 #include "present/swapchain.hh"
-#include "depth/tracker.hh"
 
 #include "keyboard_input.hh"
 #include "keyboard_input_wayland.hh"
@@ -20,6 +18,7 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <atomic>
 #include <mutex>
 #include <set>
 #include <sys/stat.h>
@@ -100,29 +99,43 @@ namespace VkHook
     }
 
     DeviceControlState::DeviceControlState()
-        : keySymbol(convertToKeySym(settingsManager.getToggleKey()))
-        , reloadKeySymbol(convertToKeySym(settingsManager.getReloadKey()))
-        , overlayKeySymbol(convertToKeySym(settingsManager.getOverlayKey()))
-        , presentEffect(settingsManager.getEnableOnLaunch())
     {
+        const auto settings = settingsManager.snapshot();
+        keySymbol        = convertToKeySym(settings->toggleKey);
+        reloadKeySymbol  = convertToKeySym(settings->reloadKey);
+        overlayKeySymbol = convertToKeySym(settings->overlayKey);
+        presentEffect    = settings->enableOnLaunch;
+        lastEffectsOn.store(presentEffect, std::memory_order_relaxed);
     }
 
     namespace
     {
-        // guarded by globalLock
+        // Own small mutex: the map is touched by present threads of every device
+        // and by vkDestroyDevice. States are heap-allocated, so a reference
+        // stays valid until releaseDeviceControl for that device.
+        std::mutex deviceControlMutex;
         std::unordered_map<LogicalDevice*, std::unique_ptr<DeviceControlState>> deviceControlStates;
+
+        // Clears LogicalDevice::frontendBusy when the frame ends, on every path.
+        struct FrontendBusyGuard
+        {
+            LogicalDevice* device;
+            ~FrontendBusyGuard() { device->frontendBusy.store(false, std::memory_order_release); }
+        };
     }
 
-    DeviceControlState& deviceControlLocked(LogicalDevice* logicalDevice)
+    DeviceControlState& deviceControl(LogicalDevice* logicalDevice)
     {
+        std::lock_guard<std::mutex> lock(deviceControlMutex);
         auto& slot = deviceControlStates[logicalDevice];
         if (!slot)
             slot = std::make_unique<DeviceControlState>();
         return *slot;
     }
 
-    void releaseDeviceControlLocked(LogicalDevice* logicalDevice)
+    void releaseDeviceControl(LogicalDevice* logicalDevice)
     {
+        std::lock_guard<std::mutex> lock(deviceControlMutex);
         deviceControlStates.erase(logicalDevice);
     }
 
@@ -476,55 +489,58 @@ namespace VkHook
         logicalDevice->imguiOverlay->updateState(std::move(overlayState));
     }
 
-    bool runFrontendFrameLocked(LogicalDevice* deviceForSettings, DeviceControlState& state)
+    bool runFrontendFrame(LogicalDevice* logicalDevice, DeviceControlState& state)
     {
-        // Check if settings were saved (re-read from settingsManager which is already updated by UI)
-        if (deviceForSettings && deviceForSettings->imguiOverlay && deviceForSettings->imguiOverlay->hasSettingsSaved())
+        // One present thread runs the control step per device; the others reuse
+        // its last decision instead of racing on the hotkey/reload state.
+        if (logicalDevice->frontendBusy.exchange(true, std::memory_order_acq_rel))
+            return state.lastEffectsOn.load(std::memory_order_acquire);
+        FrontendBusyGuard busyGuard{logicalDevice};
+
+        // No layer lock is held here: the step does file I/O (config change
+        // checks, reloads), shader scans and overlay work. stateLock is taken
+        // only for the short pending-reload / depthReallocPending accesses.
+        const auto settings = settingsManager.snapshot();
+
+        // Check if settings were saved (the UI already published the new settings)
+        if (logicalDevice->imguiOverlay && logicalDevice->imguiOverlay->hasSettingsSaved())
         {
-            // settingsManager is already updated by the UI, just re-read the values
-            state.keySymbol = convertToKeySym(settingsManager.getToggleKey());
-            state.reloadKeySymbol = convertToKeySym(settingsManager.getReloadKey());
-            state.overlayKeySymbol = convertToKeySym(settingsManager.getOverlayKey());
-            initInputBlocker(settingsManager.getOverlayBlockInput());
-            if (deviceForSettings->imguiOverlay)
-                setInputBlocked(deviceForSettings->imguiOverlay->isVisible());
-            deviceForSettings->imguiOverlay->clearSettingsSaved();
+            state.keySymbol = convertToKeySym(settings->toggleKey);
+            state.reloadKeySymbol = convertToKeySym(settings->reloadKey);
+            state.overlayKeySymbol = convertToKeySym(settings->overlayKey);
+            initInputBlocker(settings->overlayBlockInput);
+            setInputBlocked(logicalDevice->imguiOverlay->isVisible());
+            logicalDevice->imguiOverlay->clearSettingsSaved();
             Logger::info("Settings reloaded from SettingsManager");
         }
 
         // Check if shader paths were changed (refresh available effects list)
-        if (deviceForSettings && deviceForSettings->imguiOverlay && deviceForSettings->imguiOverlay->hasShaderPathsChanged())
+        if (logicalDevice->imguiOverlay && logicalDevice->imguiOverlay->hasShaderPathsChanged())
         {
             invalidateAvailableEffects();  // force re-scan of available effects
-            deviceForSettings->imguiOverlay->clearShaderPathsChanged();
+            logicalDevice->imguiOverlay->clearShaderPathsChanged();
             Logger::info("Shader paths changed, effect list refreshed");
         }
 
-        // Deferred chain reload. A rebuild must not free command buffers or
-        // destroy effect resources while the GPU still executes them, but a
-        // global QueueWaitIdle stalls the present thread. So the reload is
-        // armed and run on the first present where every swapchain's
-        // in-flight effect submissions have completed.
-        if (deviceForSettings && deviceForSettings->pendingChainReload)
+        // Deferred chain reload armed by an earlier frame. reloadAllSwapchains
+        // builds new generations off-lock and swaps them in; it neither waits for
+        // the GPU nor needs a lock, so the request is simply taken and run.
         {
-            bool gpuDone = true;
-            for (auto& [_, sc] : swapchainMap)
+            std::vector<std::string> reloadEffects;
+            bool                     reloadNow = false;
             {
-                if (sc && sc->logicalDevice == deviceForSettings && !sc->fakeImages.empty()
-                    && !depthRebuildFencesReady(deviceForSettings, sc.get()))
+                std::lock_guard<std::mutex> lock(logicalDevice->stateLock);
+                if (logicalDevice->pendingChainReload)
                 {
-                    gpuDone = false;
-                    break;
+                    reloadEffects = std::move(logicalDevice->pendingChainEffects);
+                    logicalDevice->pendingChainEffects.clear();
+                    logicalDevice->pendingChainReload = false;
+                    logicalDevice->depthReallocPending = false;
+                    reloadNow = true;
                 }
             }
-
-            if (gpuDone)
-            {
-                reloadAllSwapchains(deviceForSettings, deviceForSettings->pendingChainEffects);
-                deviceForSettings->depthReallocPending = false;
-                deviceForSettings->pendingChainReload = false;
-                deviceForSettings->pendingChainEffects.clear();
-            }
+            if (reloadNow)
+                reloadAllSwapchains(logicalDevice, reloadEffects);
         }
 
         if (!state.initLogged)
@@ -556,12 +572,9 @@ namespace VkHook
         // Toggle overlay on/off
         if (handleKeyPress(state.overlayKeySymbol, state.overlayPressed))
         {
-            if (deviceForSettings->imguiOverlay)
-                deviceForSettings->imguiOverlay->toggle();
+            if (logicalDevice->imguiOverlay)
+                logicalDevice->imguiOverlay->toggle();
         }
-
-        // Check for Apply button press in overlay (overlay is at device level)
-        LogicalDevice* logicalDevice = deviceForSettings;
 
         // Toggle effects on/off via overlay checkbox
         if (logicalDevice->imguiOverlay && logicalDevice->imguiOverlay->hasToggleEffectsRequest())
@@ -571,12 +584,13 @@ namespace VkHook
         }
 
         // only the resolve path needs rebuilding, which the deferred realloc
-        // below does per swapchain under its own fence gate. the full chain
-        // reload this used to trigger recompiles every shader and re-records
-        // every command buffer for a change that does not touch the chain.
+        // does per swapchain generation. the full chain reload this used to
+        // trigger recompiles every shader and re-records every command buffer
+        // for a change that does not touch the chain.
         if (logicalDevice->imguiOverlay && logicalDevice->imguiOverlay->hasDepthPinChanged())
         {
             logicalDevice->imguiOverlay->clearDepthPinChanged();
+            std::lock_guard<std::mutex> lock(logicalDevice->stateLock);
             logicalDevice->depthReallocPending = true;
         }
 
@@ -596,9 +610,11 @@ namespace VkHook
             Logger::info("hot-reloading config and effects...");
             auto reloadSelectedEffects = [&]() {
                 invalidateAvailableEffects();
-                logicalDevice->pendingChainEffects = logicalDevice->imguiOverlay
+                std::vector<std::string> effects = logicalDevice->imguiOverlay
                     ? logicalDevice->imguiOverlay->getActiveEffects()
                     : config->getOption<std::vector<std::string>>("effects", {});
+                std::lock_guard<std::mutex> lock(logicalDevice->stateLock);
+                logicalDevice->pendingChainEffects = std::move(effects);
                 logicalDevice->pendingChainReload = true;
             };
 
@@ -668,16 +684,17 @@ namespace VkHook
                 Logger::info("debounced resize reload after " + std::to_string(resizeElapsed) + "ms");
                 resizeDebounce.pending = false;
 
-                // Get selected effects from registry (single source of truth)
-                // and arm the fence-gated rebuild instead of rebuilding here.
-                logicalDevice->pendingChainEffects = effectRegistry.getSelectedEffects();
+                // Get selected effects from registry (single source of truth);
+                // the reload runs at the start of the next control step.
+                std::vector<std::string> effects = effectRegistry.getSelectedEffects();
+                std::lock_guard<std::mutex> lock(logicalDevice->stateLock);
+                logicalDevice->pendingChainEffects = std::move(effects);
                 logicalDevice->pendingChainReload = true;
             }
         }
 
-        // Keep lock scope small: the caller snapshots pointers and immutable
-        // per-present state, then submits and presents outside the global mutex.
         updateOverlayState(logicalDevice, state.presentEffect, state);
+        state.lastEffectsOn.store(state.presentEffect, std::memory_order_release);
         return state.presentEffect;
     }
 } // namespace VkHook

@@ -2,95 +2,119 @@
 #include "memory.hh"
 #include "buffer.hh"
 #include "format.hh"
-#include "vk_handle.hh"
 
 namespace VkHook
 {
     namespace
     {
-        VkCommandBuffer allocateOneTimeCommandBuffer(LogicalDevice* logicalDevice, const char* what)
+        // One-time command buffer in its own transient pool: concurrent builders
+        // never share a pool (pools are externally synchronized).
+        struct OneTimeCommands
         {
+            VkCommandPool   pool   = VK_NULL_HANDLE;
+            VkCommandBuffer buffer = VK_NULL_HANDLE;
+        };
+
+        OneTimeCommands allocateOneTimeCommandBuffer(LogicalDevice* logicalDevice, const char* what)
+        {
+            VkCommandPoolCreateInfo poolInfo = {};
+            poolInfo.sType            = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+            poolInfo.flags            = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+            poolInfo.queueFamilyIndex = logicalDevice->queueFamilyIndex;
+
+            OneTimeCommands commands;
+            const VkResult poolResult = logicalDevice->vkd.CreateCommandPool(logicalDevice->device, &poolInfo, nullptr, &commands.pool);
+            if (poolResult != VK_SUCCESS || commands.pool == VK_NULL_HANDLE)
+            {
+                Logger::err(std::string(what) + ": vkCreateCommandPool failed: " + std::to_string(poolResult));
+                return {};
+            }
+
             VkCommandBufferAllocateInfo allocInfo = {};
             allocInfo.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
             allocInfo.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-            allocInfo.commandPool        = logicalDevice->commandPool;
+            allocInfo.commandPool        = commands.pool;
             allocInfo.commandBufferCount = 1;
 
-            VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
-            const VkResult result = logicalDevice->vkd.AllocateCommandBuffers(logicalDevice->device, &allocInfo, &commandBuffer);
-            if (result != VK_SUCCESS || commandBuffer == VK_NULL_HANDLE)
+            const VkResult result = logicalDevice->vkd.AllocateCommandBuffers(logicalDevice->device, &allocInfo, &commands.buffer);
+            if (result != VK_SUCCESS || commands.buffer == VK_NULL_HANDLE)
             {
                 Logger::err(std::string(what) + ": vkAllocateCommandBuffers failed: " + std::to_string(result));
-                return VK_NULL_HANDLE;
+                logicalDevice->vkd.DestroyCommandPool(logicalDevice->device, commands.pool, nullptr);
+                return {};
             }
             // initialize dispatch table for commandBuffer since it is a dispatchable object
-            initializeDispatchTable(commandBuffer, logicalDevice->device);
+            initializeDispatchTable(commands.buffer, logicalDevice->device);
 
             VkCommandBufferBeginInfo beginInfo = {};
             beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
             beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-            const VkResult beginResult = logicalDevice->vkd.BeginCommandBuffer(commandBuffer, &beginInfo);
+            const VkResult beginResult = logicalDevice->vkd.BeginCommandBuffer(commands.buffer, &beginInfo);
             if (beginResult != VK_SUCCESS)
             {
                 Logger::err(std::string(what) + ": vkBeginCommandBuffer failed: " + std::to_string(beginResult));
-                logicalDevice->vkd.FreeCommandBuffers(logicalDevice->device, logicalDevice->commandPool, 1, &commandBuffer);
-                return VK_NULL_HANDLE;
+                logicalDevice->vkd.DestroyCommandPool(logicalDevice->device, commands.pool, nullptr);
+                return {};
             }
-            return commandBuffer;
+            return commands;
         }
 
-        // Ends, submits and synchronously waits for `commandBuffer`, then releases
-        // it together with the optional staging buffer and memory. Returns whether
-        // the work completed. When the GPU has not finished within the bounded
-        // wait, the objects it may still read are released behind a later idle.
+        // Ends, submits and synchronously waits for the one-time buffer, then
+        // releases it (its pool) together with the optional staging buffer and
+        // memory. Returns whether the work completed. When the GPU has not
+        // finished within the bounded wait, the objects it may still read are
+        // retired instead of destroyed.
         bool finishOneTimeCommands(LogicalDevice* logicalDevice,
-                                   VkCommandBuffer commandBuffer,
+                                   const OneTimeCommands& commands,
                                    const char* what,
                                    const char* waitLabel,
                                    VkBuffer stagingBuffer = VK_NULL_HANDLE,
                                    VkDeviceMemory stagingMemory = VK_NULL_HANDLE)
         {
             const VkDevice device = logicalDevice->device;
-            const VkCommandPool pool = logicalDevice->commandPool;
-            const auto vkd = logicalDevice->vkd;
-            const auto releaseAll = [vkd, device, pool, commandBuffer, stagingBuffer, stagingMemory] {
-                vkd.FreeCommandBuffers(device, pool, 1, &commandBuffer);
+            const auto destroyInline = [&] {
+                logicalDevice->vkd.DestroyCommandPool(device, commands.pool, nullptr);
                 if (stagingBuffer != VK_NULL_HANDLE)
-                    vkd.DestroyBuffer(device, stagingBuffer, nullptr);
+                    logicalDevice->vkd.DestroyBuffer(device, stagingBuffer, nullptr);
                 if (stagingMemory != VK_NULL_HANDLE)
-                    vkd.FreeMemory(device, stagingMemory, nullptr);
+                    logicalDevice->vkd.FreeMemory(device, stagingMemory, nullptr);
             };
 
-            const VkResult endResult = logicalDevice->vkd.EndCommandBuffer(commandBuffer);
+            const VkResult endResult = logicalDevice->vkd.EndCommandBuffer(commands.buffer);
             if (endResult != VK_SUCCESS)
             {
                 Logger::err(std::string(what) + ": vkEndCommandBuffer failed: " + std::to_string(endResult));
-                releaseAll();
+                destroyInline();
                 return false;
             }
 
             VkSubmitInfo submitInfo       = {};
             submitInfo.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
             submitInfo.commandBufferCount = 1;
-            submitInfo.pCommandBuffers    = &commandBuffer;
+            submitInfo.pCommandBuffers    = &commands.buffer;
 
-            const VkResult submitResult = logicalDevice->vkd.QueueSubmit(logicalDevice->queue, 1, &submitInfo, VK_NULL_HANDLE);
-            if (submitResult != VK_SUCCESS)
+            const VkResult result = logicalDevice->queues.submitAndWait(logicalDevice->queue, submitInfo, 4000);
+            if (result == VK_SUCCESS)
             {
-                // Nothing was queued, so nothing can still be reading these.
-                Logger::err(std::string(what) + ": vkQueueSubmit failed: " + std::to_string(submitResult));
-                releaseAll();
+                destroyInline();
+                return true;
+            }
+            if (result == VK_TIMEOUT)
+            {
+                // Still pending on the GPU: the layer destroys these once the serial completes.
+                Logger::err(std::string(what) + ": " + waitLabel + " timed out; retiring its objects");
+                logicalDevice->retire(VK_OBJECT_TYPE_COMMAND_POOL, handleToU64(commands.pool));
+                if (stagingBuffer != VK_NULL_HANDLE)
+                    logicalDevice->retire(VK_OBJECT_TYPE_BUFFER, handleToU64(stagingBuffer));
+                if (stagingMemory != VK_NULL_HANDLE)
+                    logicalDevice->retire(VK_OBJECT_TYPE_DEVICE_MEMORY, handleToU64(stagingMemory));
                 return false;
             }
 
-            if (!waitQueueIdleBounded(logicalDevice, waitLabel))
-            {
-                DeferredDestroyQueue::instance().push(DestroyPhase::Resource, releaseAll);
-                return false;
-            }
-
-            releaseAll();
-            return true;
+            // The submit itself failed, so nothing was queued and nothing reads these.
+            Logger::err(std::string(what) + ": vkQueueSubmit failed: " + std::to_string(result));
+            destroyInline();
+            return false;
         }
     } // namespace
 
@@ -232,7 +256,8 @@ namespace VkHook
         std::memcpy(data, writeData, size);
         logicalDevice->vkd.UnmapMemory(logicalDevice->device, stagingMemory);
 
-        VkCommandBuffer commandBuffer = allocateOneTimeCommandBuffer(logicalDevice, "uploadToImage");
+        const OneTimeCommands oneTime = allocateOneTimeCommandBuffer(logicalDevice, "uploadToImage");
+        const VkCommandBuffer commandBuffer = oneTime.buffer;
         if (commandBuffer == VK_NULL_HANDLE)
         {
             logicalDevice->vkd.DestroyBuffer(logicalDevice->device, stagingBuffer, nullptr);
@@ -282,7 +307,7 @@ namespace VkHook
 
         generateMipMaps(logicalDevice, commandBuffer, image, extent, mipLevels);
 
-        finishOneTimeCommands(logicalDevice, commandBuffer, "uploadToImage", "image upload sync", stagingBuffer, stagingMemory);
+        finishOneTimeCommands(logicalDevice, oneTime, "uploadToImage", "image upload sync", stagingBuffer, stagingMemory);
     }
 
     VkImage createSingleImage(LogicalDevice*        logicalDevice,
@@ -304,7 +329,8 @@ namespace VkHook
 
     void changeImageLayout(LogicalDevice* logicalDevice, const std::vector<VkImage>& images, uint32_t mipLevels)
     {
-        VkCommandBuffer commandBuffer = allocateOneTimeCommandBuffer(logicalDevice, "changeImageLayout");
+        const OneTimeCommands oneTime = allocateOneTimeCommandBuffer(logicalDevice, "changeImageLayout");
+        const VkCommandBuffer commandBuffer = oneTime.buffer;
         if (commandBuffer == VK_NULL_HANDLE)
             return;
 
@@ -343,7 +369,7 @@ namespace VkHook
                 commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &memoryBarrier);
         }
 
-        finishOneTimeCommands(logicalDevice, commandBuffer, "changeImageLayout", "image layout sync");
+        finishOneTimeCommands(logicalDevice, oneTime, "changeImageLayout", "image layout sync");
     }
 
     void generateMipMaps(LogicalDevice* logicalDevice, VkCommandBuffer commandBuffer, VkImage image, VkExtent3D extent, uint32_t mipLevels)

@@ -1,5 +1,8 @@
 #include "layer/entry.hh"
-#include "layer/state.hh"
+#include "layer/registry.hh"
+#include "layer/guard.hh"
+#include "layer/device_plan.hh"
+#include "persist.hh"
 
 #include "keyboard_input_wayland.hh"
 #include "mouse_input_wayland.hh"
@@ -9,6 +12,7 @@
 #include "util.hh"
 
 #include <algorithm>
+#include <memory>
 
 #define VK_USE_PLATFORM_WAYLAND_KHR
 #define VK_USE_PLATFORM_XLIB_KHR
@@ -40,7 +44,7 @@ namespace
         Logger::trace("vkCreateInstance");
 
         // reach the app's wayland marshalling before any window commit can race
-        installWaylandInterposeHooks();
+        guardLayerWork(nullptr, "vkCreateInstance", [] { installWaylandInterposeHooks(); });
 
         if (layerCreateInfo == nullptr)
         {
@@ -54,35 +58,16 @@ namespace
 
         PFN_vkCreateInstance createFunc = (PFN_vkCreateInstance) gpa(VK_NULL_HANDLE, "vkCreateInstance");
 
-        VkInstanceCreateInfo modifiedCreateInfo = *pCreateInfo;
-        VkApplicationInfo    appInfo;
-        if (modifiedCreateInfo.pApplicationInfo)
-        {
-            appInfo = *(modifiedCreateInfo.pApplicationInfo);
-            if (appInfo.apiVersion < VK_API_VERSION_1_1)
-            {
-                appInfo.apiVersion = VK_API_VERSION_1_1;
-            }
-        }
-        else
-        {
-            appInfo.sType              = VK_STRUCTURE_TYPE_APPLICATION_INFO;
-            appInfo.pNext              = nullptr;
-            appInfo.pApplicationName   = nullptr;
-            appInfo.applicationVersion = 0;
-            appInfo.pEngineName        = nullptr;
-            appInfo.engineVersion      = 0;
-            appInfo.apiVersion         = VK_API_VERSION_1_1;
-        }
-
+        InstanceCaps caps;
 #ifdef VKHOOK_DLSS5
         auto enumerateVersion = reinterpret_cast<PFN_vkEnumerateInstanceVersion>(gpa(VK_NULL_HANDLE, "vkEnumerateInstanceVersion"));
-        uint32_t loaderVersion = VK_API_VERSION_1_0;
-        if (enumerateVersion && enumerateVersion(&loaderVersion) == VK_SUCCESS && loaderVersion >= VK_API_VERSION_1_3)
-            appInfo.apiVersion = std::max(appInfo.apiVersion, VK_API_VERSION_1_3);
+        if (!enumerateVersion || enumerateVersion(&caps.loaderApiVersion) != VK_SUCCESS)
+            caps.loaderApiVersion = VK_API_VERSION_1_0;
+        caps.wantApi13 = true;
 #endif
 
-        modifiedCreateInfo.pApplicationInfo = &appInfo;
+        const std::unique_ptr<InstancePlan> plan = planInstanceCreate(caps, *pCreateInfo);
+        const VkInstanceCreateInfo&         modifiedCreateInfo = plan->createInfo();
         VkResult ret                        = createFunc(&modifiedCreateInfo, pAllocator, pInstance);
 
         if (ret != VK_SUCCESS)
@@ -98,10 +83,11 @@ namespace
 
         // store the table by key
         {
-            scoped_lock l(globalLock);
-            instanceDispatchMap[GetKey(*pInstance)] = dispatchTable;
-            instanceMap[GetKey(*pInstance)]         = *pInstance;
-            instanceVersionMap[GetKey(*pInstance)]  = modifiedCreateInfo.pApplicationInfo->apiVersion;
+            auto state        = std::make_shared<InstanceState>();
+            state->dispatch   = dispatchTable;
+            state->instance   = *pInstance;
+            state->apiVersion = modifiedCreateInfo.pApplicationInfo->apiVersion;
+            registerInstance(GetKey(*pInstance), std::move(state));
         }
 
         return ret;
@@ -122,13 +108,14 @@ namespace
             return;
         }
 
-        // forward with the lock released, then forget the instance
+        // forward first, then forget the instance
         snapshot.dispatch.DestroyInstance(instance, pAllocator);
 
-        scoped_lock l(globalLock);
-        instanceDispatchMap.erase(GetKey(instance));
-        instanceMap.erase(GetKey(instance));
-        instanceVersionMap.erase(GetKey(instance));
+        unregisterInstance(GetKey(instance));
+
+        // final teardown: no instance left, so no device can queue a write again
+        if (noInstancesRegistered())
+            PersistenceQueue::instance().shutdown();
     }
 
     // Looks the instance up under the lock and resolves the next layer's
@@ -156,10 +143,12 @@ namespace
         Logger::trace("vkCreateWaylandSurfaceKHR");
 
         // Capture the wl_display and wl_surface for Wayland input
-        if (pCreateInfo && pCreateInfo->display)
-            setWaylandDisplay(pCreateInfo->display);
-        if (pCreateInfo && pCreateInfo->surface)
-            setWaylandSurface(pCreateInfo->surface);
+        guardLayerWork(nullptr, "vkCreateWaylandSurfaceKHR", [&] {
+            if (pCreateInfo && pCreateInfo->display)
+                setWaylandDisplay(pCreateInfo->display);
+            if (pCreateInfo && pCreateInfo->surface)
+                setWaylandSurface(pCreateInfo->surface);
+        });
 
         // Forward to the real implementation via the next layer
         auto nextFunc = (PFN_vkCreateWaylandSurfaceKHR) resolveNextInstanceProc(instance, "vkCreateWaylandSurfaceKHR");

@@ -1,10 +1,9 @@
 #include "diag/gpu_crash.hh"
 
-#include "layer/state.hh"
+#include "layer/registry.hh"
 #include "layer/env.hh"
 #include "control/frontend.hh"
 
-#include "vk_handle.hh"
 #include "format.hh"
 #include "buffer.hh"
 #include "memory.hh"
@@ -17,12 +16,9 @@
 #include <limits>
 #include <mutex>
 #include <sstream>
-#include <unordered_set>
 
 namespace VkHook
 {
-    static std::mutex deviceLossLock;
-    static std::unordered_set<LogicalDevice*> deviceLostDevices;
 
     std::string formatHexU64(uint64_t value)
     {
@@ -64,7 +60,7 @@ namespace VkHook
             return;
         lastFired = now;
 
-        scoped_lock l(globalLock);
+        std::lock_guard<std::mutex> l(logicalDevice->stateLock);
         logicalDevice->activeDepthState      = DepthState{};
         logicalDevice->bestDepthCandidate    = LogicalDevice::DepthCandidateTrackingState{};
         logicalDevice->pinnedDepthImageView  = VK_NULL_HANDLE;
@@ -135,7 +131,7 @@ namespace VkHook
         state.depthDumped = true;
 
         // One-shot debug path: wait for prior work so the sampled backup image is stable.
-        logicalDevice->vkd.QueueWaitIdle(queue);
+        logicalDevice->queues.waitIdle(queue);
 
         const VkDeviceSize dumpSize = static_cast<VkDeviceSize>(extent.width) * static_cast<VkDeviceSize>(extent.height) * sizeof(float);
         VkBuffer stagingBuffer = VK_NULL_HANDLE;
@@ -147,14 +143,22 @@ namespace VkHook
                      stagingBuffer,
                      stagingMemory);
 
+        VkCommandPoolCreateInfo poolInfo = {};
+        poolInfo.sType            = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        poolInfo.flags            = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+        poolInfo.queueFamilyIndex = logicalDevice->queueFamilyIndex;
+        VkCommandPool dumpPool = VK_NULL_HANDLE;
+        VkResult vr = logicalDevice->vkd.CreateCommandPool(logicalDevice->device, &poolInfo, nullptr, &dumpPool);
+        ASSERT_VULKAN(vr);
+
         VkCommandBufferAllocateInfo allocInfo = {};
         allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-        allocInfo.commandPool = logicalDevice->commandPool;
+        allocInfo.commandPool = dumpPool;
         allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
         allocInfo.commandBufferCount = 1;
 
         VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
-        VkResult vr = logicalDevice->vkd.AllocateCommandBuffers(logicalDevice->device, &allocInfo, &commandBuffer);
+        vr = logicalDevice->vkd.AllocateCommandBuffers(logicalDevice->device, &allocInfo, &commandBuffer);
         ASSERT_VULKAN(vr);
         initializeDispatchTable(commandBuffer, logicalDevice->device);
 
@@ -232,9 +236,8 @@ namespace VkHook
         submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
         submitInfo.commandBufferCount = 1;
         submitInfo.pCommandBuffers = &commandBuffer;
-        vr = logicalDevice->vkd.QueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE);
+        vr = logicalDevice->queues.submitAndWait(queue, submitInfo, 5000);
         ASSERT_VULKAN(vr);
-        logicalDevice->vkd.QueueWaitIdle(queue);
 
         void* mapped = nullptr;
         vr = logicalDevice->vkd.MapMemory(logicalDevice->device, stagingMemory, 0, dumpSize, 0, &mapped);
@@ -286,7 +289,7 @@ namespace VkHook
         Logger::warn("depth copy dump written to " + dumpPath);
 
         logicalDevice->vkd.UnmapMemory(logicalDevice->device, stagingMemory);
-        logicalDevice->vkd.FreeCommandBuffers(logicalDevice->device, logicalDevice->commandPool, 1, &commandBuffer);
+        logicalDevice->vkd.DestroyCommandPool(logicalDevice->device, dumpPool, nullptr);
         logicalDevice->vkd.DestroyBuffer(logicalDevice->device, stagingBuffer, nullptr);
         logicalDevice->vkd.FreeMemory(logicalDevice->device, stagingMemory, nullptr);
     }
@@ -415,27 +418,19 @@ namespace VkHook
         logDeviceFaultInfo(logicalDevice, context);
     }
 
-    // Push a fatal-error toast onto the device's overlay and switch the layer
-    // into pass-through mode. The game keeps rendering; effects are disabled
-    // until the device is destroyed (i.e. until the user restarts the game).
+    // Soft-disable the device: push a fatal-error toast onto its overlay and
+    // stop running effects. Presents of faked swapchains keep going through the
+    // layer's copy-only path (AGENTS.md invariant 5); nothing is destroyed or
+    // flushed here, because a panic does not make a GPU object any less in use.
     void panicLayer(LogicalDevice* logicalDevice, const std::string& reason)
     {
         Logger::err("VkHook panic: " + reason);
         if (logicalDevice)
         {
-            // A panic means we are about to stop touching Vulkan, so anything still
-            // queued has to go now. The queue may never be flushed again on this
-            // path, and leaving driver objects alive after a device-lost is both a
-            // leak and, on some drivers, a fault of its own.
-            DeferredDestroyQueue::instance().flush();
-
             if (reason.find("Device lost") != std::string::npos
                 || reason.find("device lost") != std::string::npos
                 || reason.find("VK_ERROR_DEVICE_LOST") != std::string::npos)
-            {
-                std::lock_guard<std::mutex> lossLock(deviceLossLock);
-                deviceLostDevices.insert(logicalDevice);
-            }
+                logicalDevice->deviceLost.store(true, std::memory_order_release);
 
             logicalDevice->softDisabled.store(true, std::memory_order_release);
             if (logicalDevice->imguiOverlay)
@@ -448,13 +443,46 @@ namespace VkHook
 
     bool isDeviceLost(LogicalDevice* logicalDevice)
     {
-        std::lock_guard<std::mutex> lossLock(deviceLossLock);
-        return deviceLostDevices.find(logicalDevice) != deviceLostDevices.end();
+        return logicalDevice->deviceLost.load(std::memory_order_acquire);
     }
 
-    void forgetDeviceLoss(LogicalDevice* logicalDevice)
+    void recordSubmittedBatch(LogicalDevice* logicalDevice, const char* kind, uint32_t imageIndex,
+                              VkSemaphore waitSemaphore, VkSemaphore signalSemaphore, VkFence fence)
     {
-        std::lock_guard<std::mutex> lossLock(deviceLossLock);
-        deviceLostDevices.erase(logicalDevice);
+        if (!logicalDevice)
+            return;
+
+        const uint64_t seq = logicalDevice->submitJournalSeq.fetch_add(1, std::memory_order_relaxed);
+        auto& entry = logicalDevice->submitJournal[seq % LogicalDevice::kSubmitJournalSize];
+        entry.seq             = seq;
+        entry.kind            = kind;
+        entry.imageIndex      = imageIndex;
+        entry.waitSemaphore   = waitSemaphore;
+        entry.signalSemaphore = signalSemaphore;
+        entry.fence           = fence;
+    }
+
+    void logSubmitJournal(LogicalDevice* logicalDevice, const char* reason)
+    {
+        // the batches a stuck queue might be waiting on, oldest first
+        const uint64_t journalSeq = logicalDevice->submitJournalSeq.load(std::memory_order_relaxed);
+        const uint32_t journalCount = journalSeq < LogicalDevice::kSubmitJournalSize
+            ? static_cast<uint32_t>(journalSeq) : LogicalDevice::kSubmitJournalSize;
+        Logger::warn(std::string(reason ? reason : "submit journal") + ": submit journal, newest last ("
+                     + std::to_string(journalCount) + " entries):");
+        for (uint32_t i = 0; i < journalCount; i++)
+        {
+            const auto& entry = logicalDevice->submitJournal[(journalSeq - journalCount + i) % LogicalDevice::kSubmitJournalSize];
+            const VkResult fenceStatus = entry.fence != VK_NULL_HANDLE
+                ? logicalDevice->vkd.GetFenceStatus(logicalDevice->device, entry.fence)
+                : VK_SUCCESS;
+            Logger::warn("  #" + std::to_string(entry.seq)
+                         + " " + std::string(entry.kind ? entry.kind : "?")
+                         + " img=" + std::to_string(entry.imageIndex)
+                         + " wait=" + convertToString(entry.waitSemaphore)
+                         + " signal=" + convertToString(entry.signalSemaphore)
+                         + " fence=" + convertToString(entry.fence)
+                         + " fenceStatus=" + std::to_string(fenceStatus));
+        }
     }
 } // namespace VkHook

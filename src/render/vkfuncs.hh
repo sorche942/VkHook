@@ -8,7 +8,8 @@
     FORVKFUNC(GetPhysicalDeviceMemoryProperties) \
     FORVKFUNC(GetPhysicalDeviceQueueFamilyProperties) \
     FORVKFUNC(GetPhysicalDeviceProperties) \
-    FORVKFUNC(GetPhysicalDeviceProperties2)
+    FORVKFUNC(GetPhysicalDeviceProperties2) \
+    FORVKFUNC(GetPhysicalDeviceSurfaceCapabilitiesKHR)
 
 #define VK_DEVICE_FUNCS \
     FORVKFUNC(AllocateCommandBuffers) \
@@ -101,22 +102,14 @@
     FORVKFUNC(GetDeviceQueue) \
     FORVKFUNC(GetDeviceQueue2) \
     FORVKFUNC(GetFenceStatus) \
+    FORVKFUNC(GetPipelineCacheData) \
     FORVKFUNC(GetImageMemoryRequirements) \
     FORVKFUNC(GetQueueCheckpointData2NV) \
     FORVKFUNC(GetQueueCheckpointDataNV) \
     FORVKFUNC(GetSwapchainImagesKHR) \
     FORVKFUNC(MapMemory) \
     FORVKFUNC(CmdSetCheckpointNV) \
-    FORVKFUNC(QueuePresentKHR) \
-    FORVKFUNC(QueueSubmit) \
-    FORVKFUNC(QueueSubmit2) \
-    FORVKFUNC(QueueSubmit2KHR) \
-    FORVKFUNC(QueueBindSparse) \
-    FORVKFUNC(QueueBeginDebugUtilsLabelEXT) \
-    FORVKFUNC(QueueEndDebugUtilsLabelEXT) \
-    FORVKFUNC(QueueInsertDebugUtilsLabelEXT) \
     FORVKFUNC(DeviceWaitIdle) \
-    FORVKFUNC(QueueWaitIdle) \
     FORVKFUNC(ResetCommandPool) \
     FORVKFUNC(ResetFences) \
     FORVKFUNC(UnmapMemory) \

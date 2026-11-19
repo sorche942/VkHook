@@ -12,7 +12,9 @@ namespace VkHook
 {
     struct LogicalSwapchain;
 
-    std::vector<VkCommandBuffer> allocateCommandBuffer(LogicalDevice* logicalDevice, uint32_t count, VkCommandPool pool = VK_NULL_HANDLE);
+    // `pool` is required (a swapchain generation's own RESET_COMMAND_BUFFER pool);
+    // returns an empty vector and logs when it is null or allocation fails.
+    std::vector<VkCommandBuffer> allocateCommandBuffer(LogicalDevice* logicalDevice, uint32_t count, VkCommandPool pool);
 
     void writeCommandBuffers(LogicalDevice*                                 logicalDevice,
                              LogicalSwapchain*                              logicalSwapchain,
@@ -21,8 +23,10 @@ namespace VkHook
                              const DepthState&                              depthState,
                              uint32_t                                       imageIndex = UINT32_MAX);
 
-    // Caller holds globalLock. Only record outside application render scopes;
-    // layer-owned command buffers have no tracked application scope.
+    // Reads the device's depth tracking maps: the caller holds the device
+    // stateLock. Only record outside application render scopes; layer-owned
+    // command buffers have no tracked application scope. Polls (never waits on)
+    // the image's fence before rewriting live descriptor sets.
     void recordDepthResolveSnapshot(LogicalDevice*            logicalDevice,
                                     LogicalSwapchain*         logicalSwapchain,
                                     VkCommandBuffer           commandBuffer,

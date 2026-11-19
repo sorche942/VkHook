@@ -84,11 +84,18 @@ overlay_src = [
 
 VkHook_src = [
     'layer/entry.cc',
-    'layer/state.cc',
+    'layer/registry.cc',
     'layer/instance.cc',
     'layer/device.cc',
+    'layer/device_plan.cc',
+    'layer/pipeline_cache.cc',
+    'gpu/queue.cc',
+    'gpu/retire.cc',
+    'gpu/retire_device.cc',
+    'gpu/timeline.cc',
     'present/swapchain.cc',
     'present/present.cc',
+    'present/present_mode.cc',
     'present/submit.cc',
     'depth/hooks.cc',
     'depth/tracker.cc',
@@ -99,7 +106,6 @@ VkHook_src = [
     'core/config/ini.cc',
     'render/buffer.cc',
     'render/command_buffer.cc',
-    'render/vk_handle.cc',
     'core/config/config.cc',
     'core/config/config_serializer.cc',
     'core/config/config_serializer_profile.cc',
@@ -276,7 +282,6 @@ shader_check = executable('vkhook-shader-check',
     'vendor/reshade/effect_parser.cc',
     'vendor/reshade/effect_preprocessor.cc',
     'vendor/reshade/effect_symbol_table.cc',
-    'render/vk_handle.cc',
     'core/config/config.cc',
     'core/config/config_serializer.cc',
     'core/config/config_serializer_profile.cc',
@@ -316,16 +321,6 @@ variable_font_tests = executable('vkhook-variable-font-tests',
     include_directories : [imgui_inc])
 test('variable font', variable_font_tests)
 
-# The deferred destroy queue's release order is load-bearing for driver
-# stability and impossible to observe without a real GPU, so it is tested
-# directly rather than only through the smoke test.
-vk_handle_tests = executable('vkhook-vk-handle-tests',
-    'render/vk_handle_test.cc',
-    'render/vk_handle.cc',
-    'core/logger.cc',
-    include_directories : [core_inc, render_inc, source_inc])
-test('vk handle ordering', vk_handle_tests)
-
 # X11 input blocking: notification hitboxes remain non-modal, but an interactive
 # menu owns pointer and keyboard for its whole lifetime. Held keys are handed
 # back on close. Uses the real blocker and synthesises input on a display:
@@ -346,6 +341,16 @@ depth_copy_state_tests = executable('vkhook-depth-copy-state-tests',
     dependencies : [threads_dep],
     include_directories : [render_inc, source_inc])
 test('depth copy state', depth_copy_state_tests)
+
+# RetireQueue + Timeline (formal/VkHookFormal/RetireQueue.lean): seeded random
+# action sequences against a ground-truth GPU model, no Vulkan device needed.
+retire_tests = executable('vkhook-retire-tests',
+    'gpu/retire_test.cc',
+    'gpu/retire.cc',
+    'gpu/timeline.cc',
+    'core/logger.cc',
+    include_directories : [core_inc, render_inc, source_inc])
+test('retire queue', retire_tests)
 
 if dlss5_available
     dlss5_device_tests = executable('vkhook-dlss5-device-tests',
@@ -371,6 +376,33 @@ if dlss5_available
         link_depends : dlss5_assets)
 endif
 
+# Pure device/instance create planning (AGENTS.md invariant 9): no GPU needed.
+device_plan_sources = ['tests/device_plan_test.cc', 'layer/device_plan.cc']
+device_plan_deps = []
+if dlss5_available
+    device_plan_sources += ['render/dlss5_device.cc', dlss5_chain]
+    device_plan_deps += opendlss_nr_dep
+endif
+device_plan_tests = executable('vkhook-device-plan-tests',
+    device_plan_sources,
+    cpp_args : dlss5_args,
+    dependencies : device_plan_deps,
+    include_directories : [core_inc, render_inc, source_inc])
+test('device plan', device_plan_tests)
+
+# Present mode chooser and semaphore accounting, driven through the production
+# submitPresentBatches with a fake queue dispatch.
+present_mode_tests = executable('vkhook-present-mode-tests',
+    'tests/present_mode_test.cc',
+    'present/present_mode.cc',
+    'gpu/queue.cc',
+    'gpu/timeline.cc',
+    'core/logger.cc',
+    dependencies : [threads_dep],
+    include_directories : [core_inc, render_inc, source_inc])
+test('present modes', present_mode_tests,
+    env : ['VKHOOK_LOG_LEVEL=none'])
+
 # Link the production recorder and fake only Vulkan dispatch. Section GC keeps
 # unrelated command-buffer allocation/effect code out of the headless executable.
 depth_snapshot_scope_tests = executable('vkhook-depth-snapshot-scope-tests',
@@ -378,6 +410,9 @@ depth_snapshot_scope_tests = executable('vkhook-depth-snapshot-scope-tests',
     'render/command_buffer.cc',
     'render/format.cc',
     'render/image_view.cc',
+    'render/logical_swapchain.cc',
+    'gpu/retire.cc',
+    'gpu/timeline.cc',
     'core/logger.cc',
     cpp_args : ['-ffunction-sections', '-fdata-sections'],
     link_args : ['-Wl,--gc-sections'],
@@ -424,7 +459,6 @@ reshade_compile_tests = executable('vkhook-reshade-compile-tests',
     'vendor/reshade/effect_parser.cc',
     'vendor/reshade/effect_preprocessor.cc',
     'vendor/reshade/effect_symbol_table.cc',
-    'render/vk_handle.cc',
     'core/config/config.cc',
     'core/config/config_serializer.cc',
     'core/config/config_serializer_profile.cc',
@@ -456,7 +490,8 @@ reshade_texture_pool_tests = executable('vkhook-reshade-texture-pool-tests',
     'effects/reshade_texture_pool_test.cc',
     'effects/reshade_texture_pool.cc',
     'render/format.cc',
-    'render/vk_handle.cc',
+    'gpu/retire.cc',
+    'gpu/timeline.cc',
     'core/logger.cc',
     include_directories : [core_inc, render_inc, effects_inc, source_inc])
 test('reshade texture pool', reshade_texture_pool_tests)

@@ -3,6 +3,7 @@
 
 #include "vulkan_include.hh"
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -10,6 +11,17 @@
 namespace VkHook
 {
     struct LogicalDevice;
+
+    // Where a texture's GPU objects go when it is released. The default (null
+    // fn) is LogicalDevice::retire; a custom hook lets tests observe release
+    // without a layer device.
+    struct ReshadeRetireHook
+    {
+        using Fn = void (*)(void* ctx, VkObjectType type, uint64_t handle, uint64_t extra);
+        Fn   fn  = nullptr;
+        void* ctx = nullptr;
+    };
+
 
     struct ReshadeTextureDesc
     {
@@ -23,7 +35,7 @@ namespace VkHook
 
     struct ReshadeTexture
     {
-        ReshadeTexture(LogicalDevice* logicalDevice, const ReshadeTextureDesc& description);
+        ReshadeTexture(LogicalDevice* logicalDevice, const ReshadeTextureDesc& description, ReshadeRetireHook hook = {});
         ~ReshadeTexture();
         ReshadeTexture(const ReshadeTexture&) = delete;
         ReshadeTexture& operator=(const ReshadeTexture&) = delete;
@@ -37,12 +49,11 @@ namespace VkHook
         VkImageView srgbRenderView = VK_NULL_HANDLE;
 
     private:
+        // Retires every owned handle; the retire queue destroys views before
+        // the image and memory last once the GPU serial passes.
         void deferRelease();
 
-        const VkDevice device;
-        const PFN_vkDestroyImage destroyImage;
-        const PFN_vkDestroyImageView destroyImageView;
-        const PFN_vkFreeMemory freeMemory;
+        const ReshadeRetireHook retireHook;
     };
 
     // One pool per effect-chain build. Its strong references preserve producers
@@ -57,7 +68,8 @@ namespace VkHook
     class ReshadeTexturePool
     {
     public:
-        explicit ReshadeTexturePool(LogicalDevice* logicalDevice) : logicalDevice(logicalDevice) {}
+        explicit ReshadeTexturePool(LogicalDevice* logicalDevice, ReshadeRetireHook hook = {})
+            : logicalDevice(logicalDevice), retireHook(hook) {}
         ReshadeTexturePool(const ReshadeTexturePool&) = delete;
         ReshadeTexturePool& operator=(const ReshadeTexturePool&) = delete;
 
@@ -70,6 +82,7 @@ namespace VkHook
 
     private:
         LogicalDevice* logicalDevice;
+        ReshadeRetireHook retireHook;
         std::unordered_map<std::string, uint32_t> instanceCounts;
         std::unordered_map<std::string, std::shared_ptr<ReshadeTexture>> textures;
     };

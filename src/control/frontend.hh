@@ -1,14 +1,18 @@
 #pragma once
 
 // Control plane of the layer: config selection, hotkeys, hot-reload requests
-// coming from the overlay, and the overlay state handed back to it. Everything
-// here runs on the present thread at a present boundary.
+// coming from the overlay, and the overlay state handed back to it. The control
+// step runs on a present thread at a present boundary with NO layer lock held
+// (it does file I/O and shader scans); it takes LogicalDevice::stateLock itself
+// only for short accesses to the pending-reload state.
 
 #include "vulkan_include.hh"
 #include "config.hh"
 #include "diag/gpu_crash.hh"
 #include "effects/effect_registry.hh"
 #include "logical_device.hh"
+
+#include <atomic>
 
 #include <chrono>
 #include <cstdint>
@@ -59,7 +63,9 @@ namespace VkHook
     // Mark the start of an input frame (dispatch de-duplication resets).
     void beginInputFrame();
 
-    // Everything the present path used to keep in function-local statics.
+    // Per-device control state. Only the thread that wins
+    // LogicalDevice::frontendBusy touches the plain members; `lastEffectsOn`
+    // is what the other present threads of the device reuse meanwhile.
     struct DeviceControlState
     {
         DeviceControlState();
@@ -78,14 +84,20 @@ namespace VkHook
         std::string cachedConfigName;
 
         DiagState diag;
+
+        // last effects-on decision, published at the end of every control step
+        std::atomic<bool> lastEffectsOn{true};
     };
 
-    // Per-device control state. Caller holds globalLock.
-    DeviceControlState& deviceControlLocked(LogicalDevice* logicalDevice);
-    void releaseDeviceControlLocked(LogicalDevice* logicalDevice);
+    // Per-device control state; the reference stays valid until
+    // releaseDeviceControl. Thread-safe (own small mutex).
+    DeviceControlState& deviceControl(LogicalDevice* logicalDevice);
+    void releaseDeviceControl(LogicalDevice* logicalDevice);
 
     // Present-boundary control step: settings reload, hotkeys, overlay requests,
     // hot-reload, resize debounce and the overlay state update. Returns whether
-    // effects are on for this present. Caller holds globalLock.
-    bool runFrontendFrameLocked(LogicalDevice* logicalDevice, DeviceControlState& state);
+    // effects are on for this present. No lock held by the caller. If another
+    // present thread of the device is already inside the step, returns that
+    // thread's previous decision without running it.
+    bool runFrontendFrame(LogicalDevice* logicalDevice, DeviceControlState& state);
 } // namespace VkHook

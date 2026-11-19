@@ -1,5 +1,6 @@
 #include "layer/entry.hh"
-#include "layer/state.hh"
+#include "layer/guard.hh"
+#include "layer/registry.hh"
 
 #include "control/frontend.hh"
 #include "depth/tracker.hh"
@@ -12,10 +13,9 @@
 #include "util.hh"
 
 #include <algorithm>
-#include <chrono>
 #include <memory>
+#include <mutex>
 #include <string>
-#include <thread>
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
@@ -23,17 +23,44 @@
 // Depth-capture hooks. Everything in this file is only handed out by
 // vkGetDeviceProcAddr while depth capture is on (InterceptGate::DepthCapture),
 // so a game that does not use it never calls into the layer from command
-// recording. Each hook looks the device up under globalLock, does its
-// bookkeeping, releases the lock and then forwards to the next layer.
+// recording. Each hook looks the device up lock-free, does its bookkeeping
+// under the device's stateLock inside guardLayerWork (a throw soft-disables the
+// device), releases the lock and then ALWAYS forwards the application's call.
+// The tracker functions marked `Locked` (and the other tracker entry points
+// called here) run with dev->stateLock held by the hook.
 
 namespace VkHook
 {
 namespace
 {
-    // Cache: VkRenderPass -> depth attachment's finalLayout. Populated at
-    // CreateRenderPass time and used by the deferred depth copy to pick the
-    // source layout for the copy barrier. Guarded by globalLock.
-    std::unordered_map<VkRenderPass, VkImageLayout> renderPassDepthFinalLayouts;
+    // How long an app-side destroy waits for the layer's in-flight work that may
+    // still read the object. Never fails the destroy.
+    constexpr uint32_t kDestroySyncTimeoutMs = 2000;
+
+    // Waits with no lock held until the layer's submissions up to `serial` are
+    // done, then lets the app's destroy proceed regardless of the outcome.
+    void waitLayerSubmissionsForDestroy(LogicalDevice* logicalDevice, uint64_t serial, const char* entryPoint)
+    {
+        guardLayerWork(logicalDevice, entryPoint, [&] {
+            const VkResult vr = logicalDevice->queues.waitSerial(serial, kDestroySyncTimeoutMs);
+            if (vr != VK_SUCCESS)
+            {
+                VKHOOK_LOG_DEBUG([&](std::string& s) {
+                    s = std::string(entryPoint) + ": layer submissions not provably complete after "
+                        + std::to_string(kDestroySyncTimeoutMs) + "ms (VkResult " + std::to_string(static_cast<int>(vr))
+                        + "); destroying anyway";
+                });
+            }
+        });
+    }
+
+    // Drops everything tracked per command buffer. Needs logicalDevice->stateLock.
+    void dropCommandBufferStateLocked(LogicalDevice* logicalDevice, VkCommandBuffer commandBuffer)
+    {
+        logicalDevice->commandBufferRecordedDrawCounts.erase(commandBuffer);
+        logicalDevice->commandBufferDepthStates.erase(commandBuffer);
+        logicalDevice->pendingTransferLinkedDepthScopes.erase(commandBuffer);
+    }
 
     ///////////////////////////////////////////////////////////////////////////////////////////
     // Render passes
@@ -54,37 +81,39 @@ namespace
         std::vector<Attachment> attachments;
         CreateInfo              modifiedCreateInfo;
         const CreateInfo*       createInfo = pCreateInfo;
-        if (pCreateInfo && pCreateInfo->attachmentCount != 0)
-        {
+        guardLayerWork(logicalDevice, name, [&] {
+            if (!pCreateInfo || pCreateInfo->attachmentCount == 0)
+                return;
             attachments.assign(pCreateInfo->pAttachments, pCreateInfo->pAttachments + pCreateInfo->attachmentCount);
             bool changed = false;
             for (auto& attachment : attachments)
                 changed = forceDepthAttachmentStoreOp(attachment) || changed;
-            if (changed)
-            {
-                modifiedCreateInfo = *pCreateInfo;
-                modifiedCreateInfo.pAttachments = attachments.data();
-                VKHOOK_LOG_DEBUG([&](std::string& s) {
-                    s = std::string("forcing depth attachment storeOp=STORE for ") + infoName
-                        + " with attachmentCount=" + std::to_string(modifiedCreateInfo.attachmentCount);
-                });
-                createInfo = &modifiedCreateInfo;
-            }
-        }
+            if (!changed)
+                return;
+            modifiedCreateInfo = *pCreateInfo;
+            modifiedCreateInfo.pAttachments = attachments.data();
+            VKHOOK_LOG_DEBUG([&](std::string& s) {
+                s = std::string("forcing depth attachment storeOp=STORE for ") + infoName
+                    + " with attachmentCount=" + std::to_string(modifiedCreateInfo.attachmentCount);
+            });
+            createInfo = &modifiedCreateInfo;
+        });
 
-        // forwarded with the lock released
         VkResult vr = (logicalDevice->vkd.*createFn)(device, createInfo, pAllocator, pRenderPass);
         if (vr == VK_SUCCESS && pRenderPass && createInfo)
         {
-            scoped_lock l(globalLock);
-            for (uint32_t ai = 0; ai < createInfo->attachmentCount; ai++)
-            {
-                if (isDepthFormat(createInfo->pAttachments[ai].format))
+            guardLayerWork(logicalDevice, name, [&] {
+                std::lock_guard<std::mutex> l(logicalDevice->stateLock);
+                for (uint32_t ai = 0; ai < createInfo->attachmentCount; ai++)
                 {
-                    renderPassDepthFinalLayouts[*pRenderPass] = createInfo->pAttachments[ai].finalLayout;
-                    break;
+                    if (isDepthFormat(createInfo->pAttachments[ai].format))
+                    {
+                        // used by the deferred depth copy to pick the source layout
+                        logicalDevice->renderPassDepthFinalLayouts[*pRenderPass] = createInfo->pAttachments[ai].finalLayout;
+                        break;
+                    }
                 }
-            }
+            });
         }
         return vr;
     }
@@ -114,17 +143,16 @@ namespace
     {
         if (!device)
             return;
-        std::shared_ptr<LogicalDevice> deviceRef;
-        {
-            scoped_lock l(globalLock);
-            renderPassDepthFinalLayouts.erase(renderPass);
-            deviceRef = findDeviceLocked(GetKey(device));
-        }
+        auto deviceRef = findDevice(GetKey(device));
         if (!deviceRef)
         {
             failUnknownObject("vkDestroyRenderPass", VK_ERROR_DEVICE_LOST);
             return;
         }
+        guardLayerWork(deviceRef.get(), "vkDestroyRenderPass", [&] {
+            std::lock_guard<std::mutex> l(deviceRef->stateLock);
+            deviceRef->renderPassDepthFinalLayouts.erase(renderPass);
+        });
         deviceRef->vkd.DestroyRenderPass(device, renderPass, pAllocator);
     }
 
@@ -181,17 +209,19 @@ namespace
         if (result != VK_SUCCESS)
             return result;
 
-        scoped_lock l(globalLock);
-        logicalDevice->depthImages.push_back(*pImage);
-        logicalDevice->depthFormats.push_back(pCreateInfo->format);
-        logicalDevice->depthImageExtents[*pImage] = pCreateInfo->extent;
-        logicalDevice->depthImageMetadata[*pImage] = metadata;
-        VKHOOK_LOG_DEBUG([&](std::string& s) {
-            s = "tracked depth image metadata: image=" + convertToString(*pImage)
-                + " usage=0x" + formatHexU64(static_cast<uint64_t>(metadata.usage))
-                + " samples=" + convertToString(metadata.samples)
-                + " tiling=" + convertToString(metadata.tiling)
-                + " transient=" + std::string((metadata.usage & VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT) != 0 ? "true" : "false");
+        guardLayerWork(logicalDevice, "vkCreateImage", [&] {
+            std::lock_guard<std::mutex> l(logicalDevice->stateLock);
+            logicalDevice->depthImages.push_back(*pImage);
+            logicalDevice->depthFormats.push_back(pCreateInfo->format);
+            logicalDevice->depthImageExtents[*pImage] = pCreateInfo->extent;
+            logicalDevice->depthImageMetadata[*pImage] = metadata;
+            VKHOOK_LOG_DEBUG([&](std::string& s) {
+                s = "tracked depth image metadata: image=" + convertToString(*pImage)
+                    + " usage=0x" + formatHexU64(static_cast<uint64_t>(metadata.usage))
+                    + " samples=" + convertToString(metadata.samples)
+                    + " tiling=" + convertToString(metadata.tiling)
+                    + " transient=" + std::string((metadata.usage & VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT) != 0 ? "true" : "false");
+            });
         });
 
         return result;
@@ -211,91 +241,62 @@ namespace
         if (result != VK_SUCCESS)
             return result;
 
-        scoped_lock l(globalLock);
+        guardLayerWork(logicalDevice, "vkCreateImageView", [&] {
+            std::lock_guard<std::mutex> l(logicalDevice->stateLock);
 
-        DepthSnapshotTarget snapshotTarget = selectDepthSnapshotTargetFromImage(logicalDevice, pCreateInfo->image);
-        if (snapshotTarget.swapchain != VK_NULL_HANDLE)
-        {
+            DepthSnapshotTarget snapshotTarget = selectDepthSnapshotTargetFromImage(logicalDevice, pCreateInfo->image);
+            if (snapshotTarget.swapchain != VK_NULL_HANDLE)
+            {
+                VKHOOK_LOG_DEBUG([&](std::string& s) {
+                    s = "tracked snapshot target image view: appView=" + convertToString(*view)
+                        + " image=" + convertToString(pCreateInfo->image)
+                        + " swapchain=" + convertToString(snapshotTarget.swapchain)
+                        + " imageIndex=" + std::to_string(snapshotTarget.imageIndex);
+                });
+                logicalDevice->snapshotTargetViewStates[*view] = snapshotTarget;
+            }
+
+            if ((pCreateInfo->subresourceRange.aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT) == 0)
+                return;
+
+            auto imageIt = std::find(logicalDevice->depthImages.begin(), logicalDevice->depthImages.end(), pCreateInfo->image);
+            if (imageIt == logicalDevice->depthImages.end())
+                return;
+
+            size_t i = std::distance(logicalDevice->depthImages.begin(), imageIt);
+            // Bounds-check the parallel vectors before indexing.
+            if (i >= logicalDevice->depthFormats.size())
+            {
+                Logger::warn("CreateImageView: depth image index " + std::to_string(i)
+                             + " out of depthFormats range (" + std::to_string(logicalDevice->depthFormats.size())
+                             + "); skipping depth view tracking for image="
+                             + convertToString(pCreateInfo->image));
+                return;
+            }
+            VkImageView sampledView = getOrCreateTrackedDepthSampleViewLocked(logicalDevice, pCreateInfo->image, logicalDevice->depthFormats[i]);
             VKHOOK_LOG_DEBUG([&](std::string& s) {
-                s = "tracked snapshot target image view: appView=" + convertToString(*view)
+                s = "tracked depth image view created: appView=" + convertToString(*view)
+                    + " sampledView=" + convertToString(sampledView)
                     + " image=" + convertToString(pCreateInfo->image)
-                    + " swapchain=" + convertToString(snapshotTarget.swapchain)
-                    + " imageIndex=" + std::to_string(snapshotTarget.imageIndex);
+                    + " aspect=" + convertToString(pCreateInfo->subresourceRange.aspectMask);
             });
-            logicalDevice->snapshotTargetViewStates[*view] = snapshotTarget;
-        }
-
-        if ((pCreateInfo->subresourceRange.aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT) == 0)
-            return result;
-
-        auto imageIt = std::find(logicalDevice->depthImages.begin(), logicalDevice->depthImages.end(), pCreateInfo->image);
-        if (imageIt == logicalDevice->depthImages.end())
-            return result;
-
-        size_t i = std::distance(logicalDevice->depthImages.begin(), imageIt);
-        // Bounds-check the parallel vectors before indexing.
-        if (i >= logicalDevice->depthFormats.size())
-        {
-            Logger::warn("CreateImageView: depth image index " + std::to_string(i)
-                         + " out of depthFormats range (" + std::to_string(logicalDevice->depthFormats.size())
-                         + "); skipping depth view tracking for image="
-                         + convertToString(pCreateInfo->image));
-            return result;
-        }
-        VkImageView sampledView = getOrCreateTrackedDepthSampleViewLocked(logicalDevice, pCreateInfo->image, logicalDevice->depthFormats[i]);
-        VKHOOK_LOG_DEBUG([&](std::string& s) {
-            s = "tracked depth image view created: appView=" + convertToString(*view)
-                + " sampledView=" + convertToString(sampledView)
-                + " image=" + convertToString(pCreateInfo->image)
-                + " aspect=" + convertToString(pCreateInfo->subresourceRange.aspectMask);
+            DepthState depth;
+            depth.image = pCreateInfo->image;
+            depth.imageView = sampledView;
+            depth.format = logicalDevice->depthFormats[i];
+            auto extentIt = logicalDevice->depthImageExtents.find(depth.image);
+            if (extentIt != logicalDevice->depthImageExtents.end())
+                depth.extent = extentIt->second;
+            auto metadataIt = logicalDevice->depthImageMetadata.find(depth.image);
+            if (metadataIt != logicalDevice->depthImageMetadata.end())
+            {
+                depth.samples = metadataIt->second.samples;
+                depth.transient = (metadataIt->second.usage & VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT) != 0;
+            }
+            logicalDevice->depthViewStates[*view] = depth;
         });
-        DepthState depth;
-        depth.image = pCreateInfo->image;
-        depth.imageView = sampledView;
-        depth.format = logicalDevice->depthFormats[i];
-        auto extentIt = logicalDevice->depthImageExtents.find(depth.image);
-        if (extentIt != logicalDevice->depthImageExtents.end())
-            depth.extent = extentIt->second;
-        auto metadataIt = logicalDevice->depthImageMetadata.find(depth.image);
-        if (metadataIt != logicalDevice->depthImageMetadata.end())
-        {
-            depth.samples = metadataIt->second.samples;
-            depth.transient = (metadataIt->second.usage & VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT) != 0;
-        }
-        logicalDevice->depthViewStates[*view] = depth;
 
         return result;
-    }
-
-    // In-flight layer submissions can still be reading a depth handle the app
-    // is destroying; destroy-while-read is the freeze at target recreation.
-    // Give them a bounded window, then let the app's teardown proceed.
-    void drainLayerSubmissionsForDestroyLocked(LogicalDevice* logicalDevice, uint32_t timeoutMs)
-    {
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
-        bool pending = true;
-        while (pending && std::chrono::steady_clock::now() < deadline)
-        {
-            pending = false;
-            for (auto& [handle, sc] : swapchainMap)
-            {
-                if (!sc || sc->logicalDevice != logicalDevice)
-                    continue;
-                for (size_t i = 0; i < sc->effectSubmitFences.size() && i < sc->effectSubmitFenceUsed.size(); i++)
-                {
-                    if (!sc->effectSubmitFenceUsed[i] || sc->effectSubmitFences[i] == VK_NULL_HANDLE)
-                        continue;
-                    if (logicalDevice->vkd.GetFenceStatus(logicalDevice->device, sc->effectSubmitFences[i]) != VK_SUCCESS)
-                        pending = true;
-                }
-            }
-            if (pending)
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
-
-        if (pending)
-            Logger::warn("depth destroy sync: layer submissions were still in flight after "
-                         + std::to_string(timeoutMs) + "ms; destroying depth handles anyway");
     }
 
     VKAPI_ATTR void VKAPI_CALL VkHook_DestroyImageView(VkDevice device, VkImageView imageView, const VkAllocationCallbacks* pAllocator)
@@ -303,17 +304,21 @@ namespace
         if (!imageView)
             return;
 
-        std::shared_ptr<LogicalDevice> deviceRef;
+        auto deviceRef = findDevice(GetKey(device));
+        if (!deviceRef)
         {
-            scoped_lock l(globalLock);
-            deviceRef = findDeviceLocked(GetKey(device));
-            if (!deviceRef)
-            {
-                failUnknownObject("vkDestroyImageView", VK_ERROR_DEVICE_LOST);
-                return;
-            }
-            LogicalDevice* logicalDevice = deviceRef.get();
-            const bool viewTrackedByLayer = logicalDevice->snapshotTargetViewStates.count(imageView) != 0
+            failUnknownObject("vkDestroyImageView", VK_ERROR_DEVICE_LOST);
+            return;
+        }
+        LogicalDevice* logicalDevice = deviceRef.get();
+
+        // In-flight layer submissions can still be reading a depth handle the app
+        // is destroying; destroy-while-read is the freeze at target recreation.
+        bool     viewTrackedByLayer = false;
+        uint64_t submittedSerial    = 0;
+        guardLayerWork(logicalDevice, "vkDestroyImageView", [&] {
+            std::lock_guard<std::mutex> l(logicalDevice->stateLock);
+            viewTrackedByLayer = logicalDevice->snapshotTargetViewStates.count(imageView) != 0
                 || logicalDevice->depthViewStates.count(imageView) != 0;
             logicalDevice->snapshotTargetViewStates.erase(imageView);
             logicalDevice->depthViewStates.erase(imageView);
@@ -348,9 +353,12 @@ namespace
             }
 
             if (viewTrackedByLayer)
-                drainLayerSubmissionsForDestroyLocked(logicalDevice, 2000);
-        }
-        deviceRef->vkd.DestroyImageView(device, imageView, pAllocator);
+                submittedSerial = logicalDevice->timeline.submittedSerial();
+        });
+
+        if (viewTrackedByLayer)
+            waitLayerSubmissionsForDestroy(logicalDevice, submittedSerial, "vkDestroyImageView");
+        logicalDevice->vkd.DestroyImageView(device, imageView, pAllocator);
     }
 
     VKAPI_ATTR VkResult VKAPI_CALL VkHook_CreateFramebuffer(VkDevice device,
@@ -367,41 +375,43 @@ namespace
         if (result != VK_SUCCESS)
             return result;
 
-        scoped_lock l(globalLock);
-        for (uint32_t i = 0; i < pCreateInfo->attachmentCount; i++)
-        {
-            auto it = logicalDevice->depthViewStates.find(pCreateInfo->pAttachments[i]);
-            if (it != logicalDevice->depthViewStates.end())
+        guardLayerWork(logicalDevice, "vkCreateFramebuffer", [&] {
+            std::lock_guard<std::mutex> l(logicalDevice->stateLock);
+            for (uint32_t i = 0; i < pCreateInfo->attachmentCount; i++)
+            {
+                auto it = logicalDevice->depthViewStates.find(pCreateInfo->pAttachments[i]);
+                if (it != logicalDevice->depthViewStates.end())
+                {
+                    VKHOOK_LOG_DEBUG([&](std::string& s) {
+                        s = "tracked depth framebuffer attachment: framebuffer=" + convertToString(*pFramebuffer)
+                            + " attachmentView=" + convertToString(pCreateInfo->pAttachments[i])
+                            + " sampledView=" + convertToString(it->second.imageView)
+                            + " image=" + convertToString(it->second.image);
+                    });
+                    logicalDevice->framebufferDepthStates[*pFramebuffer] = it->second;
+                    break;
+                }
+            }
+
+            DepthSnapshotTarget snapshotTarget = selectDepthSnapshotTargetFromImageViews(
+                logicalDevice, pCreateInfo->pAttachments, pCreateInfo->attachmentCount);
+            if (snapshotTarget.swapchain != VK_NULL_HANDLE)
             {
                 VKHOOK_LOG_DEBUG([&](std::string& s) {
-                    s = "tracked depth framebuffer attachment: framebuffer=" + convertToString(*pFramebuffer)
-                        + " attachmentView=" + convertToString(pCreateInfo->pAttachments[i])
-                        + " sampledView=" + convertToString(it->second.imageView)
-                        + " image=" + convertToString(it->second.image);
+                    s = "tracked framebuffer snapshot target: framebuffer=" + convertToString(*pFramebuffer)
+                        + " swapchain=" + convertToString(snapshotTarget.swapchain)
+                        + " imageIndex=" + std::to_string(snapshotTarget.imageIndex);
                 });
-                logicalDevice->framebufferDepthStates[*pFramebuffer] = it->second;
-                break;
+                logicalDevice->framebufferSnapshotTargets[*pFramebuffer] = snapshotTarget;
             }
-        }
-
-        DepthSnapshotTarget snapshotTarget = selectDepthSnapshotTargetFromImageViews(
-            logicalDevice, pCreateInfo->pAttachments, pCreateInfo->attachmentCount);
-        if (snapshotTarget.swapchain != VK_NULL_HANDLE)
-        {
-            VKHOOK_LOG_DEBUG([&](std::string& s) {
-                s = "tracked framebuffer snapshot target: framebuffer=" + convertToString(*pFramebuffer)
-                    + " swapchain=" + convertToString(snapshotTarget.swapchain)
-                    + " imageIndex=" + std::to_string(snapshotTarget.imageIndex);
-            });
-            logicalDevice->framebufferSnapshotTargets[*pFramebuffer] = snapshotTarget;
-        }
-        else
-        {
-            VKHOOK_LOG_DEBUG([&](std::string& s) {
-                s = "framebuffer has no snapshot target: framebuffer=" + convertToString(*pFramebuffer)
-                    + " attachments=" + std::to_string(pCreateInfo->attachmentCount);
-            });
-        }
+            else
+            {
+                VKHOOK_LOG_DEBUG([&](std::string& s) {
+                    s = "framebuffer has no snapshot target: framebuffer=" + convertToString(*pFramebuffer)
+                        + " attachments=" + std::to_string(pCreateInfo->attachmentCount);
+                });
+            }
+        });
 
         return result;
     }
@@ -411,21 +421,17 @@ namespace
         if (!framebuffer)
             return;
 
-        std::shared_ptr<LogicalDevice> deviceRef;
-        {
-            scoped_lock l(globalLock);
-            deviceRef = findDeviceLocked(GetKey(device));
-            if (deviceRef)
-            {
-                deviceRef->framebufferDepthStates.erase(framebuffer);
-                deviceRef->framebufferSnapshotTargets.erase(framebuffer);
-            }
-        }
+        auto deviceRef = findDevice(GetKey(device));
         if (!deviceRef)
         {
             failUnknownObject("vkDestroyFramebuffer", VK_ERROR_DEVICE_LOST);
             return;
         }
+        guardLayerWork(deviceRef.get(), "vkDestroyFramebuffer", [&] {
+            std::lock_guard<std::mutex> l(deviceRef->stateLock);
+            deviceRef->framebufferDepthStates.erase(framebuffer);
+            deviceRef->framebufferSnapshotTargets.erase(framebuffer);
+        });
         deviceRef->vkd.DestroyFramebuffer(device, framebuffer, pAllocator);
     }
 
@@ -434,88 +440,93 @@ namespace
         if (!image)
             return;
 
-        std::shared_ptr<LogicalDevice> deviceRef;
+        auto deviceRef = findDevice(GetKey(device));
+        if (!deviceRef)
         {
-            scoped_lock l(globalLock);
-            deviceRef = findDeviceLocked(GetKey(device));
-            if (!deviceRef)
-            {
-                failUnknownObject("vkDestroyImage", VK_ERROR_DEVICE_LOST);
-                return;
-            }
-            LogicalDevice* logicalDevice = deviceRef.get();
+            failUnknownObject("vkDestroyImage", VK_ERROR_DEVICE_LOST);
+            return;
+        }
+        LogicalDevice* logicalDevice = deviceRef.get();
+
+        bool     imageTrackedByLayer = false;
+        uint64_t submittedSerial     = 0;
+        guardLayerWork(logicalDevice, "vkDestroyImage", [&] {
+            std::lock_guard<std::mutex> l(logicalDevice->stateLock);
 
             // Check if this is a tracked depth image
             auto it = std::find(logicalDevice->depthImages.begin(), logicalDevice->depthImages.end(), image);
-            if (it != logicalDevice->depthImages.end())
+            if (it == logicalDevice->depthImages.end())
+                return;
+
+            // the layer's own sampled view and the app's image can both still be
+            // read by in-flight work: wait for it after the lock is released
+            imageTrackedByLayer = true;
+            submittedSerial     = logicalDevice->timeline.submittedSerial();
+            size_t i = std::distance(logicalDevice->depthImages.begin(), it);
+
+            // Remove from tracking lists
+            logicalDevice->depthImageExtents.erase(image);
+            logicalDevice->depthImageMetadata.erase(image);
+            logicalDevice->depthImages.erase(it);
+            if (i < logicalDevice->depthImageViews.size())
             {
-                // before any of this branch's destroys: the layer's own sampled view
-                // and the app's image can both still be read by in-flight work
-                drainLayerSubmissionsForDestroyLocked(logicalDevice, 2000);
-                size_t i = std::distance(logicalDevice->depthImages.begin(), it);
+                logicalDevice->retire(VK_OBJECT_TYPE_IMAGE_VIEW, handleToU64(logicalDevice->depthImageViews[i]));
+                logicalDevice->depthImageViews.erase(logicalDevice->depthImageViews.begin() + i);
+            }
+            if (i < logicalDevice->depthFormats.size())
+                logicalDevice->depthFormats.erase(logicalDevice->depthFormats.begin() + i);
 
-                // Remove from tracking lists
-                logicalDevice->depthImageExtents.erase(image);
-                logicalDevice->depthImageMetadata.erase(image);
-                logicalDevice->depthImages.erase(it);
-                // TODO what if an image gets destroyed before binding memory?
-                if (i < logicalDevice->depthImageViews.size())
-                {
-                    logicalDevice->vkd.DestroyImageView(logicalDevice->device, logicalDevice->depthImageViews[i], nullptr);
-                    logicalDevice->depthImageViews.erase(logicalDevice->depthImageViews.begin() + i);
-                }
-                if (i < logicalDevice->depthFormats.size())
-                    logicalDevice->depthFormats.erase(logicalDevice->depthFormats.begin() + i);
-
-                for (auto viewIt = logicalDevice->depthViewStates.begin(); viewIt != logicalDevice->depthViewStates.end();)
-                {
-                    if (viewIt->second.image == image)
-                        viewIt = logicalDevice->depthViewStates.erase(viewIt);
-                    else
-                        ++viewIt;
-                }
-                for (auto fbIt = logicalDevice->framebufferDepthStates.begin(); fbIt != logicalDevice->framebufferDepthStates.end();)
-                {
-                    if (fbIt->second.image == image)
-                        fbIt = logicalDevice->framebufferDepthStates.erase(fbIt);
-                    else
-                        ++fbIt;
-                }
-
-                clearTrackedDepthScopesLocked(logicalDevice, [image](const DepthState& state) { return state.image == image; });
-
-                if (logicalDevice->activeDepthState.image == image)
-                {
-                    logicalDevice->activeDepthState = {};
-                    // Also clear the pin if it references a view of this image
-                    if (logicalDevice->pinnedDepthImageView != VK_NULL_HANDLE)
-                    {
-                        auto pinIt = logicalDevice->depthViewStates.find(logicalDevice->pinnedDepthImageView);
-                        if (pinIt == logicalDevice->depthViewStates.end() || pinIt->second.image == image)
-                            logicalDevice->pinnedDepthImageView = VK_NULL_HANDLE;
-                    }
-                    // same as the view path: resolve targets and copies still
-                    // reference the image being recreated
-                    armDepthTransitionHoldLocked(logicalDevice, "active depth image destroyed");
-                    DepthState depth = getDepthState(logicalDevice);
-                    updateDeviceDepthStateLocked(logicalDevice, depth, "DestroyImage");
-                }
+            for (auto viewIt = logicalDevice->depthViewStates.begin(); viewIt != logicalDevice->depthViewStates.end();)
+            {
+                if (viewIt->second.image == image)
+                    viewIt = logicalDevice->depthViewStates.erase(viewIt);
                 else
+                    ++viewIt;
+            }
+            for (auto fbIt = logicalDevice->framebufferDepthStates.begin(); fbIt != logicalDevice->framebufferDepthStates.end();)
+            {
+                if (fbIt->second.image == image)
+                    fbIt = logicalDevice->framebufferDepthStates.erase(fbIt);
+                else
+                    ++fbIt;
+            }
+
+            clearTrackedDepthScopesLocked(logicalDevice, [image](const DepthState& state) { return state.image == image; });
+
+            if (logicalDevice->activeDepthState.image == image)
+            {
+                logicalDevice->activeDepthState = {};
+                // Also clear the pin if it references a view of this image
+                if (logicalDevice->pinnedDepthImageView != VK_NULL_HANDLE)
                 {
-                    // Image wasn't active, but clear pin if it referenced this image
-                    if (logicalDevice->pinnedDepthImageView != VK_NULL_HANDLE)
+                    auto pinIt = logicalDevice->depthViewStates.find(logicalDevice->pinnedDepthImageView);
+                    if (pinIt == logicalDevice->depthViewStates.end() || pinIt->second.image == image)
+                        logicalDevice->pinnedDepthImageView = VK_NULL_HANDLE;
+                }
+                // same as the view path: resolve targets and copies still
+                // reference the image being recreated
+                armDepthTransitionHoldLocked(logicalDevice, "active depth image destroyed");
+                DepthState depth = getDepthState(logicalDevice);
+                updateDeviceDepthStateLocked(logicalDevice, depth, "DestroyImage");
+            }
+            else
+            {
+                // Image wasn't active, but clear pin if it referenced this image
+                if (logicalDevice->pinnedDepthImageView != VK_NULL_HANDLE)
+                {
+                    auto pinIt = logicalDevice->depthViewStates.find(logicalDevice->pinnedDepthImageView);
+                    if (pinIt != logicalDevice->depthViewStates.end() && pinIt->second.image == image)
                     {
-                        auto pinIt = logicalDevice->depthViewStates.find(logicalDevice->pinnedDepthImageView);
-                        if (pinIt != logicalDevice->depthViewStates.end() && pinIt->second.image == image)
-                        {
-                            Logger::debug("DestroyImage: clearing stale pinned depth view (image destroyed)");
-                            logicalDevice->pinnedDepthImageView = VK_NULL_HANDLE;
-                        }
+                        Logger::debug("DestroyImage: clearing stale pinned depth view (image destroyed)");
+                        logicalDevice->pinnedDepthImageView = VK_NULL_HANDLE;
                     }
                 }
             }
-        }
-        deviceRef->vkd.DestroyImage(deviceRef->device, image, pAllocator);
+        });
+
+        if (imageTrackedByLayer)
+            waitLayerSubmissionsForDestroy(logicalDevice, submittedSerial, "vkDestroyImage");
+        logicalDevice->vkd.DestroyImage(logicalDevice->device, image, pAllocator);
     }
 
     ///////////////////////////////////////////////////////////////////////////////////////////
@@ -525,29 +536,26 @@ namespace
     void trackedBeginRenderPass(const char* name, VkCommandBuffer commandBuffer, const VkRenderPassBeginInfo* pRenderPassBegin,
                                 Pfn DeviceDispatch::*beginFn, Extra... extra)
     {
-        std::shared_ptr<LogicalDevice> logicalDevice;
-        {
-            scoped_lock l(globalLock);
-            logicalDevice = findDeviceLocked(GetKey(commandBuffer));
-            if (logicalDevice)
-            {
-                VkImageLayout rpDepthFinalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-                auto rpLayoutIt = renderPassDepthFinalLayouts.find(pRenderPassBegin->renderPass);
-                if (rpLayoutIt != renderPassDepthFinalLayouts.end())
-                    rpDepthFinalLayout = rpLayoutIt->second;
-                beginTrackedDepthScope(logicalDevice.get(),
-                                       commandBuffer,
-                                       selectDepthStateFromRenderPassBegin(logicalDevice.get(), pRenderPassBegin),
-                                       selectDepthSnapshotTargetFromRenderPassBegin(logicalDevice.get(), pRenderPassBegin),
-                                       rpDepthFinalLayout);
-            }
-        }
-
+        auto logicalDevice = findDevice(GetKey(commandBuffer));
         if (!logicalDevice)
         {
             failUnknownObject(name, VK_ERROR_DEVICE_LOST);
             return;
         }
+
+        guardLayerWork(logicalDevice.get(), name, [&] {
+            std::lock_guard<std::mutex> l(logicalDevice->stateLock);
+            VkImageLayout rpDepthFinalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+            auto rpLayoutIt = logicalDevice->renderPassDepthFinalLayouts.find(pRenderPassBegin->renderPass);
+            if (rpLayoutIt != logicalDevice->renderPassDepthFinalLayouts.end())
+                rpDepthFinalLayout = rpLayoutIt->second;
+            beginTrackedDepthScope(logicalDevice.get(),
+                                   commandBuffer,
+                                   selectDepthStateFromRenderPassBegin(logicalDevice.get(), pRenderPassBegin),
+                                   selectDepthSnapshotTargetFromRenderPassBegin(logicalDevice.get(), pRenderPassBegin),
+                                   rpDepthFinalLayout);
+        });
+
         (logicalDevice->vkd.*beginFn)(commandBuffer, pRenderPassBegin, extra...);
     }
 
@@ -572,6 +580,7 @@ namespace
         trackedBeginRenderPass("vkCmdBeginRenderPass2KHR", commandBuffer, pRenderPassBegin, &DeviceDispatch::CmdBeginRenderPass2KHR, pSubpassBeginInfo);
     }
 
+    // Needs logicalDevice->stateLock.
     void seedTrackedDepthScopeFromRenderingInfo(LogicalDevice* logicalDevice,
                                                 VkCommandBuffer commandBuffer,
                                                 const VkRenderingInfo* pRenderingInfo)
@@ -591,19 +600,17 @@ namespace
     void trackedBeginRendering(const char* name, const char* infoName, VkCommandBuffer commandBuffer,
                                const VkRenderingInfo* pRenderingInfo, Pfn DeviceDispatch::*beginFn)
     {
-        std::shared_ptr<LogicalDevice> logicalDevice;
-        {
-            scoped_lock l(globalLock);
-            logicalDevice = findDeviceLocked(GetKey(commandBuffer));
-            if (logicalDevice)
-                seedTrackedDepthScopeFromRenderingInfo(logicalDevice.get(), commandBuffer, pRenderingInfo);
-        }
-
+        auto logicalDevice = findDevice(GetKey(commandBuffer));
         if (!logicalDevice)
         {
             failUnknownObject(name, VK_ERROR_DEVICE_LOST);
             return;
         }
+
+        guardLayerWork(logicalDevice.get(), name, [&] {
+            std::lock_guard<std::mutex> l(logicalDevice->stateLock);
+            seedTrackedDepthScopeFromRenderingInfo(logicalDevice.get(), commandBuffer, pRenderingInfo);
+        });
 
         if (pRenderingInfo)
         {
@@ -655,8 +662,9 @@ namespace
     // NO command recording happens here.
     void finishTrackedDepthScope(LogicalDevice* logicalDevice, VkCommandBuffer commandBuffer, const char* reason)
     {
-        const int method = settingsManager.getDepthCaptureMethod();
-        scoped_lock l(globalLock);
+        const auto settings = settingsManager.snapshot();
+        const int  method   = settings->depthCaptureMethod;
+        std::lock_guard<std::mutex> l(logicalDevice->stateLock);
         DepthState promoted = {};
         DepthSnapshotTarget snapTarget = {};
         if (method == 1 || method == 2)
@@ -692,7 +700,9 @@ namespace
             return;
         }
         (logicalDevice->vkd.*endFn)(commandBuffer, args...);
-        finishTrackedDepthScope(logicalDevice.get(), commandBuffer, name + 2);  // reason: the name without "vk"
+        guardLayerWork(logicalDevice.get(), name, [&] {
+            finishTrackedDepthScope(logicalDevice.get(), commandBuffer, name + 2);  // reason: the name without "vk"
+        });
     }
 
     VKAPI_ATTR void VKAPI_CALL VkHook_CmdEndRenderPass(VkCommandBuffer commandBuffer)
@@ -726,19 +736,17 @@ namespace
     template <typename Pfn, typename... Args>
     void trackedDraw(const char* name, VkCommandBuffer commandBuffer, uint32_t drawCount, Pfn DeviceDispatch::*drawFn, Args... args)
     {
-        std::shared_ptr<LogicalDevice> logicalDevice;
-        {
-            scoped_lock l(globalLock);
-            logicalDevice = findDeviceLocked(GetKey(commandBuffer));
-            if (logicalDevice)
-                countTrackedDepthDraw(logicalDevice.get(), commandBuffer, drawCount);
-        }
-
+        auto logicalDevice = findDevice(GetKey(commandBuffer));
         if (!logicalDevice)
         {
             failUnknownObject(name, VK_ERROR_DEVICE_LOST);
             return;
         }
+
+        guardLayerWork(logicalDevice.get(), name, [&] {
+            std::lock_guard<std::mutex> l(logicalDevice->stateLock);
+            countTrackedDepthDraw(logicalDevice.get(), commandBuffer, drawCount);
+        });
         (logicalDevice->vkd.*drawFn)(commandBuffer, args...);
     }
 
@@ -795,8 +803,10 @@ namespace
         }
 
         logicalDevice->vkd.CmdCopyImage(commandBuffer, srcImage, srcImageLayout, dstImage, dstImageLayout, regionCount, pRegions);
-        scoped_lock l(globalLock);
-        tryActivatePendingTransferLinkedDepthScope(logicalDevice.get(), commandBuffer, dstImage, "CmdCopyImage");
+        guardLayerWork(logicalDevice.get(), "vkCmdCopyImage", [&] {
+            std::lock_guard<std::mutex> l(logicalDevice->stateLock);
+            tryActivatePendingTransferLinkedDepthScope(logicalDevice.get(), commandBuffer, dstImage, "CmdCopyImage");
+        });
     }
 
     VKAPI_ATTR void VKAPI_CALL VkHook_CmdBlitImage(VkCommandBuffer commandBuffer,
@@ -816,27 +826,27 @@ namespace
         }
 
         logicalDevice->vkd.CmdBlitImage(commandBuffer, srcImage, srcImageLayout, dstImage, dstImageLayout, regionCount, pRegions, filter);
-        scoped_lock l(globalLock);
-        tryActivatePendingTransferLinkedDepthScope(logicalDevice.get(), commandBuffer, dstImage, "CmdBlitImage");
+        guardLayerWork(logicalDevice.get(), "vkCmdBlitImage", [&] {
+            std::lock_guard<std::mutex> l(logicalDevice->stateLock);
+            tryActivatePendingTransferLinkedDepthScope(logicalDevice.get(), commandBuffer, dstImage, "CmdBlitImage");
+        });
     }
 
     VKAPI_ATTR void VKAPI_CALL VkHook_CmdExecuteCommands(VkCommandBuffer commandBuffer,
                                                          uint32_t commandBufferCount,
                                                          const VkCommandBuffer* pCommandBuffers)
     {
-        std::shared_ptr<LogicalDevice> logicalDevice;
-        {
-            scoped_lock l(globalLock);
-            logicalDevice = findDeviceLocked(GetKey(commandBuffer));
-            if (logicalDevice)
-                accumulateExecutedCommandBufferDraws(logicalDevice.get(), commandBuffer, pCommandBuffers, commandBufferCount);
-        }
-
+        auto logicalDevice = findDevice(GetKey(commandBuffer));
         if (!logicalDevice)
         {
             failUnknownObject("vkCmdExecuteCommands", VK_ERROR_DEVICE_LOST);
             return;
         }
+
+        guardLayerWork(logicalDevice.get(), "vkCmdExecuteCommands", [&] {
+            std::lock_guard<std::mutex> l(logicalDevice->stateLock);
+            accumulateExecutedCommandBufferDraws(logicalDevice.get(), commandBuffer, pCommandBuffers, commandBufferCount);
+        });
         logicalDevice->vkd.CmdExecuteCommands(commandBuffer, commandBufferCount, pCommandBuffers);
     }
 
@@ -850,33 +860,29 @@ namespace
                                                                 uint32_t rangeCount,
                                                                 const VkImageSubresourceRange* pRanges)
     {
-        std::shared_ptr<LogicalDevice> logicalDevice;
-        {
-            scoped_lock l(globalLock);
-            logicalDevice = findDeviceLocked(GetKey(commandBuffer));
-            if (logicalDevice)
-            {
-                const auto& activeDepth = logicalDevice->activeDepthState;
-                if (activeDepth.image == image && hasDepthState(activeDepth))
-                {
-                    // Snapshot helpers read tracked resources under globalLock. The
-                    // clear's explicit layout is authoritative, not the last draw's.
-                    DepthState sourceDepth = activeDepth;
-                    sourceDepth.observedLayout = imageLayout;
-                    VKHOOK_LOG_DEBUG([&](std::string& s) {
-                        s = "CmdClearDepthStencilImage: preserving depth before clear of active depth image="
-                            + convertToString(image);
-                    });
-                    recordDepthResolveSnapshotForAllSwapchains(logicalDevice.get(), commandBuffer, sourceDepth);
-                }
-            }
-        }
-
+        auto logicalDevice = findDevice(GetKey(commandBuffer));
         if (!logicalDevice)
         {
             failUnknownObject("vkCmdClearDepthStencilImage", VK_ERROR_DEVICE_LOST);
             return;
         }
+
+        guardLayerWork(logicalDevice.get(), "vkCmdClearDepthStencilImage", [&] {
+            std::lock_guard<std::mutex> l(logicalDevice->stateLock);
+            const auto& activeDepth = logicalDevice->activeDepthState;
+            if (activeDepth.image == image && hasDepthState(activeDepth))
+            {
+                // Snapshot helpers read tracked resources under stateLock. The
+                // clear's explicit layout is authoritative, not the last draw's.
+                DepthState sourceDepth = activeDepth;
+                sourceDepth.observedLayout = imageLayout;
+                VKHOOK_LOG_DEBUG([&](std::string& s) {
+                    s = "CmdClearDepthStencilImage: preserving depth before clear of active depth image="
+                        + convertToString(image);
+                });
+                recordDepthResolveSnapshotForAllSwapchains(logicalDevice.get(), commandBuffer, sourceDepth);
+            }
+        });
         logicalDevice->vkd.CmdClearDepthStencilImage(commandBuffer, image, imageLayout, pDepthStencil, rangeCount, pRanges);
     }
 
@@ -886,27 +892,42 @@ namespace
     VKAPI_ATTR VkResult VKAPI_CALL VkHook_BeginCommandBuffer(VkCommandBuffer commandBuffer,
                                                              const VkCommandBufferBeginInfo* pBeginInfo)
     {
-        std::shared_ptr<LogicalDevice> logicalDevice;
-        {
-            scoped_lock l(globalLock);
-            logicalDevice = findDeviceLocked(GetKey(commandBuffer));
-            if (logicalDevice)
-            {
-                logicalDevice->commandBufferRecordedDrawCounts[commandBuffer] = 0;
-                logicalDevice->commandBufferDepthStates.erase(commandBuffer);
-                logicalDevice->pendingTransferLinkedDepthScopes.erase(commandBuffer);
-            }
-        }
-
         // The loader reaches this hook only for command buffers of a device this
         // layer created (see failUnknownObject), so an unknown device means the
         // application is using a command buffer of a destroyed device. There is no
         // dispatch table to call down through, and succeeding without recording
         // anything would hide the bug: fail with a once-only log instead.
+        auto logicalDevice = findDevice(GetKey(commandBuffer));
         if (!logicalDevice)
             return failUnknownObject("vkBeginCommandBuffer", VK_ERROR_DEVICE_LOST);
 
+        guardLayerWork(logicalDevice.get(), "vkBeginCommandBuffer", [&] {
+            std::lock_guard<std::mutex> l(logicalDevice->stateLock);
+            logicalDevice->commandBufferRecordedDrawCounts[commandBuffer] = 0;
+            logicalDevice->commandBufferDepthStates.erase(commandBuffer);
+            logicalDevice->pendingTransferLinkedDepthScopes.erase(commandBuffer);
+        });
         return logicalDevice->vkd.BeginCommandBuffer(commandBuffer, pBeginInfo);
+    }
+
+    VKAPI_ATTR VkResult VKAPI_CALL VkHook_AllocateCommandBuffers(VkDevice device,
+                                                                 const VkCommandBufferAllocateInfo* pAllocateInfo,
+                                                                 VkCommandBuffer* pCommandBuffers)
+    {
+        auto logicalDevice = findDevice(GetKey(device));
+        if (!logicalDevice)
+            return failUnknownObject("vkAllocateCommandBuffers", VK_ERROR_DEVICE_LOST);
+
+        VkResult result = logicalDevice->vkd.AllocateCommandBuffers(device, pAllocateInfo, pCommandBuffers);
+        if (result == VK_SUCCESS && pAllocateInfo && pCommandBuffers)
+        {
+            guardLayerWork(logicalDevice.get(), "vkAllocateCommandBuffers", [&] {
+                std::lock_guard<std::mutex> l(logicalDevice->stateLock);
+                auto& poolBuffers = logicalDevice->commandPoolBuffers[pAllocateInfo->commandPool];
+                poolBuffers.insert(poolBuffers.end(), pCommandBuffers, pCommandBuffers + pAllocateInfo->commandBufferCount);
+            });
+        }
+        return result;
     }
 
     VKAPI_ATTR void VKAPI_CALL VkHook_FreeCommandBuffers(VkDevice device,
@@ -914,27 +935,81 @@ namespace
                                                          uint32_t commandBufferCount,
                                                          const VkCommandBuffer* pCommandBuffers)
     {
-        std::shared_ptr<LogicalDevice> logicalDevice;
-        {
-            scoped_lock l(globalLock);
-            logicalDevice = findDeviceLocked(GetKey(device));
-            if (logicalDevice && pCommandBuffers)
-            {
-                for (uint32_t i = 0; i < commandBufferCount; ++i)
-                {
-                    logicalDevice->commandBufferRecordedDrawCounts.erase(pCommandBuffers[i]);
-                    logicalDevice->commandBufferDepthStates.erase(pCommandBuffers[i]);
-                    logicalDevice->pendingTransferLinkedDepthScopes.erase(pCommandBuffers[i]);
-                }
-            }
-        }
-
+        auto logicalDevice = findDevice(GetKey(device));
         if (!logicalDevice)
         {
             failUnknownObject("vkFreeCommandBuffers", VK_ERROR_DEVICE_LOST);
             return;
         }
+
+        if (pCommandBuffers)
+        {
+            guardLayerWork(logicalDevice.get(), "vkFreeCommandBuffers", [&] {
+                std::lock_guard<std::mutex> l(logicalDevice->stateLock);
+                auto poolIt = logicalDevice->commandPoolBuffers.find(commandPool);
+                for (uint32_t i = 0; i < commandBufferCount; ++i)
+                {
+                    dropCommandBufferStateLocked(logicalDevice.get(), pCommandBuffers[i]);
+                    if (poolIt != logicalDevice->commandPoolBuffers.end())
+                    {
+                        auto& poolBuffers = poolIt->second;
+                        poolBuffers.erase(std::remove(poolBuffers.begin(), poolBuffers.end(), pCommandBuffers[i]), poolBuffers.end());
+                    }
+                }
+            });
+        }
         logicalDevice->vkd.FreeCommandBuffers(device, commandPool, commandBufferCount, pCommandBuffers);
+    }
+
+    VKAPI_ATTR VkResult VKAPI_CALL VkHook_ResetCommandPool(VkDevice device, VkCommandPool commandPool, VkCommandPoolResetFlags flags)
+    {
+        auto logicalDevice = findDevice(GetKey(device));
+        if (!logicalDevice)
+            return failUnknownObject("vkResetCommandPool", VK_ERROR_DEVICE_LOST);
+
+        guardLayerWork(logicalDevice.get(), "vkResetCommandPool", [&] {
+            std::lock_guard<std::mutex> l(logicalDevice->stateLock);
+            auto poolIt = logicalDevice->commandPoolBuffers.find(commandPool);
+            if (poolIt == logicalDevice->commandPoolBuffers.end())
+                return;
+            for (VkCommandBuffer commandBuffer : poolIt->second)
+                dropCommandBufferStateLocked(logicalDevice.get(), commandBuffer);
+        });
+        return logicalDevice->vkd.ResetCommandPool(device, commandPool, flags);
+    }
+
+    VKAPI_ATTR void VKAPI_CALL VkHook_DestroyCommandPool(VkDevice device, VkCommandPool commandPool, const VkAllocationCallbacks* pAllocator)
+    {
+        auto logicalDevice = findDevice(GetKey(device));
+        if (!logicalDevice)
+        {
+            failUnknownObject("vkDestroyCommandPool", VK_ERROR_DEVICE_LOST);
+            return;
+        }
+
+        guardLayerWork(logicalDevice.get(), "vkDestroyCommandPool", [&] {
+            std::lock_guard<std::mutex> l(logicalDevice->stateLock);
+            auto poolIt = logicalDevice->commandPoolBuffers.find(commandPool);
+            if (poolIt == logicalDevice->commandPoolBuffers.end())
+                return;
+            for (VkCommandBuffer commandBuffer : poolIt->second)
+                dropCommandBufferStateLocked(logicalDevice.get(), commandBuffer);
+            logicalDevice->commandPoolBuffers.erase(poolIt);
+        });
+        logicalDevice->vkd.DestroyCommandPool(device, commandPool, pAllocator);
+    }
+
+    VKAPI_ATTR VkResult VKAPI_CALL VkHook_ResetCommandBuffer(VkCommandBuffer commandBuffer, VkCommandBufferResetFlags flags)
+    {
+        auto logicalDevice = findDevice(GetKey(commandBuffer));
+        if (!logicalDevice)
+            return failUnknownObject("vkResetCommandBuffer", VK_ERROR_DEVICE_LOST);
+
+        guardLayerWork(logicalDevice.get(), "vkResetCommandBuffer", [&] {
+            std::lock_guard<std::mutex> l(logicalDevice->stateLock);
+            dropCommandBufferStateLocked(logicalDevice.get(), commandBuffer);
+        });
+        return logicalDevice->vkd.ResetCommandBuffer(commandBuffer, flags);
     }
 
     const InterceptEntry kDepthIntercepts[] = {
@@ -943,23 +1018,27 @@ namespace
         VKHOOK_INTERCEPT(DepthCapture, CreateImageView),
         VKHOOK_INTERCEPT(DepthCapture, DestroyImageView),
         VKHOOK_INTERCEPT(DepthCapture, CreateRenderPass),
-        VKHOOK_INTERCEPT(DepthCapture, CreateRenderPass2),
-        VKHOOK_INTERCEPT(DepthCapture, CreateRenderPass2KHR),
+        VKHOOK_INTERCEPT_EXT(DepthCapture, CreateRenderPass2, nullptr, VK_API_VERSION_1_2),
+        VKHOOK_INTERCEPT_EXT(DepthCapture, CreateRenderPass2KHR, VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME, 0),
         VKHOOK_INTERCEPT(DepthCapture, DestroyRenderPass),
         VKHOOK_INTERCEPT(DepthCapture, CreateFramebuffer),
         VKHOOK_INTERCEPT(DepthCapture, DestroyFramebuffer),
         VKHOOK_INTERCEPT(DepthCapture, BeginCommandBuffer),
+        VKHOOK_INTERCEPT(DepthCapture, AllocateCommandBuffers),
         VKHOOK_INTERCEPT(DepthCapture, FreeCommandBuffers),
+        VKHOOK_INTERCEPT(DepthCapture, ResetCommandPool),
+        VKHOOK_INTERCEPT(DepthCapture, DestroyCommandPool),
+        VKHOOK_INTERCEPT(DepthCapture, ResetCommandBuffer),
         VKHOOK_INTERCEPT(DepthCapture, CmdBeginRenderPass),
-        VKHOOK_INTERCEPT(DepthCapture, CmdBeginRenderPass2),
-        VKHOOK_INTERCEPT(DepthCapture, CmdBeginRenderPass2KHR),
-        VKHOOK_INTERCEPT(DepthCapture, CmdBeginRendering),
-        VKHOOK_INTERCEPT(DepthCapture, CmdBeginRenderingKHR),
+        VKHOOK_INTERCEPT_EXT(DepthCapture, CmdBeginRenderPass2, nullptr, VK_API_VERSION_1_2),
+        VKHOOK_INTERCEPT_EXT(DepthCapture, CmdBeginRenderPass2KHR, VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME, 0),
+        VKHOOK_INTERCEPT_EXT(DepthCapture, CmdBeginRendering, nullptr, VK_API_VERSION_1_3),
+        VKHOOK_INTERCEPT_EXT(DepthCapture, CmdBeginRenderingKHR, VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME, 0),
         VKHOOK_INTERCEPT(DepthCapture, CmdEndRenderPass),
-        VKHOOK_INTERCEPT(DepthCapture, CmdEndRenderPass2),
-        VKHOOK_INTERCEPT(DepthCapture, CmdEndRenderPass2KHR),
-        VKHOOK_INTERCEPT(DepthCapture, CmdEndRendering),
-        VKHOOK_INTERCEPT(DepthCapture, CmdEndRenderingKHR),
+        VKHOOK_INTERCEPT_EXT(DepthCapture, CmdEndRenderPass2, nullptr, VK_API_VERSION_1_2),
+        VKHOOK_INTERCEPT_EXT(DepthCapture, CmdEndRenderPass2KHR, VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME, 0),
+        VKHOOK_INTERCEPT_EXT(DepthCapture, CmdEndRendering, nullptr, VK_API_VERSION_1_3),
+        VKHOOK_INTERCEPT_EXT(DepthCapture, CmdEndRenderingKHR, VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME, 0),
         VKHOOK_INTERCEPT(DepthCapture, CmdBlitImage),
         VKHOOK_INTERCEPT(DepthCapture, CmdClearDepthStencilImage),
         VKHOOK_INTERCEPT(DepthCapture, CmdCopyImage),
@@ -968,10 +1047,10 @@ namespace
         VKHOOK_INTERCEPT(DepthCapture, CmdDrawIndexed),
         VKHOOK_INTERCEPT(DepthCapture, CmdDrawIndirect),
         VKHOOK_INTERCEPT(DepthCapture, CmdDrawIndexedIndirect),
-        VKHOOK_INTERCEPT(DepthCapture, CmdDrawIndirectCount),
-        VKHOOK_INTERCEPT(DepthCapture, CmdDrawIndirectCountKHR),
-        VKHOOK_INTERCEPT(DepthCapture, CmdDrawIndexedIndirectCount),
-        VKHOOK_INTERCEPT(DepthCapture, CmdDrawIndexedIndirectCountKHR),
+        VKHOOK_INTERCEPT_EXT(DepthCapture, CmdDrawIndirectCount, nullptr, VK_API_VERSION_1_2),
+        VKHOOK_INTERCEPT_EXT(DepthCapture, CmdDrawIndirectCountKHR, VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME, 0),
+        VKHOOK_INTERCEPT_EXT(DepthCapture, CmdDrawIndexedIndirectCount, nullptr, VK_API_VERSION_1_2),
+        VKHOOK_INTERCEPT_EXT(DepthCapture, CmdDrawIndexedIndirectCountKHR, VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME, 0),
     };
 } // namespace
 

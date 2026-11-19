@@ -1,6 +1,6 @@
 #include "imgui_overlay.hh"
 
-#include "vk_handle.hh"
+#include "layer/registry.hh"
 #include "effects/effect_registry.hh"
 #include "settings_manager.hh"
 #include "reshade_parser.hh"
@@ -101,8 +101,10 @@ namespace VkHook
         CHECK_FUNC(GetImageMemoryRequirements);
         CHECK_FUNC(GetSwapchainImagesKHR);
         CHECK_FUNC(MapMemory);
-        CHECK_FUNC(QueueSubmit);
-        CHECK_FUNC(QueueWaitIdle);
+        // Queue entry points exist only in the layer's locked QueueTable; the
+        // device dispatch table has none.
+        if (strcmp(function_name, "vkQueueSubmit") == 0 || strcmp(function_name, "vkQueueWaitIdle") == 0)
+            return layerDeviceProcAddr()(device->device, function_name);
         CHECK_FUNC(ResetCommandPool);
         CHECK_FUNC(ResetFences);
         CHECK_FUNC(UnmapMemory);
@@ -227,9 +229,7 @@ namespace VkHook
         // the layer tears down rather than racing process exit.
         PersistenceQueue::instance().waitForIdle();
 
-        logicalDevice->vkd.QueueWaitIdle(logicalDevice->queue);
-
-        // Release ImGui's descriptor references before the deferred pool teardown.
+        // Release ImGui's descriptor references before the pool is retired.
         if (backendInitialized)
             ImGui_ImplVulkan_Shutdown();
         ImGuiContext* const owned = imguiContext;
@@ -238,42 +238,31 @@ namespace VkHook
         // hand back whichever context the host had, unless that was ours
         ImGui::SetCurrentContext(previousContext == owned ? nullptr : previousContext);
 
-        // Deferred, like every other owner. The QueueWaitIdle above already makes
-        // this a safe moment, but inline destruction still meant that an overlay
-        // torn down during device teardown would call into a destroyed VkDevice.
-        // Handing the handles over means the flush at device destroy decides when
-        // they actually go, and the handle is still valid when it does.
-        auto& queue   = DeferredDestroyQueue::instance();
-        auto  device = logicalDevice->device;
-        auto& vkd    = logicalDevice->vkd;
-
-        const VkCommandPool   pool = commandPool;
-        const VkRenderPass    pass = renderPass;
+        // The overlay is destroyed only in vkDestroyDevice, after the device went
+        // idle; the layer drains the retire queue right after this.
+        const VkCommandPool    pool     = commandPool;
+        const VkRenderPass     pass     = renderPass;
         const VkDescriptorPool descPool = descriptorPool;
 
-        if (pool != VK_NULL_HANDLE)
-            queue.push(DestroyPhase::Resource, [vkd, device, pool] { vkd.DestroyCommandPool(device, pool, nullptr); });
-
-        if (descPool != VK_NULL_HANDLE)
-            queue.push(DestroyPhase::Descriptor, [vkd, device, descPool] { vkd.DestroyDescriptorPool(device, descPool, nullptr); });
-
-        // framebuffers before the pass they were created from
-        for (auto fb : framebuffers)
-        {
-            if (fb != VK_NULL_HANDLE)
-                queue.push(DestroyPhase::RenderPass, [vkd, device, fb] { vkd.DestroyFramebuffer(device, fb, nullptr); });
-        }
-        if (pass != VK_NULL_HANDLE)
-            queue.push(DestroyPhase::RenderPass, [vkd, device, pass] { vkd.DestroyRenderPass(device, pass, nullptr); });
-
-        // Fences are the earliest phase: a fence whose command pool is gone is
-        // fine to destroy, but a command pool destroyed while a submitted fence
-        // is still unsignalled is not, and the pool lands in Resource.
         for (auto fence : commandBufferFences)
         {
             if (fence != VK_NULL_HANDLE)
-                queue.push(DestroyPhase::Sync, [vkd, device, fence] { vkd.DestroyFence(device, fence, nullptr); });
+                logicalDevice->retire(VK_OBJECT_TYPE_FENCE, handleToU64(fence));
         }
+
+        if (pool != VK_NULL_HANDLE)
+            logicalDevice->retire(VK_OBJECT_TYPE_COMMAND_POOL, handleToU64(pool));
+
+        if (descPool != VK_NULL_HANDLE)
+            logicalDevice->retire(VK_OBJECT_TYPE_DESCRIPTOR_POOL, handleToU64(descPool));
+
+        for (auto fb : framebuffers)
+        {
+            if (fb != VK_NULL_HANDLE)
+                logicalDevice->retire(VK_OBJECT_TYPE_FRAMEBUFFER, handleToU64(fb));
+        }
+        if (pass != VK_NULL_HANDLE)
+            logicalDevice->retire(VK_OBJECT_TYPE_RENDER_PASS, handleToU64(pass));
 
         Logger::info("ImGui overlay destroyed");
     }
