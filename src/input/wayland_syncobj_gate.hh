@@ -12,13 +12,16 @@ namespace VkHook
     // through any marshalling we can see, so the presenter's side is bracketed
     // around the driver present call instead.
     //
-    // Per surface there is one shared_timed_mutex. The presenter holds it
-    // exclusively from beginPresent to endPresent; every other thread holds it
-    // shared across the actual commit send (CommitScope). There is no
-    // check-then-act: a commit either holds the lock while it is sent, in which
-    // case beginPresent waits for it, or it waits behind the open present.
-    // Both waits are bounded by a budget so a wedged thread cannot park the
-    // other forever; when a budget runs out the lock is skipped and warned.
+    // Per surface the presenter holds an exclusive bracket from beginPresent to
+    // endPresent; every other thread holds it shared across the actual commit send
+    // (CommitScope). There is no check-then-act: a commit either holds the gate while
+    // it is sent, in which case beginPresent waits for it, or it waits behind the open
+    // present. There is no timeout escape either: letting a commit through behind an
+    // open present is the very error being prevented (formal/VkHookFormal/SyncobjGate.lean
+    // reaches it from the old wait budget). Both critical sections are short and wait on
+    // nothing but each other. A presenter that waits for the gate holds new commits back,
+    // so a stream of commits cannot starve it. A thread bracketing several surfaces must
+    // take them in a fixed order (present.cc sorts the surface ids).
     namespace WaylandSyncobjGate
     {
         // surface id of the captured wayland window, 0 when not on wayland
@@ -52,8 +55,7 @@ namespace VkHook
         // diagnostics: commits that were actually made to wait
         uint64_t heldCount();
 
-        // test hooks
-        void setWaitBudgetForTests(uint64_t microseconds);
+        // test hook
         void resetForTests();
     }
 } // namespace VkHook

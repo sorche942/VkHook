@@ -507,8 +507,17 @@ sidecar's `Effects=` list.
   looks up the cache for a whole chain on one worker thread with no layer lock:
   `submit(spec)` returns a `std::shared_future<ChainCompileResult>` holding every
   effect's module and its technique reflection. A newer `submit` on the same
-  channel cancels the older request. Building Vulkan objects from the result stays
-  on the present path.
+  channel cancels the older request. The registry's own initial build
+  (`initialize()`, at device creation and on a config switch) and its macro
+  re-parses run there too, so no shader parse or compile runs on a present thread
+  or in `vkCreateDevice`.
+* **Chain builds.** A chain (re)build submits one `ChainCompileSpec` for the
+  swapchain's ReShade entries (`beginChainBuild`, one compile channel per
+  swapchain) and returns. At a later present `advanceChainBuild` finds the future
+  ready, constructs the effects with the `precompiled` results (Vulkan objects are
+  still built on the present path) and swaps the generation in with no lock held.
+  A swapchain's first chain is requested as soon as the registry's initial build
+  has the selection; until then it presents through the copy chain.
 * **Macros.** Changing a macro value in the overlay re-parses that effect's
   parameter list on the worker, so macro-gated uniforms appear (and vanish)
   without a restart; values of parameters that survive are kept.

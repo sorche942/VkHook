@@ -37,10 +37,9 @@ Next: correctness and architecture (AGENTS.md catalog, still open)
    DH_UI_TextDetect need independently ordered BEFORE/AFTER techniques).
 4. H21  VRAM: imageCount x (maxEffects+1) full-resolution images and the silent
    drop of effects beyond the cap; pool and alias intermediates.
-5. H2  Compile effects on a worker thread, swap at present (today compiles run on the
-   present thread without a lock held).
+5. H2  done: the registry's parses and the chain compiles run on its worker (WORKFLOWS).
 6. Invariant 13: remaining process-global mutable state (baseConfig, config,
-   effectRegistry, cachedEffects, activeProfile*, DLSS5 ModelCache, shader cache,
+   cachedEffects, activeProfile*, DLSS5 ModelCache, shader cache,
    Wayland-interpose statics). Make them per-device/per-swapchain or LayerContext.
 7. Unify createRenderPass and createEffectRenderPass (different layouts, load ops,
    dependencies).

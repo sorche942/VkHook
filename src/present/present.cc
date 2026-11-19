@@ -20,6 +20,7 @@
 #include "wayland_syncobj_gate.hh"
 #include "effects/effect.hh"
 
+#include <algorithm>
 #include <chrono>
 #include <memory>
 #include <optional>
@@ -70,6 +71,8 @@ namespace
             if (surfaceId && std::find(out.begin(), out.end(), surfaceId) == out.end())
                 out.push_back(surfaceId);
         }
+        // brackets are blocking: two presenters of the same windows must take them in one order
+        std::sort(out.begin(), out.end());
     }
 
     // The real present, bracketed so Mesa's explicit-sync points inside it

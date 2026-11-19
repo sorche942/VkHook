@@ -99,13 +99,13 @@ int main()
         CHECK(microsSince(start) < 5000);
     }
 
-    // endPresent from another thread must not close the bracket
+    // endPresent from another thread must not close the bracket: the foreign commit
+    // stays held until the owner closes it, however long that takes
     {
         resetForTests();
-        setWaitBudgetForTests(20000);
-        std::atomic<uint64_t> waited{0};
         std::atomic<bool> presentOpen{false};
         std::atomic<bool> finish{false};
+        std::atomic<bool> committed{false};
 
         std::thread presenter([&] {
             beginPresent(SURFACE);
@@ -121,48 +121,67 @@ int main()
         endPresent(SURFACE); // different thread: ignored
 
         std::thread foreign([&] {
-            auto start = Clock::now();
             commitOnce(SURFACE);
-            waited.store(microsSince(start));
+            committed.store(true);
         });
-        foreign.join();
-        CHECK(waited.load() >= 18000);
+        std::this_thread::sleep_for(std::chrono::milliseconds(60));
+        CHECK(!committed.load()); // no wait budget lets it through
 
         finish.store(true);
         presenter.join();
+        foreign.join();
+        CHECK(committed.load());
+        CHECK(heldCount() == 1);
         resetForTests();
     }
 
-    // bound: a present that never closes cannot park commits forever
+    // a second presenter waits for the first one's bracket, and every commit
+    // behind it stays held until both are done
     {
         resetForTests();
-        setWaitBudgetForTests(20000);
-        beginPresent(SURFACE); // opened by this thread, never ended
-
-        std::atomic<uint64_t> first{0};
-        std::atomic<uint64_t> second{0};
-
-        std::thread a([&] {
-            auto start = Clock::now();
-            commitOnce(SURFACE);
-            first.store(microsSince(start));
+        std::atomic<bool> firstOpen{false};
+        std::atomic<bool> firstDone{false};
+        std::atomic<bool> secondOpened{false};
+        std::thread first([&] {
+            beginPresent(SURFACE);
+            firstOpen.store(true);
+            std::this_thread::sleep_for(std::chrono::milliseconds(40));
+            firstDone.store(true);
+            endPresent(SURFACE);
         });
-        a.join();
-
-        std::thread b([&] {
-            auto start = Clock::now();
-            commitOnce(SURFACE);
-            second.store(microsSince(start));
+        while (!firstOpen.load())
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        std::thread second([&] {
+            beginPresent(SURFACE);
+            CHECK(firstDone.load());
+            secondOpened.store(true);
+            endPresent(SURFACE);
         });
-        b.join();
+        first.join();
+        second.join();
+        CHECK(secondOpened.load());
+        CHECK(!anyPresentOpen());
+    }
 
-        CHECK(first.load() >= 18000);
-        CHECK(first.load() < 500000);
-        CHECK(second.load() >= 18000);
-        CHECK(second.load() < 500000);
-        CHECK(heldCount() == 2);
-
+    // a presenter is not starved by a steady stream of commits
+    {
         resetForTests();
+        std::atomic<bool> stop{false};
+        std::vector<std::thread> committers;
+        for (int i = 0; i < 4; ++i)
+            committers.emplace_back([&] {
+                while (!stop.load())
+                    commitOnce(SURFACE);
+            });
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        auto start = Clock::now();
+        beginPresent(SURFACE);
+        const uint64_t waited = microsSince(start);
+        endPresent(SURFACE);
+        stop.store(true);
+        for (auto& t : committers)
+            t.join();
+        CHECK(waited < 20'000'000);
     }
 
     // surfaces are independent: a present on one never holds a commit on another
