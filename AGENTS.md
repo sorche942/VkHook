@@ -48,7 +48,12 @@ Report only checks you actually ran.
 
 | Path | Contents |
 |---|---|
-| `src/core/` | Layer entry points and global state (`vkhook.cc`, which is being split; see §5), config (`config/`), logger, async writer, utils |
+| `src/layer/` | Entry points (GIPA/GDPA, intercept table), instance/device create, shared layer state |
+| `src/present/` | Swapchain create/destroy, effect chain build, `QueuePresentKHR` steps, queue submit hooks |
+| `src/depth/` | Depth-tracking `vkCmd*`/create/destroy hooks and the depth tracker |
+| `src/control/` | Hotkeys, hot-reload, profile switching, ReShade preset import |
+| `src/diag/` | GPU crash diagnostics, `panicLayer` |
+| `src/core/` | Config (`config/`: INI tokenizer, paths, `PersistenceQueue`, settings), logger, utils |
 | `src/render/` | Thin Vulkan helpers: images, buffers, render passes, pipelines, descriptor sets, swapchain state, dispatch tables, depth state |
 | `src/effects/` | Effect interface, ReShade runtime (`effect_reshade.cc`), parser, uniforms, texture pool, compile cache, DLSS5 effect, GLSL shaders |
 | `src/overlay/` | ImGui overlay, views, parameter field editors |
@@ -64,7 +69,7 @@ Report only checks you actually ran.
 ## 3. Target architecture
 
 The overhaul (§5) moves the code toward this shape. New code goes into the target modules. Do
-not grow `vkhook.cc` or `LogicalDevice`.
+not add global state to `layer/state.hh` or grow `LogicalDevice`.
 
 ```
 layer/entry        GIPA/GDPA, interface negotiation, one table {name, fn, required ext/version}
@@ -105,13 +110,15 @@ Each rule names the failure it prevents. Rules marked **[F]** are modeled and pr
    looks safe". [F: `RetireQueue`]
 4. **The layer does not record its pipelines, descriptor sets or render passes into application
    command buffers.** The only allowed injection is a transfer-only copy into layer-owned storage.
-   That storage's lifetime is then tied to the app submissions that reference it (fence appended on
-   the same queue). [F: `ChainRebuild`]
+   That storage may be destroyed only when no in-flight submission references it and no recorded
+   app command buffer is still bound to it. A recorded buffer can be resubmitted later, so this
+   requires tracking reset/re-begin/free/pool-reset/pool-destroy (H8). Without that tracking,
+   inject only into `ONE_TIME_SUBMIT` buffers. [F: `ChainRebuild`]
 5. **Present never shows an image the game did not render.** For a swapchain whose images were
    replaced by fakes, every present goes through a layer submission. That submission waits on the
    app's present semaphores, consuming each exactly once, and writes the real image. Valid modes
-   are `Effects` and `CopyOnly`. `Passthrough` is legal only for never-faked swapchains.
-   [F: `PresentModes`]
+   are `Effects` and `CopyOnly`. `Passthrough` is legal only for never-faked swapchains:
+   `mode = faked ? (bypass ? CopyOnly : Effects) : Passthrough`. [F: `PresentModes`]
 6. **Chain or depth rebuilds swap generations atomically.** Command buffers reference exactly one
    resource generation. A generation is retired only after its last submission completes.
    [F: `ChainRebuild`]
@@ -213,7 +220,7 @@ Each protocol model has these parts:
 | `LockDiscipline` | Invariants 1–2 (no deadlock with app semaphore chains) | `gpu/queue`, every hook |
 | `PresentModes` | Invariant 5 | `present/present` |
 | `ChainRebuild` | Invariants 4, 6 | `present/swapchain`, `effects/graph`, `depth/tracker` |
-| `SyncobjGate` | Commit/present exclusion on Wayland explicit sync | `input/wayland_syncobj_gate` |
+| `SyncobjGate` | Commit/present exclusion on Wayland explicit sync. Same-thread owner bypass is required (Mesa commits from inside the driver present); no wait-budget escape; `beginPresent` drains in-flight commits | `input/wayland_syncobj_gate` |
 | `PersistenceQueue` | Invariant 12 | `config/persist` |
 
 Rules:
