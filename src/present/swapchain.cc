@@ -262,7 +262,7 @@ namespace
             return false;
         }
 
-        createEffectsForSwapchain(&next, logicalDevice, config.get(), plan);
+        createEffectsForSwapchain(&next, logicalDevice, deviceControl(logicalDevice).config.get(), plan);
         next.effectNames.clear();
         for (const ChainEntry& entry : plan)
             next.effectNames.push_back(entry.name);
@@ -273,7 +273,7 @@ namespace
         next.defaultTransfer = std::make_shared<TransferEffect>(
             logicalDevice, next.format, next.imageExtent,
             std::vector<VkImage>(next.fakeImages.begin(), next.fakeImages.begin() + next.imageCount),
-            next.images, config.get());
+            next.images, deviceControl(logicalDevice).config.get());
 
         next.commandBuffersEffect   = allocateCommandBuffer(logicalDevice, next.imageCount, next.commandPool);
         next.commandBuffersNoEffect = allocateCommandBuffer(logicalDevice, next.imageCount, next.commandPool);
@@ -321,7 +321,7 @@ namespace
         EffectRegistry& registry = deviceControl(logicalDevice).effectRegistry;
 
         auto pending = std::make_shared<PendingChain>();
-        pending->plan = planChain(names, config.get());
+        pending->plan = planChain(names, deviceControl(logicalDevice).config.get());
         ChainCompileSpec spec = compileSpecFor(registry, *current, pending->plan);
         // one channel per swapchain: a newer request supersedes this swapchain's older one only
         spec.channel = reinterpret_cast<uint64_t>(&shared);

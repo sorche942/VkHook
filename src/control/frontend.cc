@@ -44,11 +44,12 @@ namespace VkHook
         return g_depthCaptureLatched;
     }
 
-    std::shared_ptr<Config> baseConfig = nullptr;
-    std::shared_ptr<Config> config = nullptr;
-    // set by initConfigs when the process's config has a shader profile to lay over it; the
-    // first device's registry applies it (resolving shader names needs a registry)
-    static std::atomic<bool> initialShaderProfilePending{false};
+    // set by initConfigs: the config file the process selects (empty: VkHook.conf alone),
+    // and whether it has a shader profile to lay over it. Written once, before any
+    // device exists; each device's registry applies the profile (resolving shader names
+    // needs a registry).
+    static std::string initialConfigPath;
+    static bool        initialShaderProfilePending = false;
 
     static std::once_flag initConfigsOnceFlag;
 
@@ -60,16 +61,13 @@ namespace VkHook
 
     static constexpr int64_t RESIZE_DEBOUNCE_MS = 200;
 
-    // Cached available effects data (to avoid re-parsing config every frame)
-    struct CachedEffectsData
+    // The process's selected config as a layer over `base`
+    static std::shared_ptr<Config> makeProfileConfig(Config& base)
     {
-        std::vector<std::string> currentConfigEffects;
-        std::vector<std::string> defaultConfigEffects;
-        std::map<std::string, std::string> effectPaths;
-        std::string configPath;
-        bool initialized = false;
-    };
-    CachedEffectsData cachedEffects;
+        auto profile = std::make_shared<Config>(initialConfigPath);
+        profile->setFallback(&base);
+        return profile;
+    }
 
     bool handleKeyPress(InputSession* session, uint32_t keySymbol, bool& wasPressed)
     {
@@ -89,7 +87,9 @@ namespace VkHook
     }
 
     DeviceControlState::DeviceControlState(LogicalDevice* device)
-        : effectRegistry(config), overlay(device, &effectRegistry)
+        : baseConfig(std::make_shared<Config>()),
+          config(initialConfigPath.empty() ? baseConfig : makeProfileConfig(*baseConfig)),
+          effectRegistry(config), overlay(device, &effectRegistry)
     {
         const auto settings = ConfigStore::instance().snapshot();
         keySymbol        = convertToKeySym(settings->toggleKey);
@@ -101,7 +101,7 @@ namespace VkHook
         // Parses and runtime compiles of one device share cache keys only when they
         // use the same codegen options.
         effectRegistry.setCodegenOptions(runtimeCodegenOptions(device->isNvidiaGpu));
-        if (initialShaderProfilePending.exchange(false, std::memory_order_acq_rel))
+        if (initialShaderProfilePending)
             applyShaderProfile(config.get(), effectRegistry, activeShaderProfilePath);
         // the parses of the chain's effects run on the registry's worker, not here
         effectRegistry.initialize(config);
@@ -147,10 +147,10 @@ namespace VkHook
         }
 
         // The selected effects of the config just loaded
-        void selectEffectsFromConfig(EffectRegistry& registry)
+        void selectEffectsFromConfig(DeviceControlState& state)
         {
-            selectEffects(registry, config->getOption<std::vector<std::string>>("effects", {}),
-                          config->getOption<std::vector<std::string>>("disabledEffects", {}));
+            selectEffects(state.effectRegistry, state.config->getOption<std::vector<std::string>>("effects", {}),
+                          state.config->getOption<std::vector<std::string>>("disabledEffects", {}));
         }
 
         // Asks for a rebuild of every chain with the registry's enabled effects. While
@@ -158,7 +158,7 @@ namespace VkHook
         // yet: the request is kept and made once it finishes (the control step retries).
         void requestActiveChainReload(LogicalDevice* logicalDevice, DeviceControlState& state)
         {
-            invalidateAvailableEffects();
+            invalidateAvailableEffects(state);
             if (state.effectRegistry.initializing())
             {
                 state.reloadAfterInitialize = true;
@@ -195,8 +195,7 @@ namespace VkHook
             // command recording, so a mid-frame re-arm is off the table
             latchDepthCaptureSetting();
 
-            // Load base config (VkHook.conf) - used for paths, effect definitions
-            baseConfig = std::make_shared<Config>();
+            // (VkHook.conf is loaded per device, as `DeviceControlState::baseConfig`)
 
             // Detect the game executable
             detectedGameName = ConfigSerializer::detectGameName();
@@ -250,58 +249,51 @@ namespace VkHook
                     currentConfigPath = ConfigSerializer::getConfigsDir() + "/" + defaultName + ".conf";
             }
 
-            // Load current config if specified, otherwise use base
+            // The config file the process selects; each device loads its own Config
+            // objects from it (see DeviceControlState)
             if (!currentConfigPath.empty())
             {
                 std::ifstream file(currentConfigPath);
                 if (file.good())
                 {
-                    config = std::make_shared<Config>(currentConfigPath);
-                    config->setFallback(baseConfig.get());
-                    if (!detectedGameName.empty())
-                    {
-                        initialShaderProfilePending.store(true, std::memory_order_release);
-                    }
+                    initialConfigPath = currentConfigPath;
+                    initialShaderProfilePending = !detectedGameName.empty();
                     Logger::info("current config: " + currentConfigPath);
                 }
-                else
-                {
-                    config = baseConfig;
-                }
-            }
-            else
-            {
-                config = baseConfig;
             }
         });
     }
 
     // Switch to a new config (called from overlay)
-    void switchConfig(EffectRegistry& registry, const std::string& configPath, const std::string& shaderPath)
+    void switchConfig(DeviceControlState& state, const std::string& configPath, const std::string& shaderPath)
     {
         Logger::info("switching to config: " + configPath);
 
         // Create new config from file (starts with no overrides)
-        config = std::make_shared<Config>(configPath);
-        config->setFallback(baseConfig.get());
-        applyShaderProfile(config.get(), registry, shaderPath);
+        state.config = std::make_shared<Config>(configPath);
+        state.config->setFallback(state.baseConfig.get());
+        applyShaderProfile(state.config.get(), state.effectRegistry, shaderPath);
 
         // Also clear any overrides on the base config to avoid stale values
-        if (baseConfig)
-            baseConfig->clearOverrides();
+        if (state.baseConfig)
+            state.baseConfig->clearOverrides();
 
         // Rebuild the registry for the new config on its worker
-        registry.initialize(config);
+        state.effectRegistry.initialize(state.config);
 
         Logger::info("switched to config: " + configPath);
     }
 
     // Helper function to get available effects separated by source (uses cache)
-    void getAvailableEffects(Config* config,
+    void getAvailableEffects(DeviceControlState& state,
                              std::vector<std::string>& currentConfigEffects,
                              std::vector<std::string>& defaultConfigEffects,
                              std::map<std::string, std::string>& effectPaths)
     {
+        Config* const config     = state.config.get();
+        Config* const baseConfig = state.baseConfig.get();
+        CachedEffectsData& cachedEffects = state.cachedEffects;
+
         // Use cache if available and config hasn't changed
         if (cachedEffects.initialized && cachedEffects.configPath == config->getConfigFilePath())
         {
@@ -466,16 +458,16 @@ namespace VkHook
         std::sort(defaultConfigEffects.begin(), defaultConfigEffects.end());
 
         // Update cache
-        cachedEffects.currentConfigEffects = currentConfigEffects;
-        cachedEffects.defaultConfigEffects = defaultConfigEffects;
-        cachedEffects.effectPaths = effectPaths;
-        cachedEffects.configPath = config->getConfigFilePath();
-        cachedEffects.initialized = true;
+        state.cachedEffects.currentConfigEffects = currentConfigEffects;
+        state.cachedEffects.defaultConfigEffects = defaultConfigEffects;
+        state.cachedEffects.effectPaths = effectPaths;
+        state.cachedEffects.configPath = config->getConfigFilePath();
+        state.cachedEffects.initialized = true;
     }
 
-    void invalidateAvailableEffects()
+    void invalidateAvailableEffects(DeviceControlState& state)
     {
-        cachedEffects.initialized = false;
+        state.cachedEffects.initialized = false;
     }
 
     // The add-effects page's data and the snapshot the views read this frame.
@@ -491,9 +483,9 @@ namespace VkHook
         // No fallback to config - registry is the single source of truth
         // (initialized from config at first swapchain creation)
 
-        getAvailableEffects(config.get(), overlayState.currentConfigEffects,
+        getAvailableEffects(state, overlayState.currentConfigEffects,
                             overlayState.defaultConfigEffects, overlayState.effectPaths);
-        overlayState.configPath = config->getConfigFilePath();
+        overlayState.configPath = state.config->getConfigFilePath();
 
         // Cache the filename extraction — config path rarely changes
         if (overlayState.configPath != state.cachedConfigPath)
@@ -559,7 +551,7 @@ namespace VkHook
         // Check if shader paths were changed (refresh available effects list)
         if (requests.shaderPathsChanged)
         {
-            invalidateAvailableEffects();  // force re-scan of available effects
+            invalidateAvailableEffects(state);  // force re-scan of available effects
             Logger::info("Shader paths changed, effect list refreshed");
         }
 
@@ -589,7 +581,7 @@ namespace VkHook
 
         if (!state.initLogged)
         {
-            Logger::info("hot-reload initialized, config: " + config->getConfigFilePath());
+            Logger::info("hot-reload initialized, config: " + state.config->getConfigFilePath());
             state.initLogged = true;
         }
 
@@ -606,7 +598,7 @@ namespace VkHook
             shouldReload = true;
             reloadFromDisk = true;
         }
-        if (config->hasConfigChanged())
+        if (state.config->hasConfigChanged())
         {
             Logger::debug("config file changed detected");
             shouldReload = true;
@@ -650,16 +642,16 @@ namespace VkHook
             // Check if the overlay wants to load a different config
             if (!requests.pendingConfigPath.empty())
             {
-                switchConfig(state.effectRegistry, requests.pendingConfigPath, overlayShaderPath);
+                switchConfig(state, requests.pendingConfigPath, overlayShaderPath);
                 // Update the registry with the effects from the new config
-                selectEffectsFromConfig(state.effectRegistry);
+                selectEffectsFromConfig(state);
                 reloadSelectedEffects();
             }
             else if (requests.pendingShaderProfile)
             {
                 // an empty path drops the preset's overrides
-                switchConfig(state.effectRegistry, config->getConfigFilePath(), requests.pendingShaderProfilePath);
-                selectEffectsFromConfig(state.effectRegistry);
+                switchConfig(state, state.config->getConfigFilePath(), requests.pendingShaderProfilePath);
+                selectEffectsFromConfig(state);
                 reloadSelectedEffects();
             }
             else
@@ -670,8 +662,12 @@ namespace VkHook
                 // the truth
                 if (reloadFromDisk)
                 {
-                    config->reload();
-                    applyShaderProfile(config.get(), state.effectRegistry, overlayShaderPath);
+                    // the file is the truth again: re-read it, re-apply the profile and
+                    // rebuild the registry on its worker, as a config switch does
+                    state.config->reload();
+                    applyShaderProfile(state.config.get(), state.effectRegistry, overlayShaderPath);
+                    state.effectRegistry.initialize(state.config);
+                    selectEffectsFromConfig(state);
                 }
                 reloadSelectedEffects();
             }

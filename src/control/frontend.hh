@@ -30,26 +30,26 @@ namespace VkHook
     void latchDepthCaptureSetting();
     bool depthCaptureActive();
 
-    extern std::shared_ptr<Config> baseConfig;  // always VkHook.conf
-    extern std::shared_ptr<Config> config;      // current config (base + overlay)
-
     // detected game and the active profile files (set by initConfigs / the overlay)
     extern std::string detectedGameName;
     extern std::string activeProfileName;
     extern std::string activeProfilePath;
     extern std::string activeShaderProfilePath;
 
+    // Process-level, once: settings store, the detected game and the config file the
+    // process selects. Every device then loads its own Config objects from it.
     void initConfigs();
-    // Makes `configPath` (and the shader profile at `shaderPath`) the process's config and
-    // rebuilds `registry` for it on its compile worker.
-    void switchConfig(EffectRegistry& registry, const std::string& configPath, const std::string& shaderPath = "");
 
-    // available effects by source (cached until invalidateAvailableEffects)
-    void getAvailableEffects(Config* config,
-                             std::vector<std::string>& currentConfigEffects,
-                             std::vector<std::string>& defaultConfigEffects,
-                             std::map<std::string, std::string>& effectPaths);
-    void invalidateAvailableEffects();
+    // The available-effects page's data, cached per device until invalidated or the
+    // config path changes.
+    struct CachedEffectsData
+    {
+        std::vector<std::string>           currentConfigEffects;
+        std::vector<std::string>           defaultConfigEffects;
+        std::map<std::string, std::string> effectPaths;
+        std::string                        configPath;
+        bool                               initialized = false;
+    };
 
     class InputSession;
 
@@ -65,6 +65,15 @@ namespace VkHook
     struct DeviceControlState
     {
         explicit DeviceControlState(LogicalDevice* device);
+
+        // The device's configs, owned here so a switch on one device never touches
+        // another's. `baseConfig` is VkHook.conf; `config` is the current one layered
+        // over it (the same object when no profile is active). Declared before the
+        // registry, which is built from `config`.
+        std::shared_ptr<Config> baseConfig;
+        std::shared_ptr<Config> config;
+
+        CachedEffectsData cachedEffects;
 
         uint32_t keySymbol       = 0;
         uint32_t reloadKeySymbol = 0;
@@ -111,6 +120,17 @@ namespace VkHook
     // The device's control state (created in vkCreateDevice, so never null for
     // a device the layer tracks). The reference stays valid until the device is destroyed.
     inline DeviceControlState& deviceControl(LogicalDevice* logicalDevice) { return *logicalDevice->control; }
+
+    // Makes `configPath` (and the shader profile at `shaderPath`) the device's config and
+    // rebuilds its registry for it on the compile worker. Touches only `state`.
+    void switchConfig(DeviceControlState& state, const std::string& configPath, const std::string& shaderPath = "");
+
+    // available effects by source (cached per device until invalidateAvailableEffects)
+    void getAvailableEffects(DeviceControlState& state,
+                             std::vector<std::string>& currentConfigEffects,
+                             std::vector<std::string>& defaultConfigEffects,
+                             std::map<std::string, std::string>& effectPaths);
+    void invalidateAvailableEffects(DeviceControlState& state);
 
     // Present-boundary control step: overlay commands, settings reload, hotkeys,
     // hot-reload, resize debounce and the overlay snapshot. `session` is the
