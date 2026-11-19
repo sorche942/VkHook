@@ -156,45 +156,32 @@ Each rule names the failure it prevents. Rules marked **[F]** are modeled and pr
 
 ---
 
-## 5. The overhaul
+## 5. Parallel work (worktrees)
 
-The overhaul is driven by a full code review. Its defect catalog is §7. The work runs in
-three git worktrees in parallel, plus the formal model on `main`.
+The 2026-11 overhaul (stages 1–3, defect catalog §7) is complete and merged into `main`. It was
+done in three git worktrees (`../VKHook-wt/{core,effects,frontend}`, branches `overhaul/*`), plus
+the formal model on `main`. Large future efforts should reuse the same scheme:
 
-| Worktree | Branch | Path | Owns |
-|---|---|---|---|
-| core | `overhaul/core` | `../VKHook-wt/core` | `src/core/vkhook*.{cc,hh}` and the new `src/{layer,gpu,present,depth,control,diag}/`; `src/render/{logical_device,logical_swapchain,fake_swapchain,vkdispatch,vkfuncs,vk_handle,command_buffer,renderpass,depth_*}*` |
-| effects | `overhaul/effects` | `../VKHook-wt/effects` | `src/effects/**`; `src/render/{image,image_view,buffer,memory,sampler,format,shader,graphics_pipeline,descriptor_set,framebuffer,dlss5_*}*`; effect tests |
-| frontend | `overhaul/frontend` | `../VKHook-wt/frontend` | `src/core/config/**`; `src/core/{logger,async_writer,util}*`; `src/overlay/**`; `src/input/**`; packaging, CI, `scripts/`; their tests |
-| formal | `main` | `formal/` | `formal/**` |
+| Slice | Owns |
+|---|---|
+| core | `src/{layer,gpu,present,depth,control,diag}/`, `src/render/{logical_device,logical_swapchain,fake_swapchain,vkdispatch,vkfuncs,command_buffer}*`, depth shaders |
+| effects | `src/effects/**`, `src/render/{image,image_view,buffer,memory,sampler,format,shader,graphics_pipeline,descriptor_set,framebuffer,dlss5_*}*` |
+| frontend/infra | `src/core/**`, `src/overlay/**`, `src/input/**`, build, CI, packaging, `scripts/`, `docs/` |
+| formal | `formal/**` |
 
-Rules for parallel work:
-- **Edit only files your worktree owns.** If you need a change in someone else's file, write it
-  down as a follow-up in your final report with exact file, symbol and change. The integrator
-  routes it.
+Rules:
+- **Edit only files your slice owns.** If you need a change in someone else's file, write it
+  down as a follow-up with exact file, symbol and change. The integrator routes it.
 - **`src/meson.build` is shared.** Add or remove only the lines for your own files, and keep each
   hunk small and local.
-- **Do not edit `AGENTS.md`** from a worktree. The integrator updates §7 status at merge.
+- **Do not edit `AGENTS.md`** from a worktree; the integrator owns it.
 - **Commits:** imperative subject, optionally prefixed by area (`core: …`, `effects: …`). Make
   small coherent commits that each build. Never rewrite `main`'s history.
-- **Integration:** the integrator merges worktree branches into `main` at the end of each stage,
-  runs the full suite, then rebases every worktree onto the new `main`.
-
-Stages:
-1. **Fixes and split.**
-   - core: split `vkhook.cc` into the §3 modules without changing behaviour; delete the signal
-     handlers; fix the entry-point bugs.
-   - effects: memory-safety and correctness fixes.
-   - frontend: config data loss, persistence ordering, overlay and input fixes, logger.
-   - formal: models and proofs.
-2. **Architecture.**
-   - core: registry, queue locks, timeline + RetireQueue, present modes, device plan.
-   - effects: EffectGraph, uniform ring, worker compile, EffectId, pipeline cache.
-   - frontend: per-swapchain overlay, UI command queue, ConfigStore, PresetModel.
-3. **Depth and infra.**
-   - core: DepthTracker rewrite.
-   - frontend: meson core library, CI matrix with validation, pixel readback in smoke tests,
-     packaging fixes.
+- **Integration:** the integrator merges branches into `main` at stage end, runs the full
+  verification (§1), then fast-forwards every worktree to the new `main`.
+- **Absolute paths:** edit tools resolve relative paths against the session's checkout. When
+  working in a worktree, use absolute worktree paths; agents repeatedly wrote into `main` by
+  accident with relative ones.
 
 ---
 
@@ -249,7 +236,7 @@ The status column uses three values:
 | C1 | Process-wide SIGSEGV/SIGABRT/SIGFPE handlers with no chaining. They kill Wine/Proton fault handling, and their `siglongjmp` is undefined behaviour | `vkhook.cc:641-687,1355-1381`, `reshade_parser.cc:424-460` | S1 |
 | C2 | Bypass paths present the real images, which the game never rendered (the game draws into fakes): the screen freezes or shows garbage. The depth hold armed on every swapchain create triggers this | `vkhook.cc:2341,3755-3764,3844` | S2 |
 | C3 | `saveSettings` rewrites `VkHook.conf` with only the 22 keys it owns, deleting the user's other keys | `config_serializer.cc:349-427` | S1 |
-| C4 | Snapshot pipelines, descriptor sets and render passes are recorded into the game's command buffers. App state is not restored, the game's depth `storeOp` becomes DONT_CARE, and the objects are destroyed while the game's buffers still reference them | `vkhook.cc:5128,5190,5228`, `vkhook_depth.cc:806`, `renderpass.cc:95,213` | open |
+| C4 | Snapshot pipelines, descriptor sets and render passes are recorded into the game's command buffers. App state is not restored, the game's depth `storeOp` becomes DONT_CARE, and the objects are destroyed while the game's buffers still reference them | `vkhook.cc:5128,5190,5228`, `vkhook_depth.cc:806`, `renderpass.cc:95,213` | S3 |
 | C5 | The overlay is built from the first swapchain only. More swapchain images cause an out-of-bounds read; a format change causes a framebuffer mismatch | `vkhook.cc:2622`, `imgui_overlay.cc:879` | S2 |
 | C6 | The replacement `wl_pointer` listener is missing v9/v11 events, so libwayland aborts. It also passes NULL user data | `wayland_interpose.cc:244-256,522,539` | S1 |
 | C7 | RG8 and wide-format texture loading overflows the heap | `effect_reshade.cc:488,551,581` | S1 |
@@ -260,58 +247,50 @@ The status column uses three values:
 | # | Defect | Status |
 |---|---|---|
 | H1 | `globalLock` is taken in every draw, render-pass, submit and begin hook, even when depth capture is off. The draw hook calls down while holding it | S2 |
-| H2 | Reload, disk I/O, compiles and overlay updates run on the present thread under `globalLock` | S2 (no lock held; compiles still on the present thread; worker compile is S3) |
+| H2 | Reload, disk I/O, compiles and overlay updates run on the present thread under `globalLock` | S2+S3 (compile worker) |
 | H3 | The layer submits to graphics queue 0 without synchronizing with app threads | S2 |
 | H4 | `realQueuePresent` is a single process global, wrong for a second device or driver | S2 |
 | H5 | `CreateDevice` forces unsupported features and sets `pEnabledFeatures` alongside Features2 | S2 |
 | H6 | `DeferredDestroyQueue` is process-global and untagged. `panicLayer` flushes it without waiting | S2 |
 | H7 | `BeginCommandBuffer` on an unknown device returns success without calling down | S1 |
 | H8 | Command pool reset and destroy are not hooked, so the per-command-buffer maps go stale | S2 |
-| H9 | `vkCmdResolveImage` is used on depth; `DEPTH_READ_ONLY_OPTIMAL` is used without `separateDepthStencilLayouts`; barriers on D/S images cover only one aspect | open |
-| H10 | Depth capture method 2 disables itself (storage image missing from `depthImageExtents`). There is no `vkQueueSubmit2` hook | open |
-| H11 | Image layouts are guessed rather than tracked; there are no barrier hooks | open |
+| H9 | `vkCmdResolveImage` is used on depth; `DEPTH_READ_ONLY_OPTIMAL` is used without `separateDepthStencilLayouts`; barriers on D/S images cover only one aspect | S3 |
+| H10 | Depth capture method 2 disables itself (storage image missing from `depthImageExtents`). There is no `vkQueueSubmit2` hook | S3 |
+| H11 | Image layouts are guessed rather than tracked; there are no barrier hooks | S3 |
 | H12 | One uniform buffer per effect is rewritten while earlier frames are still in flight | S2 |
 | H13 | Uniforms become specialization constants on non-NVIDIA GPUs, so slider edits do nothing | S1 |
-| H14 | Only `techniques[0]` of a file ever runs | open |
+| H14 | Only `techniques[0]` of a file ever runs | S3 (`EffectId`) |
 | H15 | The registry parse and the runtime compile use different preludes, extents and macros | S1+S2 |
 | H16 | Every autosave triggers a full reload | S1 |
 | H17 | Settings saves `fsync` on the present thread with a mutex held | S1+S2 |
 | H18 | File writes come from two unordered threads, so a deleted preset can be resurrected | S1 |
 | H19 | Two `VkHook.conf` parsers that disagree | S1 |
 | H20 | The swapchain command pool lacks the RESET flag but buffers are re-recorded. Real images lack `TRANSFER_DST` | S2 |
-| H21 | VRAM: `imageCount × (maxEffects+1)` full-resolution images, and effects beyond the cap are silently dropped | open |
+| H21 | VRAM: `imageCount × (maxEffects+1)` full-resolution images, and effects beyond the cap are silently dropped | S3 |
 | H22 | Overlay fence is reset without a submit, so it stays unsignalled forever. ImGui context ownership is ambiguous | S1 |
 | H23 | X11 makes blocking round trips every frame. Wayland game key handlers run on the wrong thread under a mutex | S1 |
 | H24 | Syncobj gate check-then-act race | S1 |
 | H25 | Instances of the same effect share private textures, including history | S1 |
 | H26 | Unknown or unhandled uniform sources leave uninitialized bytes | S1 |
 
-### Medium and low (abridged)
+### Medium and low
 
-The full lists are in the review reports.
-- The monolith files (`vkhook.cc` with an ~890-line `QueuePresentKHR`; `vkhook_internal.hh` with duplicate declarations).
-- The `LogicalDevice` god object.
-- About 750 lines of copy-pasted hooks.
-- Twelve depth-resolve shader variants, of which one is used.
-- Six copy-pasted numeric field editors.
-- Three render-pass builders.
-- A pipeline cache that is never persisted.
-- Synchronous per-texture uploads.
-- Debug strings built eagerly.
-- Dead code:
-  - `performDeferredDepthRealloc`
-  - `rebuildEffectsOnNextPresent`
-  - `LogicalSwapchain::reloadEffects`
-  - the logger history API
-  - the pointer-constraints module
-  - `tools/test-shaders.cc`
-  - `effects/shaders/shaders-meson.build`
-  - `normals_to_depth.comp.glsl`
-- Build and packaging:
-  - 32-bit and 64-bit installs overwrite each other's `VkHook.json`;
-  - Flatpak copies the whole tree, including `build-*/`;
-  - CI downloads moving shader archives;
-  - CI has no sanitizer, gcc or i686 job.
+All addressed in stages 1–3: the monolith split, the `LogicalDevice` cleanup, hook templates, a
+single depth-resolve shader, the field-editor template, the persisted pipeline cache, batched
+uploads, lazy debug logging, dead-code removal, the shared build-manifest path, the git-sourced
+Flatpak, pinned CI shader archives, and a full CI matrix (gcc, sanitizers, i686).
+
+### Found during the overhaul
+
+| Defect | Status |
+|---|---|
+| Depth-resolve copy target lacked `TRANSFER_DST` (20 validation errors per run) | S2 |
+| Layer-allocated command buffers had no loader data, so validation aborted as soon as the overlay opened | S2 |
+| A vendored ReShade parser destructor threw, which ended the host process; the old signal handlers hid it | S1 |
+| i686: `std::is_same_v` handle dispatch matched every non-dispatchable handle, so the old swapchain was destroyed with `vkDestroyFence` | S3 |
+| Syncobj gate 100 ms timeout escape allowed a commit to overlap a present (flaky test) | S3 |
+
+Open, all low: no 32-bit vkcube is available for the i686 smoke test; the no-timeout gate is untested against a wedged driver; the GitHub-hosted CI jobs have not run yet.
 
 ---
 
