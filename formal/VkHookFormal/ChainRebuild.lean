@@ -23,17 +23,23 @@ Application command buffers never reference a generation (invariant 4). The one 
 injection is a transfer-only copy into layer-owned *storage* `stg` (`appRecord`); the layer
 must know when that storage may go away:
 
-| model action         | C++ (target)                                                              |
+| model action         | C++ (implemented)                                                         |
 |----------------------|---------------------------------------------------------------------------|
-| `lrecord c`          | `present/present` records into the layer's own cb for `cur_gen`           |
-| `appRecord c r`      | `vkEndCommandBuffer` hook finishing the allowed transfer-only injection   |
-| `appReset c`         | hooks for `vkResetCommandBuffer`, re-`vkBeginCommandBuffer`,              |
-|                      | `vkFreeCommandBuffers`, `vkResetCommandPool`, `vkDestroyCommandPool` (H8) |
-| `submit s c`         | `vkQueueSubmit*` (app hook, or layer submit); records what `s` references |
+| `lrecord c`          | `present/present` records into the layer's own cb for `cur_gen`; the depth|
+|                      | capture cb (`DepthCapture::record`) is a layer cb of the same kind        |
+| `appRecord c r`      | `DepthTracker::recordPreserveCopy`: the transfer-only copy, which binds   |
+|                      | the storage into that cb's `CmdState::storages`                           |
+| `appReset c`         | `DepthTracker::onResetCommandBuffer`, `onBeginCommandBuffer`,             |
+|                      | `onFreeCommandBuffers`, `onResetCommandPool`, `onDestroyCommandPool` (H8) |
+| `submit s c`         | `vkQueueSubmit*` (`DepthTracker::onSubmit` for app cbs; layer submits)    |
 | `gpuComplete s`      | the GPU finishes `s` (`gpu/timeline` serial advances)                     |
-| `rebuild n`          | `effects/graph` swap at present / `depth/tracker` generation swap         |
+| `rebuild n`          | `effects/graph` chain swap at present (a depth source change no longer    |
+|                      | rebuilds: the capture target is stable, only its per-present cb changes)  |
 | `destroyGen g`       | `gpu/retire` collect of the retired generation                            |
-| `retireStg`/`destroyStg` | `gpu/retire` for transfer storage                                     |
+| `retireStg`/`destroyStg` | `DepthLayerStorage::~DepthLayerStorage` retires through `gpu/retire`; |
+|                      | storage is a `shared_ptr` held by the tracker, by every recorded cb       |
+|                      | bound to it and by the frame's `DepthSource`, so "no recorded cb bound"   |
+|                      | is the reference count reaching zero                                      |
 
 ## Proved (`#check_invariants`)
 

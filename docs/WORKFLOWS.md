@@ -191,8 +191,6 @@ Temporal enables hardware optical-flow history; history strength ranges from 0
 (no reuse) to 1 (full confidence-weighted reuse). Both default to enabled/full
 strength. Parameters update without rebuilding the network; toggling temporal
 re-records the affected command buffers.
-Keep the normal `depthCapture = on` setting: the layer's existing depth-transition
-submission gate is also used for native effects.
 
 The default model directory is shown in the extraction command. Override it
 with `dlss5ModelPath` in the active config or `VKHOOK_DLSS5_MODEL`.
@@ -628,15 +626,31 @@ selection and layer-owned snapshot command buffers remain enabled. Out-of-pass
 depth clears retain capture under the tracking lock and use the layout supplied
 by the application, including transfer-stage synchronization where required.
 
-**Limitation:** pre-clear depth inside a render pass is not preserved. If a game
-clears scene depth before ending that pass, the snapshot can contain the cleared
-depth. Supporting that case requires legal pass splitting and graphics-state
-restoration; inserting a nested pass or transfer is not a valid substitute.
+**Current design** (replaces the snapshot recorder described above). The layer
+never records into an active application scope. Its only injection into
+application command buffers is a transfer-only copy of a selected depth image
+into layer-owned storage, made just before the application overwrites it: before
+`vkCmdClearDepthStencilImage`, and before a render pass or dynamic rendering
+scope whose depth load op is CLEAR/DONT_CARE, when that image already drew this
+frame. Everything else is bookkeeping: the hooks log per-command-buffer
+`{image, layout, draws}` events, `vkQueueSubmit*` folds them in submission order
+(so barriers keep the tracked layout exact), and at present the window-sized
+image with the most draws is selected (three frames of hysteresis; a manual pin
+overrides). A layer command buffer submitted ahead of the effects resolves it by
+shader (`texelFetch` for MSAA, specialization constants for the sample count and
+resolve mode) into an R32F target the effects sample, so a change of depth
+source never rebuilds an effect chain. Without a usable source the target is
+cleared to the far plane and effects keep running. `depthSourceChannel` and
+`depthCaptureMethod` are no longer read (the capture always exposes the raw
+depth in the red channel). Memory no longer scales with chain length: a faked
+swapchain holds three image sets (game, ping, pong) however many effects run, so
+`maxEffects` is only the overlay's add limit.
 
-Both native and Zig i686 builds passed eleven suites with the opt-in X11 input
-suite skipped. The new `depth snapshot scope` regression checks that an active
-scope emits no snapshot commands, leaving the scope enables capture, independent
-command buffers are unaffected, and transfer layouts are restored correctly.
+**Limitation:** a depth clear *inside* a render pass (`vkCmdClearAttachments`) is
+not preserved: the capture then sees the cleared depth. Mixed per-aspect
+depth/stencil layouts are not tracked, and layout changes made by
+`vkCmdWaitEvents` are not observed.
+
 The existing native GPU texture-sharing regression also passed.
 
 
@@ -863,7 +877,7 @@ Each test is a small `main()` that prints `N checks, M failures` and exits non-z
 
 **compile cache** (`src/effects/compile_cache_test.cc`). Exercises `CompileCache`: store/lookup round-trip, source and flag partitioning, re-store is a no-op, FIFO eviction at capacity, `clear`, hash determinism, and a threaded store/lookup. Tells you the cache that keeps a chain reload from re-parsing every ReShade effect is keyed correctly and bounded.
 
-**depth copy state** (`src/render/depth_copy_state_test.cc`). Exercises `DepthCopyState`: publish/consume returns each copy once, the ring hands out slots in order, `detach` clears, and a threaded publish/consume never observes a torn `DepthState`. Tells you the mutex guarding the `CmdEndRenderPass` → `QueueSubmit` handoff and the copy ring actually holds — the race it covers only shows as an intermittent device loss under load.
+**depth tracker** (`src/depth/tracker_test.cc`). Drives `DepthTracker` against a fake Vulkan dispatch: window-sized candidate selection with three-frame hysteresis, layout tracking through barrier events and render pass final layouts, storage lifetime against recorded command buffers (reset, re-begin, free, pool reset and pool destroy each release the storage; a source keeps it alive), and handle reuse (a re-created image or command buffer never resolves to the old one's state).
 
 ## reshade shader check
 
@@ -906,4 +920,4 @@ VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json \
   src/tests/smoke_vkcube.sh
 ```
 
-On a headless machine wrap it in `xvfb-run -a`, which is what CI does. Under X11 plus lavapipe the layer is deliberately pass-through, so on CI the smoke test proves the layer loads, builds a real effect and does not crash; the depth path needs a GPU and is not covered there.
+On a headless machine wrap it in `xvfb-run -a`, which is what CI does. The depth capture runs in the layer's own command buffer, so the smoke test also asserts that vkcube's depth image was tracked and selected as the capture source (including across the forced refreshes). `VKHOOK_SMOKE_VALIDATION=1` additionally enables the Khronos validation layer below VkHook, asserts the loader inserted it, and fails on any `Validation Error`; `VKHOOK_SMOKE_HEADLESS=1` (or running under `xvfb-run`) unsets `WAYLAND_DISPLAY` for vkcube.

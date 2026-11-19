@@ -6,8 +6,8 @@ public import Veil
 # PresentModes: the screen only ever shows what the game rendered
 
 Protects AGENTS.md invariant 5 and defect C2 (bypass paths presented the *real* swapchain
-images, which the game never rendered, so the screen froze or showed garbage; the depth hold
-armed on every swapchain create triggered it), plus the zero-wait-semaphore present.
+images, which the game never rendered, so the screen froze or showed garbage; a depth hold
+armed on every swapchain create used to trigger it; it no longer exists), plus the zero-wait-semaphore present.
 
 ## Protocol
 
@@ -17,7 +17,7 @@ frame `f` into the fake image of that slot (real image if the swapchain is not f
 signals an app present semaphore `s`. Semaphores are binary: a signal requires the semaphore
 unsignalled, a wait consumes it. The game then calls `vkQueuePresentKHR` for `f` waiting on `s`.
 The layer picks a mode from the swapchain and a "bypass requested" input (effects disabled,
-depth hold, overlay hidden, ...):
+overlay hidden, ...):
 
 * faked: `Effects`, or `CopyOnly` when bypass is requested. Both go through a layer
   submission that waits on `s` (consuming it exactly once), copies/processes fake → real
@@ -270,7 +270,7 @@ action render (f : frame) (c : sc) (i : slot) (s : sem) {
   phase f := rendered
 }
 
--- BUG: a bypass request (effects off, depth hold armed on swapchain create, ...) selects
+-- BUG: a bypass request (effects off, soft-disabled, ...) selects
 -- Passthrough even though the swapchain's images were replaced by fakes.
 action present (f : frame) (bypass : Bool) {
   require phase f = rendered
