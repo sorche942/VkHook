@@ -20,9 +20,9 @@ meson compile -C build
 meson test -C build --print-errorlogs
 ```
 
-- **wayland-protocols.** Configure needs the `wayland-protocols` package. If it is not
-  installed system-wide, use the vendored copy in the main checkout:
-  `PKG_CONFIG="pkg-config --define-prefix" meson setup … -Dpkg_config_path=/home/sorche/Development/modding/VKHook/build/deps/wayland-protocols/usr/share/pkgconfig`.
+- Configure needs the `wayland-protocols` package (installed system-wide).
+- Agents should run GUI tests headless, e.g. `xvfb-run -a src/tests/smoke_vkcube.sh …`, so that
+  no windows appear on the user's desktop.
 - **Validation build:** run the layer with `VK_LOADER_LAYERS_ENABLE=*validation*,*VKHOOK*`
   (the Khronos validation layer is installed). New code must not add validation errors. Turn on
   synchronization validation with `VK_LAYER_ENABLES=VALIDATION_CHECK_ENABLE_SYNCHRONIZATION_VALIDATION`.
@@ -239,45 +239,45 @@ The status column uses three values:
 
 | # | Defect | Where | Status |
 |---|---|---|---|
-| C1 | Process-wide SIGSEGV/SIGABRT/SIGFPE handlers with no chaining. They kill Wine/Proton fault handling, and their `siglongjmp` is undefined behaviour | `vkhook.cc:641-687,1355-1381`, `reshade_parser.cc:424-460` | open |
+| C1 | Process-wide SIGSEGV/SIGABRT/SIGFPE handlers with no chaining. They kill Wine/Proton fault handling, and their `siglongjmp` is undefined behaviour | `vkhook.cc:641-687,1355-1381`, `reshade_parser.cc:424-460` | S1 |
 | C2 | Bypass paths present the real images, which the game never rendered (the game draws into fakes): the screen freezes or shows garbage. The depth hold armed on every swapchain create triggers this | `vkhook.cc:2341,3755-3764,3844` | open |
-| C3 | `saveSettings` rewrites `VkHook.conf` with only the 22 keys it owns, deleting the user's other keys | `config_serializer.cc:349-427` | open |
+| C3 | `saveSettings` rewrites `VkHook.conf` with only the 22 keys it owns, deleting the user's other keys | `config_serializer.cc:349-427` | S1 |
 | C4 | Snapshot pipelines, descriptor sets and render passes are recorded into the game's command buffers. App state is not restored, the game's depth `storeOp` becomes DONT_CARE, and the objects are destroyed while the game's buffers still reference them | `vkhook.cc:5128,5190,5228`, `vkhook_depth.cc:806`, `renderpass.cc:95,213` | open |
-| C5 | The overlay is built from the first swapchain only. More swapchain images cause an out-of-bounds read; a format change causes a framebuffer mismatch | `vkhook.cc:2622`, `imgui_overlay.cc:879` | open |
-| C6 | The replacement `wl_pointer` listener is missing v9/v11 events, so libwayland aborts. It also passes NULL user data | `wayland_interpose.cc:244-256,522,539` | open |
-| C7 | RG8 and wide-format texture loading overflows the heap | `effect_reshade.cc:488,551,581` | open |
+| C5 | The overlay is built from the first swapchain only. More swapchain images cause an out-of-bounds read; a format change causes a framebuffer mismatch | `vkhook.cc:2622`, `imgui_overlay.cc:879` | S1 partial (bounds check, `onSwapchainChanged`); wiring + per-swapchain renderer S2 |
+| C6 | The replacement `wl_pointer` listener is missing v9/v11 events, so libwayland aborts. It also passes NULL user data | `wayland_interpose.cc:244-256,522,539` | S1 |
+| C7 | RG8 and wide-format texture loading overflows the heap | `effect_reshade.cc:488,551,581` | S1 |
 | C8 | GPU waits happen while holding `globalLock`, which every app submit also needs: deadlock or freeze | `image.cc:215,318`, `vkhook.cc:3612,3867,4418-4440` | open |
 
 ### High
 
 | # | Defect | Status |
 |---|---|---|
-| H1 | `globalLock` is taken in every draw, render-pass, submit and begin hook, even when depth capture is off. The draw hook calls down while holding it | open |
+| H1 | `globalLock` is taken in every draw, render-pass, submit and begin hook, even when depth capture is off. The draw hook calls down while holding it | S1 partial (no call-down under lock; depth hooks not installed when capture off); lock removal S2 |
 | H2 | Reload, disk I/O, compiles and overlay updates run on the present thread under `globalLock` | open |
 | H3 | The layer submits to graphics queue 0 without synchronizing with app threads | open |
 | H4 | `realQueuePresent` is a single process global, wrong for a second device or driver | open |
 | H5 | `CreateDevice` forces unsupported features and sets `pEnabledFeatures` alongside Features2 | open |
 | H6 | `DeferredDestroyQueue` is process-global and untagged. `panicLayer` flushes it without waiting | open |
-| H7 | `BeginCommandBuffer` on an unknown device returns success without calling down | open |
+| H7 | `BeginCommandBuffer` on an unknown device returns success without calling down | S1 |
 | H8 | Command pool reset and destroy are not hooked, so the per-command-buffer maps go stale | open |
 | H9 | `vkCmdResolveImage` is used on depth; `DEPTH_READ_ONLY_OPTIMAL` is used without `separateDepthStencilLayouts`; barriers on D/S images cover only one aspect | open |
 | H10 | Depth capture method 2 disables itself (storage image missing from `depthImageExtents`). There is no `vkQueueSubmit2` hook | open |
 | H11 | Image layouts are guessed rather than tracked; there are no barrier hooks | open |
 | H12 | One uniform buffer per effect is rewritten while earlier frames are still in flight | open |
-| H13 | Uniforms become specialization constants on non-NVIDIA GPUs, so slider edits do nothing | open |
+| H13 | Uniforms become specialization constants on non-NVIDIA GPUs, so slider edits do nothing | S1 |
 | H14 | Only `techniques[0]` of a file ever runs | open |
-| H15 | The registry parse and the runtime compile use different preludes, extents and macros | open |
-| H16 | Every autosave triggers a full reload | open |
-| H17 | Settings saves `fsync` on the present thread with a mutex held | open |
-| H18 | File writes come from two unordered threads, so a deleted preset can be resurrected | open |
-| H19 | Two `VkHook.conf` parsers that disagree | open |
+| H15 | The registry parse and the runtime compile use different preludes, extents and macros | S1 (core must call `setCompileExtent`: S2) |
+| H16 | Every autosave triggers a full reload | S1 |
+| H17 | Settings saves `fsync` on the present thread with a mutex held | S1 (hot-thread snapshot call sites: S2 core) |
+| H18 | File writes come from two unordered threads, so a deleted preset can be resurrected | S1 |
+| H19 | Two `VkHook.conf` parsers that disagree | S1 |
 | H20 | The swapchain command pool lacks the RESET flag but buffers are re-recorded. Real images lack `TRANSFER_DST` | open |
 | H21 | VRAM: `imageCount × (maxEffects+1)` full-resolution images, and effects beyond the cap are silently dropped | open |
-| H22 | Overlay fence is reset without a submit, so it stays unsignalled forever. ImGui context ownership is ambiguous | open |
-| H23 | X11 makes blocking round trips every frame. Wayland game key handlers run on the wrong thread under a mutex | open |
-| H24 | Syncobj gate check-then-act race | open |
-| H25 | Instances of the same effect share private textures, including history | open |
-| H26 | Unknown or unhandled uniform sources leave uninitialized bytes | open |
+| H22 | Overlay fence is reset without a submit, so it stays unsignalled forever. ImGui context ownership is ambiguous | S1 |
+| H23 | X11 makes blocking round trips every frame. Wayland game key handlers run on the wrong thread under a mutex | S1 |
+| H24 | Syncobj gate check-then-act race | S1 |
+| H25 | Instances of the same effect share private textures, including history | S1 |
+| H26 | Unknown or unhandled uniform sources leave uninitialized bytes | S1 |
 
 ### Medium and low (abridged)
 
