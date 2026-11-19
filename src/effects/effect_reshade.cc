@@ -57,43 +57,6 @@ namespace VkHook
 
         using StbiImage = std::unique_ptr<stbi_uc, StbiDeleter>;
 
-        struct RuntimeCodegenPolicy
-        {
-            bool useLocalSizeId = true;
-            bool emitDebugInfo = true;
-            bool disableComputePipelineOptimization = false;
-        };
-
-        bool getLocalSizeIdEnabledOverride(bool& hasOverride, bool defaultValue)
-        {
-            hasOverride = false;
-            const char* value = std::getenv("VKHOOK_ENABLE_LOCAL_SIZE_ID");
-            if (value == nullptr || *value == '\0')
-                return defaultValue;
-
-            hasOverride = true;
-            if (value[0] == '0')
-                return false;
-            if (value[0] == '1')
-                return true;
-
-            Logger::warn(std::string("Invalid VKHOOK_ENABLE_LOCAL_SIZE_ID value '") + value +
-                         "'. Expected 0 or 1.");
-            return defaultValue;
-        }
-
-        RuntimeCodegenPolicy selectRuntimeCodegenPolicy(const LogicalDevice* logicalDevice)
-        {
-            RuntimeCodegenPolicy policy;
-            const bool isNvidiaGpu = (logicalDevice != nullptr) && logicalDevice->isNvidiaGpu;
-            policy.emitDebugInfo = !isNvidiaGpu;
-            policy.disableComputePipelineOptimization = isNvidiaGpu;
-
-            bool hasLocalSizeIdOverride = false;
-            policy.useLocalSizeId = getLocalSizeIdEnabledOverride(hasLocalSizeIdOverride, !isNvidiaGpu);
-            return policy;
-        }
-
     }
 
     // Texture uploads run as one submission per effect, through the queue's
@@ -131,12 +94,13 @@ namespace VkHook
                                  ReshadeTexturePool& texturePool,
                                  std::string          effectName,
                                  std::string          effectPath,
-                                 std::vector<PreprocessorDefinition> customDefs)
+                                 std::vector<PreprocessorDefinition> customDefs,
+                                 std::shared_ptr<const EffectCompileResult> precompiled)
     {
         try
         {
             build(logicalDevice, format, imageExtent, std::move(inputImages), std::move(outputImages), effectRegistry,
-                  texturePool, std::move(effectName), std::move(effectPath), std::move(customDefs));
+                  texturePool, std::move(effectName), std::move(effectPath), std::move(customDefs), std::move(precompiled));
         }
         catch (...)
         {
@@ -156,7 +120,8 @@ namespace VkHook
                                  ReshadeTexturePool& texturePool,
                                  std::string          effectName,
                                  std::string          effectPath,
-                                 std::vector<PreprocessorDefinition> customDefs)
+                                 std::vector<PreprocessorDefinition> customDefs,
+                                 std::shared_ptr<const EffectCompileResult> precompiled)
     {
         Logger::debug("in creating ReshadeEffect");
 
@@ -168,6 +133,12 @@ namespace VkHook
         this->effectName            = effectName;
         this->effectPath            = effectPath;
         this->customPreprocessorDefs = customDefs;
+        {
+            auto parsed = EffectId::parse(effectName);
+            if (!parsed)
+                throw EffectBuildError("effect name is not an effect id: '" + effectName + "'");
+            effectId = std::move(*parsed);
+        }
         inputOutputFormatUNORM = convertToUNORM(format);
         inputOutputFormatSRGB  = convertToSRGB(format);
 
@@ -180,7 +151,7 @@ namespace VkHook
             throw EffectBuildError("swapchain image view creation failed for effect '" + effectName + "'");
         Logger::debug("created ImageViews");
 
-        createReshadeModule();
+        createReshadeModule(std::move(precompiled));
         const reshadefx::module& module = *compiledModule;
 
         std::vector<std::string> zeroedSources;
@@ -249,9 +220,10 @@ namespace VkHook
         // unusable) go to the GPU in one submission after the loop.
         TextureUploadBatch textureUploads;
 
-        // Private textures belong to this instance of the effect file. Another
-        // file that declares the same name still shares it (ReShade semantics).
-        const uint32_t instanceOrdinal = texturePool.beginEffect(this->effectPath);
+        // Private textures belong to this instance (EffectId ordinal) of the effect
+        // file. Another file that declares the same name still shares it (ReShade
+        // semantics), and so do the techniques of one file with the same ordinal.
+        const uint32_t instanceOrdinal = texturePool.beginEffect(this->effectId.canonicalPath, this->effectId.ordinal);
 
         for (size_t i = 0; i < module.textures.size(); i++)
         {
@@ -529,14 +501,14 @@ namespace VkHook
 
         // Output writes decide how many image/sampler set groups exist, so count
         // them before sizing the pool.
-        for (const auto& pass : module.techniques[0].passes)
+        for (const auto& pass : module.techniques[techniqueIndex].passes)
         {
             if (pass.cs_entry_point.empty() && pass.render_target_names[0].empty())
             {
                 outputWrites++;
             }
         }
-        outputForwardRequired = reshadeOutputNeedsForward(module, outputWrites);
+        outputForwardRequired = reshadeOutputNeedsForward(module, techniqueIndex, outputWrites);
         Logger::debug("output writes: " + std::to_string(outputWrites));
 
         const DescriptorBudget budget = computeDescriptorBudget(static_cast<uint32_t>(inputImages.size()),
@@ -613,7 +585,7 @@ namespace VkHook
 
         bool firstTimeStencilAccess = true; // Used to clear the sttencil attachment on the first time
 
-        for (bool outputToBackBuffer = outputWrites % 2 == 0; auto& pass : module.techniques[0].passes)
+        for (bool outputToBackBuffer = outputWrites % 2 == 0; auto& pass : module.techniques[techniqueIndex].passes)
         {
             const bool isComputePass = !pass.cs_entry_point.empty();
             if (!isComputePass && (pass.vs_entry_point.empty() || pass.ps_entry_point.empty()))
@@ -1431,91 +1403,71 @@ namespace VkHook
         releaseResources();
     }
 
-    void ReshadeEffect::createReshadeModule()
+    void ReshadeEffect::createReshadeModule(std::shared_ptr<const EffectCompileResult> precompiled)
     {
-        // One preprocess setup shared with the registry parse: same prelude,
-        // depth macros, user macros and include paths, with the real extent.
-        const uint32_t colorBitDepth = (inputOutputFormatUNORM == VK_FORMAT_A2R10G10B10_UNORM_PACK32) ? 10 : 8;
-        const ReshadePreprocessSetup setup = effectRegistry->preprocessSetup(
-            imageExtent.width, imageExtent.height, colorBitDepth, customPreprocessorDefs);
-        for (const auto& def : customPreprocessorDefs)
-            Logger::debug("  custom macro: " + def.name + " = " + def.value);
+        const bool isNvidiaGpu = logicalDevice->isNvidiaGpu;
+        disableComputePipelineOptimization = isNvidiaGpu;
 
-        // Use provided effectPath, or try to find it in discovered shader paths
-        std::string shaderPath = this->effectPath;
-        if (shaderPath.empty())
+        if (!precompiled)
         {
-            shaderPath = effectRegistry->getEffectFilePath(effectName);
+            // One preprocess setup shared with the registry parse: same prelude,
+            // depth macros, user macros and include paths, with the real extent.
+            const uint32_t colorBitDepth = (inputOutputFormatUNORM == VK_FORMAT_A2R10G10B10_UNORM_PACK32) ? 10 : 8;
+            EffectCompileSpec spec;
+            spec.id    = effectId;
+            spec.setup = effectRegistry->preprocessSetup(
+                imageExtent.width, imageExtent.height, colorBitDepth, customPreprocessorDefs);
+            for (const auto& def : customPreprocessorDefs)
+                Logger::debug("  custom macro: " + def.name + " = " + def.value);
+
+            // Use provided effectPath, or try to find it in discovered shader paths
+            std::string shaderPath = this->effectPath;
             if (shaderPath.empty())
             {
-                // Search discovered shader paths for the effect
-                for (const auto& searchPath : setup.includePaths)
+                shaderPath = effectRegistry->getEffectFilePath(effectName);
+                if (shaderPath.empty())
                 {
-                    std::string candidate = searchPath + "/" + effectName + ".fx";
-                    if (std::filesystem::exists(candidate))
+                    // Search discovered shader paths for the effect
+                    for (const auto& searchPath : spec.setup.includePaths)
                     {
-                        shaderPath = candidate;
-                        break;
-                    }
-                    candidate = searchPath + "/" + effectName;
-                    if (std::filesystem::exists(candidate))
-                    {
-                        shaderPath = candidate;
-                        break;
+                        const std::string candidate = searchPath + "/" + effectId.canonicalPath;
+                        if (std::filesystem::exists(candidate))
+                        {
+                            shaderPath = candidate;
+                            break;
+                        }
                     }
                 }
             }
-        }
-        // The resolved path identifies the effect file to the texture pool.
-        this->effectPath = shaderPath;
+            this->effectPath = shaderPath;
+            spec.path        = shaderPath;
+            spec.codegen     = runtimeCodegenOptions(isNvidiaGpu);
+            effectRegistry->setCodegenOptions(spec.codegen);
+            Logger::debug("runtime codegen policy: local_size_id=" + std::to_string(spec.codegen.useLocalSizeId ? 1 : 0) +
+                          " debug_info=" + std::to_string(spec.codegen.emitDebugInfo ? 1 : 0) +
+                          " disable_compute_opt=" + std::to_string(disableComputePipelineOptimization ? 1 : 0));
 
-        std::string preprocessedSource;
-        std::string error;
-        if (!preprocessReshadeFile(shaderPath, setup, preprocessedSource, error))
+            // The same compile path as the worker: preprocess, shader cache
+            // (memory in front of disk), compile on a miss.
+            precompiled = std::make_shared<const EffectCompileResult>(compileEffect(spec, effectRegistry->shaderCache()));
+            Logger::debug(precompiled->cacheHit ? "reshade compile cache hit for " + effectName
+                                                : "reshade compiled " + effectName);
+        }
+
+        if (!precompiled->error.empty() || !precompiled->module || precompiled->techniqueIndex < 0)
         {
-            Logger::err("failed to load shader '" + effectName + "': " + error);
-            throw EffectBuildError("failed to load shader: " + effectName + ": " + error);
+            const std::string reason = precompiled->error.empty() ? std::string("no compiled module") : precompiled->error;
+            Logger::err("failed to build shader '" + effectName + "': " + reason);
+            throw EffectBuildError("failed to compile shader: " + effectName + ": " + reason);
         }
-
-        const RuntimeCodegenPolicy runtimePolicy = selectRuntimeCodegenPolicy(logicalDevice);
-        disableComputePipelineOptimization = runtimePolicy.disableComputePipelineOptimization;
-        Logger::debug("runtime codegen policy: local_size_id=" + std::to_string(runtimePolicy.useLocalSizeId ? 1 : 0) +
-                      " debug_info=" + std::to_string(runtimePolicy.emitDebugInfo ? 1 : 0) +
-                      " disable_compute_opt=" + std::to_string(runtimePolicy.disableComputePipelineOptimization ? 1 : 0));
-
-        // The key is the preprocessed source (every include and macro already
-        // folded in) plus the macro digest, the codegen flags and the compiler
-        // tag; see ShaderCacheKey. Memory in front of disk: an unchanged effect is
-        // reused across chain rebuilds within a run and across runs.
-        const uint32_t codegenFlags =
-            (runtimePolicy.useLocalSizeId ? 1u : 0u) |
-            (runtimePolicy.emitDebugInfo ? 4u : 0u);
-        const ShaderCacheKey cacheKey = makeShaderCacheKey(preprocessedSource, hashPreprocessSetup(setup), codegenFlags);
-
-        ShaderCache& shaderCache = sharedShaderCache();
-        compiledModule = shaderCache.lookup(cacheKey);
-        if (compiledModule)
-        {
-            Logger::debug("reshade compile cache hit for " + effectName);
-        }
-        else
-        {
-            const ReshadeCodegenOptions options{runtimePolicy.emitDebugInfo, runtimePolicy.useLocalSizeId};
-            auto fresh = std::make_shared<reshadefx::module>();
-            if (!compileReshadeSource(std::move(preprocessedSource), options, *fresh, error))
-            {
-                Logger::err("failed to compile shader '" + effectName + "': " + error);
-                throw EffectBuildError("failed to compile shader: " + effectName + ": " + error);
-            }
-            compiledModule = fresh;
-            shaderCache.store(cacheKey, compiledModule);
-        }
+        compiledModule = precompiled->module;
+        techniqueIndex = static_cast<size_t>(precompiled->techniqueIndex);
         const reshadefx::module& module = *compiledModule;
 
-        if (module.techniques.empty())
+        if (techniqueIndex >= module.techniques.size())
         {
-            Logger::err("shader has no techniques: " + effectName);
-            throw EffectBuildError("shader has no techniques: " + effectName);
+            Logger::err("technique index out of range: " + effectName);
+            throw EffectBuildError("technique not found: " + effectName);
         }
 
         if (module.spirv.empty())

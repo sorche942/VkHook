@@ -130,9 +130,12 @@ namespace VkHook
             retireHook.fn(retireHook.ctx, VK_OBJECT_TYPE_DEVICE_MEMORY, handleToU64(memory), 0);
     }
 
-    uint32_t ReshadeTexturePool::beginEffect(const std::string& effectFile)
+    uint32_t ReshadeTexturePool::beginEffect(const std::string& effectFile, uint32_t ordinal)
     {
-        return instanceCounts[effectFile]++;
+        const uint32_t group = ordinal > 0 ? ordinal - 1 : 0;
+        Logger::debug("[reshade-texture-pool] effect " + effectFile + " ordinal=" + std::to_string(ordinal)
+                      + " group=" + std::to_string(group));
+        return group;
     }
 
     std::shared_ptr<ReshadeTexture> ReshadeTexturePool::acquire(const std::string& uniqueName, const ReshadeTextureDesc& desc,

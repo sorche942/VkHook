@@ -118,12 +118,16 @@ VkHook_src = [
     'core/config/migrate.cc',
     'render/descriptor_set.cc',
     'effects/effect_registry.cc',
+    'effects/effect_id.cc',
+    'effects/shader_catalog.cc',
     'effects/effect_reshade.cc',
     'effects/reshade_texture_pool.cc',
     'effects/effect_transfer.cc',
     'effects/effect_renderpass.cc',
     'effects/texture_upload.cc',
     'effects/reshade_parser.cc',
+    'effects/technique_scan.cc',
+    'effects/compiler.cc',
     'effects/reshade_compile.cc',
     'effects/shader_cache.cc',
     'effects/reshade_module_io.cc',
@@ -322,6 +326,7 @@ endif
 config_serializer_tests = executable('vkhook-config-serializer-tests',
     'tests/config_serializer_test.cc',
     'control/preset_model.cc',
+    'effects/effect_id.cc',
     'core/config/config_serializer.cc',
     'core/config/config_serializer_profile.cc',
     'core/config/config.cc',
@@ -336,9 +341,17 @@ test('config serializer', config_serializer_tests)
 preset_model_tests = executable('vkhook-preset-model-tests',
     'tests/preset_model_test.cc',
     'control/preset_model.cc',
+    'effects/effect_id.cc',
     include_directories : [source_inc])
 test('preset model', preset_model_tests,
     args : [meson.current_source_dir() / 'tests/fixtures'])
+
+# The technique scan: a pure text scan of a .fx file for its `technique` names.
+technique_scan_tests = executable('vkhook-technique-scan-tests',
+    'effects/technique_scan_test.cc',
+    'effects/technique_scan.cc',
+    include_directories : [source_inc])
+test('technique scan', technique_scan_tests)
 
 # The variable-font extension to stb_truetype is pure but invisible to CI: a bad
 # download or a gvar/HVAR regression would only show as wrong-looking text. This
@@ -540,6 +553,81 @@ test('reshade compile setup', reshade_compile_tests,
     args : [meson.current_source_dir() / 'tests/fixtures'],
     env : ['VKHOOK_LOG_LEVEL=none'])
 
+# The one compile path and its worker: equivalence with the synchronous
+# compile, technique selection, per-channel cancellation and shutdown.
+compiler_tests = executable('vkhook-compiler-tests',
+    'effects/compiler_test.cc',
+    'effects/compiler.cc',
+    'effects/effect_id.cc',
+    'effects/shader_cache.cc',
+    'effects/reshade_compile.cc',
+    'effects/reshade_module_io.cc',
+    'vendor/reshade/effect_codegen_spirv.cc',
+    'vendor/reshade/effect_expression.cc',
+    'vendor/reshade/effect_lexer.cc',
+    'vendor/reshade/effect_parser.cc',
+    'vendor/reshade/effect_preprocessor.cc',
+    'vendor/reshade/effect_symbol_table.cc',
+    'core/config/config.cc',
+    'core/config/config_serializer.cc',
+    'core/config/config_serializer_profile.cc',
+    'core/config/ini.cc',
+    'core/config/persist.cc',
+    'core/logger.cc',
+    'core/util.cc',
+    include_directories : [VkHook_include_path, imgui_inc, overlay_inc, effects_inc, effects_params_inc, core_inc, input_inc, render_inc, vendor_inc, include_directories('vendor/reshade'), stb_inc, source_inc],
+    dependencies : [reshade_dep, threads_dep])
+test('effect compiler', compiler_tests,
+    args : [meson.current_source_dir() / 'tests/fixtures'],
+    env : ['VKHOOK_LOG_LEVEL=none'])
+
+# EffectId text form, the shader catalog index, and the registry on real
+# shaders: legacy-name migration, technique entries, macro re-parse on the worker.
+effect_id_tests = executable('vkhook-effect-id-tests',
+    'effects/effect_id_test.cc',
+    'effects/effect_id.cc')
+test('effect id', effect_id_tests)
+
+shader_catalog_tests = executable('vkhook-shader-catalog-tests',
+    'effects/shader_catalog_test.cc',
+    'effects/shader_catalog.cc',
+    'effects/effect_id.cc',
+    dependencies : [threads_dep])
+test('shader catalog', shader_catalog_tests)
+
+effect_registry_tests = executable('vkhook-effect-registry-tests',
+    'effects/effect_registry_test.cc',
+    'effects/effect_registry.cc',
+    'effects/effect_id.cc',
+    'effects/shader_catalog.cc',
+    'effects/compiler.cc',
+    'effects/shader_cache.cc',
+    'effects/reshade_parser.cc',
+    'effects/reshade_compile.cc',
+    'effects/reshade_module_io.cc',
+    'vendor/reshade/effect_codegen_spirv.cc',
+    'vendor/reshade/effect_expression.cc',
+    'vendor/reshade/effect_lexer.cc',
+    'vendor/reshade/effect_parser.cc',
+    'vendor/reshade/effect_preprocessor.cc',
+    'vendor/reshade/effect_symbol_table.cc',
+    'core/config/config.cc',
+    'core/config/config_serializer.cc',
+    'core/config/config_serializer_profile.cc',
+    'core/config/ini.cc',
+    'core/config/persist.cc',
+    'core/config/store.cc',
+    'core/config/settings_schema.cc',
+    'core/config/migrate.cc',
+    'core/logger.cc',
+    'core/util.cc',
+    include_directories : [VkHook_include_path, imgui_inc, overlay_inc, effects_inc, effects_params_inc, core_inc, input_inc, render_inc, vendor_inc, include_directories('vendor/reshade'), stb_inc, source_inc],
+    dependencies : [reshade_dep, threads_dep])
+test('effect registry', effect_registry_tests,
+    args : [meson.current_source_dir() / 'tests/fixtures'],
+    env : ['VKHOOK_LOG_LEVEL=none'],
+    timeout : 120)
+
 # Texture files reach the GPU through this conversion; its sizes decide how
 # many bytes the upload reads, so overflows are checked here without a device.
 texture_convert_tests = executable('vkhook-texture-convert-tests',
@@ -602,6 +690,7 @@ test('reshade uniform sources', reshade_uniform_tests)
 persist_tests = executable('vkhook-persist-tests',
     'tests/persist_test.cc',
     'control/preset_model.cc',
+    'effects/effect_id.cc',
     'core/config/persist.cc',
     'core/config/store.cc',
     'core/config/settings_schema.cc',

@@ -19,9 +19,12 @@ namespace VkHook
     // result live in the input image and need forwarding.
     //
     // Effects that write the back buffer (outputWrites > 0) never need it.
-    inline bool reshadeOutputNeedsForward(const reshadefx::module& module, int outputWrites)
+    //
+    // `techniqueIndex` selects the technique of the module that the effect runs;
+    // an index outside the module's techniques is never forwarded.
+    inline bool reshadeOutputNeedsForward(const reshadefx::module& module, size_t techniqueIndex, int outputWrites)
     {
-        if (outputWrites > 0 || module.techniques.empty())
+        if (outputWrites > 0 || techniqueIndex >= module.techniques.size())
             return false;
 
         const auto aliasesBackBuffer = [&module](const std::string& name) {
@@ -30,7 +33,7 @@ namespace VkHook
             });
         };
 
-        for (const reshadefx::pass_info& pass : module.techniques[0].passes)
+        for (const reshadefx::pass_info& pass : module.techniques[techniqueIndex].passes)
         {
             if (!pass.cs_entry_point.empty())
                 return true;

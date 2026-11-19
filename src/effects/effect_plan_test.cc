@@ -164,28 +164,42 @@ namespace
 
     void test_forward_skipped_when_output_already_holds_the_result()
     {
-        expect(!reshadeOutputNeedsForward(makeModule({}), 0), "an effect with no passes leaves its seed copy as the output");
-        expect(!reshadeOutputNeedsForward(makeModule({graphicsPass("texLut")}, {texture("texLut", "")}), 0),
+        expect(!reshadeOutputNeedsForward(makeModule({}), 0, 0), "an effect with no passes leaves its seed copy as the output");
+        expect(!reshadeOutputNeedsForward(makeModule({graphicsPass("texLut")}, {texture("texLut", "")}), 0, 0),
                "graphics passes into private textures leave the seed copy as the output");
-        expect(!reshadeOutputNeedsForward(makeModule({graphicsPass("")}), 1), "back buffer writers never need forwarding");
-        expect(!reshadeOutputNeedsForward(reshadefx::module{}, 0), "a module without techniques is not forwarded");
+        expect(!reshadeOutputNeedsForward(makeModule({graphicsPass("")}), 0, 1), "back buffer writers never need forwarding");
+        expect(!reshadeOutputNeedsForward(reshadefx::module{}, 0, 0), "a module without techniques is not forwarded");
+        expect(!reshadeOutputNeedsForward(makeModule({}), 1, 0), "a technique index past the module's techniques is not forwarded");
     }
 
     void test_forward_kept_when_the_input_is_modified()
     {
         reshadefx::pass_info compute;
         compute.cs_entry_point = "CS";
-        expect(reshadeOutputNeedsForward(makeModule({compute}), 0), "a compute pass can write the input in place");
-        expect(reshadeOutputNeedsForward(makeModule({graphicsPass("texLut"), compute}, {texture("texLut", "")}), 0),
+        expect(reshadeOutputNeedsForward(makeModule({compute}), 0, 0), "a compute pass can write the input in place");
+        expect(reshadeOutputNeedsForward(makeModule({graphicsPass("texLut"), compute}, {texture("texLut", "")}), 0, 0),
                "one compute pass among graphics passes is enough");
-        expect(reshadeOutputNeedsForward(makeModule({graphicsPass("texBack")}, {texture("texBack", "COLOR")}), 0),
+        expect(reshadeOutputNeedsForward(makeModule({graphicsPass("texBack")}, {texture("texBack", "COLOR")}), 0, 0),
                "rendering into a COLOR-semantic texture writes the input image");
-        expect(reshadeOutputNeedsForward(makeModule({graphicsPass("texDepth")}, {texture("texDepth", "DEPTH")}), 0),
+        expect(reshadeOutputNeedsForward(makeModule({graphicsPass("texDepth")}, {texture("texDepth", "DEPTH")}), 0, 0),
                "rendering into a DEPTH-semantic texture writes the input image");
         reshadefx::pass_info multi = graphicsPass("texLut");
         multi.render_target_names[3] = "texBack";
-        expect(reshadeOutputNeedsForward(makeModule({multi}, {texture("texLut", ""), texture("texBack", "COLOR")}), 0),
+        expect(reshadeOutputNeedsForward(makeModule({multi}, {texture("texLut", ""), texture("texBack", "COLOR")}), 0, 0),
                "any of the eight targets can alias the input");
+    }
+
+    // The decision is made for the technique the effect runs, not for the file's first.
+    void test_forward_follows_the_selected_technique()
+    {
+        reshadefx::pass_info compute;
+        compute.cs_entry_point = "CS";
+        reshadefx::module m = makeModule({graphicsPass("texLut")}, {texture("texLut", "")});
+        reshadefx::technique_info second;
+        second.passes = {compute};
+        m.techniques.push_back(std::move(second));
+        expect(!reshadeOutputNeedsForward(m, 0, 0), "the first technique alone does not modify the input");
+        expect(reshadeOutputNeedsForward(m, 1, 0), "the second technique's compute pass modifies the input");
     }
 
     // ---- render pass description ----
@@ -468,6 +482,7 @@ int main()
     test_budget_has_no_empty_pool_sizes();
     test_forward_skipped_when_output_already_holds_the_result();
     test_forward_kept_when_the_input_is_modified();
+    test_forward_follows_the_selected_technique();
     test_render_pass_references();
     test_upload_staging_layout();
     test_upload_is_one_submission();

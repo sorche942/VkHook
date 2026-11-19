@@ -12,7 +12,9 @@
 
 #include "vulkan_include.hh"
 
+#include "compiler.hh"
 #include "effect.hh"
+#include "effect_id.hh"
 #include "config.hh"
 #include "effect_config.hh"
 #include "effect_registry.hh"
@@ -31,6 +33,8 @@ namespace VkHook
     class ReshadeEffect : public Effect
     {
     public:
+        // `effectName` is an EffectId text (EffectId::format()): the effect runs
+        // that id's technique of the file. An unresolved technique means the first.
         ReshadeEffect(LogicalDevice*       logicalDevice,
                       VkFormat             format,
                       VkExtent2D           imageExtent,
@@ -40,7 +44,11 @@ namespace VkHook
                       ReshadeTexturePool& texturePool,
                       std::string          effectName,
                       std::string          effectPath = "",  // Optional: explicit path to .fx file
-                      std::vector<PreprocessorDefinition> customDefs = {});  // Custom preprocessor definitions
+                      std::vector<PreprocessorDefinition> customDefs = {},  // Custom preprocessor definitions
+                      // A finished compile of this entry (from EffectCompiler); when
+                      // null the effect compiles synchronously through
+                      // effectRegistry->shaderCache(). Its techniqueIndex selects the technique.
+                      std::shared_ptr<const EffectCompileResult> precompiled = nullptr);
         void virtual applyEffect(uint32_t imageIndex, VkCommandBuffer commandBuffer) override;
         // Writes this image's slice of the uniform ring (see UniformRing).
         bool updateFrame(uint32_t imageIndex) override;
@@ -76,7 +84,8 @@ namespace VkHook
                    ReshadeTexturePool& texturePool,
                    std::string          effectName,
                    std::string          effectPath,
-                   std::vector<PreprocessorDefinition> customDefs);
+                   std::vector<PreprocessorDefinition> customDefs,
+                   std::shared_ptr<const EffectCompileResult> precompiled);
 
         // Throws EffectBuildError unless `sets` holds one descriptor set per swapchain image.
         void requireDescriptorSets(const std::vector<VkDescriptorSet>& sets, const char* what) const;
@@ -133,12 +142,17 @@ namespace VkHook
         VkExtent2D                            imageExtent;
         std::vector<VkSampler>                samplers;
         EffectRegistry*                       effectRegistry = nullptr;
-        std::string                           effectName;
+        std::string                           effectName;  // EffectId::format()
         std::string                           effectPath;  // Path to .fx file (may differ from effectName)
         std::vector<PreprocessorDefinition>   customPreprocessorDefs;  // User-defined macros
         // Shared with the compile cache and every other effect built from the
         // same source; never modified after it is built.
         std::shared_ptr<const reshadefx::module> compiledModule;
+        // The entry this effect runs: `effectName` parsed as an EffectId, with an
+        // unresolved technique replaced by the file's first. The effect runs
+        // exactly compiledModule->techniques[techniqueIndex].
+        EffectId                              effectId;
+        size_t                                techniqueIndex = 0;
         std::vector<VkDeviceMemory>           textureMemory;
 
         VkFormat    inputOutputFormatUNORM = VK_FORMAT_UNDEFINED;
@@ -178,7 +192,7 @@ namespace VkHook
         uint64_t bindingsGeneration = 0;
 
         void          buildBindings(const reshadefx::module& module);
-        void          createReshadeModule();
+        void          createReshadeModule(std::shared_ptr<const EffectCompileResult> precompiled);
         VkFormat      convertReshadeFormat(reshadefx::texture_format texFormat);
         VkCompareOp   convertReshadeCompareOp(reshadefx::pass_stencil_func compareOp);
         VkStencilOp   convertReshadeStencilOp(reshadefx::pass_stencil_op stencilOp);
