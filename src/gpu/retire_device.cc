@@ -7,9 +7,10 @@ namespace VkHook
 {
 namespace
 {
-    void destroyRetired(void* ctx, const RetiredObject& object)
+    // The one place a handle's Vulkan destroy call is chosen: by `type`. Never by the
+    // C++ handle type: on i686 every non-dispatchable handle is the same uint64_t.
+    void destroyObject(LogicalDevice& d, const RetiredObject& object)
     {
-        LogicalDevice& d   = *static_cast<LogicalDevice*>(ctx);
         const VkDevice dev = d.device;
         const auto&    vkd = d.vkd;
         switch (object.type)
@@ -79,7 +80,21 @@ namespace
             break;
         }
     }
+
+    void destroyRetired(void* ctx, const RetiredObject& object)
+    {
+        destroyObject(*static_cast<LogicalDevice*>(ctx), object);
+    }
 } // namespace
+
+    void destroyObjectNow(LogicalDevice& device, VkObjectType type, uint64_t handle, uint64_t extra)
+    {
+        RetiredObject object;
+        object.type   = type;
+        object.handle = handle;
+        object.extra  = extra;
+        destroyObject(device, object);
+    }
 
     void bindRetireDestroyer(LogicalDevice& device)
     {

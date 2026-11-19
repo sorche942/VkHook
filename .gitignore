@@ -13,3 +13,4 @@ __pycache__/
 steam-*.log
 formal/.lake/
 formal/lake-manifest.json
+*.cross-local.ini

@@ -14,7 +14,10 @@
 // one, then a present-mode change (different image count), then a surface-format
 // change. Variants the surface does not offer are skipped and logged.
 //
-// usage: present-pixels [--expect identity|invert] [--frames N] [--sleep-ms N]
+// usage: present-pixels [--expect identity|invert] [--frames N] [--sleep-ms N] [--no-recreate]
+//   --no-recreate: keep presenting on the same swapchain after SUBOPTIMAL instead of
+//                  recreating it, which an app is allowed to do; the layer must not
+//                  change what it shows because of the code
 // exit:  0 pass, 1 fail, 77 skip (no X11 display or no usable device)
 // stdout: machine-readable lines, see the driver.
 
@@ -49,6 +52,8 @@ constexpr int kEffectBudgetMs = 10000;
 constexpr int kRecreateGrace = 30;
 // frames at the very start that may show the window background before the first present lands
 constexpr int kStartFrames = 3;
+// a real app recreates its swapchain when a present reports SUBOPTIMAL; --no-recreate turns that off
+bool g_recreateOnSuboptimal = true;
 // consecutive inverted frames after which the effect counts as live
 constexpr int kSettleRun = 10;
 
@@ -534,6 +539,7 @@ void App::run(bool invert, int framesPerGeneration, int sleepMs) {
         // plain-until-settled rule already covers startup
         int sinceRecreate = gi > 0 ? 0 : -1;
         int suboptimalRebuilds = 0;
+        int suboptimalPresents = 0;
         for (int k = 0;; ++k, ++frame) {
             if (k >= framesPerGeneration) {
                 const bool waiting = gi == 0 && !settled;
@@ -547,6 +553,7 @@ void App::run(bool invert, int framesPerGeneration, int sleepMs) {
                 }
             }
             const bool suboptimal = renderAndPresent(frame);
+            suboptimalPresents += suboptimal ? 1 : 0;
             std::this_thread::sleep_for(std::chrono::milliseconds(sleepMs));
             XSync(dpy_, False);
 
@@ -601,13 +608,17 @@ void App::run(bool invert, int framesPerGeneration, int sleepMs) {
             if (sinceRecreate >= 0) ++sinceRecreate;
             // a real app recreates on SUBOPTIMAL (the compositor wants a different surface
             // configuration); do the same, a bounded number of times per generation
-            if (suboptimal && suboptimalRebuilds < 3) {
+            if (suboptimal && !g_recreateOnSuboptimal && suboptimalRebuilds == 0) {
+                ++suboptimalRebuilds;
+                note("SUBOPTIMAL after frame %d: keeping the swapchain", frame);
+            } else if (suboptimal && g_recreateOnSuboptimal && suboptimalRebuilds < 3) {
                 ++suboptimalRebuilds;
                 note("SUBOPTIMAL after frame %d: recreating swapchain", frame);
                 createSwapchain(gens[gi]);
                 sinceRecreate = 0;
             }
         }
+        note("generation %zu: %d presents reported SUBOPTIMAL", gi, suboptimalPresents);
         // staleness at the end of a generation: the last frame must be (nearly) the newest
         const Frame& last = log.back();
         if (last.matchedFrame < 0 || last.index - last.matchedFrame > 3) {
@@ -647,6 +658,8 @@ int main(int argc, char** argv) {
             invert = std::string(argv[++i]) == "invert";
         else if (a == "--frames" && i + 1 < argc)
             frames = std::atoi(argv[++i]);
+        else if (a == "--no-recreate")
+            g_recreateOnSuboptimal = false;
         else if (a == "--sleep-ms" && i + 1 < argc)
             sleepMs = std::atoi(argv[++i]);
     }

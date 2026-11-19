@@ -426,6 +426,21 @@ test('present modes', present_mode_tests,
     env : ['VKHOOK_LOG_LEVEL=none'],
     suite : ['threaded'])
 
+# SwapchainShared::release destroys by VkObjectType, not by C++ handle type (all
+# non-dispatchable handles are one uint64_t on i686): the 32-bit layer crashed at the
+# first swapchain recreation. Runs in the i686 build too.
+swapchain_release_tests = executable('vkhook-swapchain-release-tests',
+    'tests/swapchain_release_test.cc',
+    'render/logical_swapchain.cc',
+    'gpu/retire_device.cc',
+    'gpu/retire.cc',
+    'gpu/timeline.cc',
+    cpp_args : ['-ffunction-sections', '-fdata-sections'],
+    link_args : ['-Wl,--gc-sections'],
+    dependencies : vkhook_core_dep)
+test('swapchain release', swapchain_release_tests,
+    env : ['VKHOOK_LOG_LEVEL=none'])
+
 # The depth tracker's contracts (candidate selection, layout tracking through
 # barriers, storage lifetime against recorded command buffers, handle reuse)
 # against a fake Vulkan dispatch; no device needed.
@@ -652,6 +667,15 @@ present_pixels_app = executable('present-pixels',
     dependencies : [dependency('vulkan'), x11_dep])
 test('present pixels', find_program('python3', native : true),
     args : [files('tests/present_pixels.py'), present_pixels_app.full_path(), vkhook_lib.full_path()],
+    depends : [present_pixels_app, vkhook_lib],
+    is_parallel : false,
+    timeout : 180,
+    protocol : 'exitcode')
+# A present that reports SUBOPTIMAL is a success: an app that keeps its swapchain
+# (it may) must keep getting processed frames.
+test('present pixels without recreate', find_program('python3', native : true),
+    args : [files('tests/present_pixels.py'), present_pixels_app.full_path(), vkhook_lib.full_path(),
+            '--no-recreate'],
     depends : [present_pixels_app, vkhook_lib],
     is_parallel : false,
     timeout : 180,

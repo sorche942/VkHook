@@ -2,9 +2,8 @@
 
 #include "depth/capture.hh"
 #include "gpu/retire.hh"
+#include "gpu/retire_device.hh"
 #include "logger.hh"
-
-#include <type_traits>
 
 namespace VkHook
 {
@@ -16,25 +15,14 @@ namespace VkHook
         // the renderer retires its own objects; it goes before the images it draws into
         overlay.reset();
         depthCapture.reset();
+        // gpuIdle: the caller proved the GPU is done with these. The destroy call is
+        // picked by `type`, never by the handle's C++ type (on i686 a VkFence and a
+        // VkImageView are both uint64_t).
         auto drop = [&](VkObjectType type, auto handle) {
             if (!handle)
                 return;
-            if (!gpuIdle)
-            {
-                d.retire(type, handle);
-                return;
-            }
-            using Handle = decltype(handle);
-            if constexpr (std::is_same_v<Handle, VkFence>)
-                d.vkd.DestroyFence(d.device, handle, nullptr);
-            else if constexpr (std::is_same_v<Handle, VkSemaphore>)
-                d.vkd.DestroySemaphore(d.device, handle, nullptr);
-            else if constexpr (std::is_same_v<Handle, VkImageView>)
-                d.vkd.DestroyImageView(d.device, handle, nullptr);
-            else if constexpr (std::is_same_v<Handle, VkImage>)
-                d.vkd.DestroyImage(d.device, handle, nullptr);
-            else if constexpr (std::is_same_v<Handle, VkDeviceMemory>)
-                d.vkd.FreeMemory(d.device, handle, nullptr);
+            if (gpuIdle)
+                destroyObjectNow(d, type, handleToU64(handle));
             else
                 d.retire(type, handle);
         };

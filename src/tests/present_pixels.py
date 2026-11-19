@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Driver for present-pixels: what reaches the screen when the layer swaps the swapchain images.
 
-usage: present_pixels.py PRESENT_PIXELS_BINARY LIBVKHOOK_SO [VARIANT...]
+usage: present_pixels.py PRESENT_PIXELS_BINARY LIBVKHOOK_SO [--no-recreate] [VARIANT...]
+
+--no-recreate makes the app keep its swapchain after a present reports SUBOPTIMAL
+(an app may); the layer must keep processing frames either way.
 
 Variants (default: all):
   copy-off     no effect, depthCapture off        -> plain copy path, colour unchanged
@@ -93,12 +96,12 @@ def seed(work, library, variant, game):
     return env, config
 
 
-def run_variant(binary, library, variant, work_root):
+def run_variant(binary, library, variant, work_root, app_args=()):
     depth, effect, expect = VARIANTS[variant]
     work = Path(tempfile.mkdtemp(prefix=f"vkhook-pixels-{variant}-", dir=work_root))
     env, config = seed(work, library, variant, binary.name)
     try:
-        proc = subprocess.run([str(binary), "--expect", expect], env=env, capture_output=True, text=True,
+        proc = subprocess.run([str(binary), "--expect", expect, *app_args], env=env, capture_output=True, text=True,
                               timeout=90)
     except subprocess.TimeoutExpired as e:
         print(f"  x {variant}: timed out (artifacts {work})")
@@ -150,7 +153,8 @@ def main(argv):
         return 2
     binary = Path(argv[1]).resolve()
     library = Path(argv[2]).resolve()
-    names = argv[3:] or list(VARIANTS)
+    app_args = [a for a in argv[3:] if a == "--no-recreate"]
+    names = [a for a in argv[3:] if a not in app_args] or list(VARIANTS)
     for n in names:
         if n not in VARIANTS:
             print(f"unknown variant {n}; known: {', '.join(VARIANTS)}")
@@ -169,7 +173,7 @@ def main(argv):
         return SKIP
 
     root = tempfile.mkdtemp(prefix="vkhook-pixels-")
-    results = [run_variant(binary, library, v, root) for v in names]
+    results = [run_variant(binary, library, v, root, app_args) for v in names]
     if not any(r == 1 for r in results):
         shutil.rmtree(root, ignore_errors=True)
     if any(r == 1 for r in results):
