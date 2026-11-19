@@ -27,8 +27,12 @@ meson test -C build --print-errorlogs
   (the Khronos validation layer is installed). New code must not add validation errors. Turn on
   synchronization validation with `VK_LAYER_ENABLES=VALIDATION_CHECK_ENABLE_SYNCHRONIZATION_VALIDATION`.
 - **Smoke test (needs a display; GPU or lavapipe):**
-  `src/tests/smoke_vkcube.sh build/src/libvkhook.so 11`. To run on lavapipe, add
+  `VKHOOK_SMOKE_VALIDATION=1 src/tests/smoke_vkcube.sh build/src/libvkhook.so 11`; headless:
+  `env -u WAYLAND_DISPLAY xvfb-run -a …`. A run counts only if the output confirms the loader
+  inserted the validation layer. To run on lavapipe, add
   `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json`.
+- **Sanitizers:** `just sanitize asan` (whole suite), `just sanitize tsan` (`threaded` suite).
+- **i686:** `scripts/build-i686.sh`.
 - **Shader corpus:** `python3 src/tests/test_reshade_shaders.py --shader-check build/src/vkhook-shader-check`.
 - **Depth regression (GPU, X11):** see the header of `src/tests/test_depth_clear_smoke.py`.
 - **Formal models:** `just formal`, which is `cd formal && lake build`. See §6.
