@@ -60,6 +60,9 @@ namespace
         logicalDevice->queue                 = VK_NULL_HANDLE;
         logicalDevice->queueFamilyIndex      = 0;
         logicalDevice->supportsMutableFormat = plan.supportsMutableFormat;
+        logicalDevice->separateDepthStencilLayouts = plan.separateDepthStencilLayouts;
+        if (depthCaptureActive())
+            logicalDevice->depth = std::make_shared<DepthTracker>(logicalDevice.get());
         logicalDevice->isNvidiaGpu           = (deviceProps.vendorID == 0x10DE);
         logicalDevice->gpuProperties         = deviceProps;
         logicalDevice->gpuCrashDiagnosticsEnabled = build.gpuCrashDiagnosticsRequested;
@@ -392,27 +395,8 @@ namespace
             // went with the swapchains above
             logicalDevice->control.reset();
 
-            destroyPersistentDepthStorage(logicalDevice);
-
-            // The ring's teardown takes its own lock so it cannot race a QueueSubmit
-            // mid-copy; the device is idle, so the objects go directly.
-            logicalDevice->depthCopy.withRing([&](DepthCopyState::RingAccess& ring) {
-                VkCommandPool pool = VK_NULL_HANDLE;
-                std::vector<VkFence> fences;
-                ring.detach(pool, fences);
-
-                if (pool == VK_NULL_HANDLE && fences.empty())
-                    return;
-
-                Logger::debug("DestroyCommandPool (depth copy ring buffer)");
-                for (VkFence f : fences)
-                {
-                    if (f != VK_NULL_HANDLE)
-                        logicalDevice->vkd.DestroyFence(device, f, nullptr);
-                }
-                if (pool != VK_NULL_HANDLE)
-                    logicalDevice->vkd.DestroyCommandPool(device, pool, pAllocator);
-            });
+            // the tracker's storages retire into the queue drained below
+            logicalDevice->depth.reset();
 
             // everything the layer retired, including the overlay's handles above
             logicalDevice->retireQueue.drainAll();

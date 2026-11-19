@@ -14,7 +14,6 @@
 #include "c_resource.hh"
 #include "descriptor_set.hh"
 #include "buffer.hh"
-#include "renderpass.hh"
 #include "graphics_pipeline.hh"
 #include "framebuffer.hh"
 #include "shader.hh"

@@ -110,6 +110,7 @@ namespace VkHook
         bool enableShaderImageGatherExtended        = false;
         bool enableShaderStorageImageReadWithoutFormat  = false;
         bool enableShaderStorageImageWriteWithoutFormat = false;
+        bool separateDepthStencilLayouts            = false; // the app enabled it (separate depth/stencil layouts usable)
         bool dlss5Supported                         = false;
         std::string dlss5UnavailableReason          = "DLSS5 backend not built";
         uint32_t opticalFlowFamily                  = VK_QUEUE_FAMILY_IGNORED;

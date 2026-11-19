@@ -25,7 +25,7 @@ statements see earlier assignments, so read a pre-state value into a `let` first
 | `RetireQueue` | inv. 3 | `gpu/retire`, `gpu/timeline` | H6: `panicLayer` flush without wait; process-global queue |
 | `LockDiscipline` | inv. 1–2 | `gpu/queue`, every hook, `present/present` | C8: GPU wait under `globalLock` deadlocks with app semaphore chains; H3: layer submit without the queue mutex |
 | `PresentModes` | inv. 5 | `present/present` | C2: bypass presents the never-rendered real image; present with zero wait semaphores |
-| `ChainRebuild` | inv. 4, 6 | `present/swapchain`, `effects/graph`, `depth/tracker` | C4: layer objects recorded into app command buffers outlive their generation |
+| `ChainRebuild` | inv. 4, 6 | `present/swapchain`, `effects/graph`, `depth/tracker` (storage lifetime) | C4: layer objects recorded into app command buffers outlive their generation |
 | `SyncobjGate` | Wayland commit/present exclusion | `input/wayland_syncobj_gate` | H24: check-then-act; wait-budget escape |
 | `PersistenceQueue` | inv. 12 | `config/persist` | H18: sync delete resurrected by queued autosave; H16: own write seen as external |
 

@@ -544,7 +544,6 @@ namespace VkHook
                     reloadEffects = std::move(logicalDevice->pendingChainEffects);
                     logicalDevice->pendingChainEffects.clear();
                     logicalDevice->pendingChainReload = false;
-                    logicalDevice->depthReallocPending = false;
                     reloadNow = true;
                 }
             }

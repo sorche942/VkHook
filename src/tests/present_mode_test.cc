@@ -88,15 +88,13 @@ namespace
 
     void testChooser()
     {
-        for (int bits = 0; bits < 32; ++bits)
+        for (int bits = 0; bits < 8; ++bits)
         {
             ModeInputs in;
             in.faked             = bits & 1;
             in.effectsOn         = bits & 2;
             in.softDisabled      = bits & 4;
-            in.depthHold         = bits & 8;
-            in.generationPending = bits & 16;
-            const bool bypass = !in.effectsOn || in.softDisabled || in.depthHold || in.generationPending;
+            const bool bypass = !in.effectsOn || in.softDisabled;
             const PresentMode mode = choosePresentMode(in);
             if (!in.faked)
                 CHECK(mode == PresentMode::Passthrough);

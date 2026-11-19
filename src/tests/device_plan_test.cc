@@ -230,6 +230,27 @@ static void mutableFormat()
     require(plan->supportsMutableFormat, "env override on ignored");
 }
 
+static void separateDepthStencil()
+{
+    DeviceCaps caps = fullCaps();
+    VkDeviceCreateInfo app{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
+    require(!planDeviceCreate(caps, app)->separateDepthStencilLayouts, "default must be off");
+
+    VkPhysicalDeviceSeparateDepthStencilLayoutsFeatures sep{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SEPARATE_DEPTH_STENCIL_LAYOUTS_FEATURES};
+    app.pNext = &sep;
+    require(!planDeviceCreate(caps, app)->separateDepthStencilLayouts, "struct present but off");
+    sep.separateDepthStencilLayouts = VK_TRUE;
+    require(planDeviceCreate(caps, app)->separateDepthStencilLayouts, "1.2 extension struct not seen");
+
+    VkPhysicalDeviceVulkan12Features v12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    f2.pNext = &v12;
+    app.pNext = &f2;
+    require(!planDeviceCreate(caps, app)->separateDepthStencilLayouts, "v12 off");
+    v12.separateDepthStencilLayouts = VK_TRUE;
+    require(planDeviceCreate(caps, app)->separateDepthStencilLayouts, "v12 struct not seen");
+}
+
 static void faultFeatures()
 {
     DeviceCaps caps = fullCaps();
@@ -481,6 +502,7 @@ int main()
         unknownNodeBeforeFeatures2();
         mutableFormat();
         faultFeatures();
+        separateDepthStencil();
         deepCopyIndependence();
         instancePlan();
 #ifdef VKHOOK_DLSS5

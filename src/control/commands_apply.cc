@@ -3,6 +3,7 @@
 #include "control/frontend.hh"
 #include "control/preset_model.hh"
 #include "depth/tracker.hh"
+#include "present/swapchain.hh"
 #include "effects/effect_registry.hh"
 #include "config_serializer.hh"
 #include "logical_device.hh"
@@ -320,12 +321,13 @@ namespace VkHook
     {
         const auto settings = ConfigStore::instance().snapshot();
 
-        // a short read of the tracker's maps; the copy leaves the lock before anything else runs
-        std::lock_guard<std::mutex> l(logicalDevice->stateLock);
-
         depthInfo.supportedResolveModes = logicalDevice->supportedDepthResolveModes;
         depthInfo.depthCaptureEnabled = settings->depthCapture;
-        depthInfo.swapchainExtent = currentSwapchainExtentLocked(logicalDevice);
+        {
+            // the window size, for the pin default
+            std::lock_guard<std::mutex> l(logicalDevice->stateLock);
+            depthInfo.swapchainExtent = currentSwapchainExtentLocked(logicalDevice);
+        }
 
         deviceInfo.gpuName = logicalDevice->gpuName;
         deviceInfo.gpuDriverInfo = logicalDevice->gpuDriverInfo;
@@ -333,59 +335,34 @@ namespace VkHook
         deviceInfo.gpuApiVersion = logicalDevice->gpuApiVersion;
         deviceInfo.gpuVendorId = logicalDevice->gpuVendorId;
 
-        const bool avgSupported = (logicalDevice->supportedDepthResolveModes & VK_RESOLVE_MODE_AVERAGE_BIT) != 0;
-        depthInfo.depthResolveMode = settings->depthResolveMode == 2 && avgSupported
-            ? VK_RESOLVE_MODE_AVERAGE_BIT : VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
+        // the capture resolves by shader, so every mode is available whatever the device's subpass resolve supports
+        depthInfo.depthResolveMode = settings->depthResolveMode == 1 ? VK_RESOLVE_MODE_SAMPLE_ZERO_BIT
+                                                                     : VK_RESOLVE_MODE_AVERAGE_BIT;
+        if (!logicalDevice->depth)
+            return;
 
-        const auto& best = logicalDevice->bestDepthCandidate;
-        auto describe = [&](DepthCandidateInfo& c, const DepthState& ds) {
-            c.imageView = ds.imageView;
-            c.format = ds.format;
-            c.extent = ds.extent;
-            c.samples = ds.samples;
-            c.observedLayout = ds.observedLayout;
-            c.transient = ds.transient;
-            const bool isBest = best.valid && best.depthState.imageView == ds.imageView;
-            c.drawCount = isBest ? best.drawCount : 0;
-            c.hasPresentableSnapshotTarget = isBest ? best.hasPresentableSnapshotTarget : false;
+        const DepthReport report = logicalDevice->depth->report();
+        const auto describe = [&](DepthCandidateInfo& c, const DepthReport::Entry& e) {
+            c.imageView = e.appView;
+            c.format = e.format;
+            c.extent = e.extent;
+            c.samples = e.samples;
+            c.observedLayout = e.layout;
+            c.transient = e.transient;
+            c.drawCount = e.drawCount;
+            c.hasPresentableSnapshotTarget = depthExtentMatchesWindow(e.extent, depthInfo.swapchainExtent);
         };
-
-        // A pin whose view the render thread destroyed since the last frame is
-        // shown as no pin (the depth hooks clear the field itself).
-        depthInfo.pinnedView = logicalDevice->pinnedDepthImageView;
-        depthInfo.depthIsPinned = depthInfo.pinnedView != VK_NULL_HANDLE;
-        if (depthInfo.depthIsPinned)
-        {
-            const auto it = logicalDevice->depthViewStates.find(depthInfo.pinnedView);
-            if (it != logicalDevice->depthViewStates.end())
-            {
-                describe(depthInfo.active, it->second);
-            }
-            else
-            {
-                depthInfo.depthIsPinned = false;
-                depthInfo.pinnedView = VK_NULL_HANDLE;
-            }
-        }
-        if (!depthInfo.depthIsPinned)
-        {
-            describe(depthInfo.active, logicalDevice->activeDepthState);
-            // the active buffer is whatever the best candidate is, tracked or not
-            depthInfo.active.drawCount = best.valid ? best.drawCount : 0;
-            depthInfo.active.hasPresentableSnapshotTarget = best.hasPresentableSnapshotTarget;
-        }
+        if (report.hasActive)
+            describe(depthInfo.active, report.active);
+        depthInfo.depthIsPinned = report.pinned;
+        depthInfo.pinnedView = report.pinnedView;
         depthInfo.depthResolveIsMsaa = depthInfo.active.samples != VK_SAMPLE_COUNT_1_BIT;
-
-        for (const auto& [view, ds] : logicalDevice->depthViewStates)
+        for (const DepthReport::Entry& e : report.candidates)
         {
             DepthCandidateInfo c;
-            describe(c, ds);
-            c.imageView = view;
+            describe(c, e);
             depthInfo.candidates.push_back(c);
         }
-        // busiest first, so the best candidate leads
-        std::sort(depthInfo.candidates.begin(), depthInfo.candidates.end(),
-                  [](const DepthCandidateInfo& a, const DepthCandidateInfo& b) { return a.drawCount > b.drawCount; });
     }
 
     CoreSnapshotPtr OverlayControl::buildSnapshot()
@@ -647,7 +624,7 @@ namespace VkHook
 
         void operator()(const PinDepth& c) const
         {
-            if (!pinDepthView(self.logicalDevice, c.view))
+            if (!self.logicalDevice->depth || !self.logicalDevice->depth->pinDepthView(c.view))
             {
                 Logger::warn("depth pin requested but view not found (may have been destroyed)");
                 return;
@@ -657,15 +634,20 @@ namespace VkHook
 
         void operator()(const ClearDepthPin&) const
         {
-            clearDepthPin(self.logicalDevice);
+            if (self.logicalDevice->depth)
+                self.logicalDevice->depth->clearDepthPin();
             Logger::info("depth manual pin cleared (back to auto-promotion)");
         }
 
-        void operator()(const RefreshDepth&) const { refreshDepthDetection(self.logicalDevice); }
+        void operator()(const RefreshDepth&) const
+        {
+            if (self.logicalDevice->depth)
+                self.logicalDevice->depth->refreshDetection();
+        }
 
-        // the resolve owns the transforms (macros no longer carry them), so
-        // re-recording it is all a toggle needs
-        void operator()(const DepthTransformChanged&) const { requestDepthRealloc(self.logicalDevice); }
+        // The transforms are push constants read from the settings at every
+        // present: a toggle needs nothing rebuilt.
+        void operator()(const DepthTransformChanged&) const {}
 
         void operator()(const SetSetting& c) const
         {

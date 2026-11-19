@@ -16,22 +16,14 @@ namespace VkHook
     // returns an empty vector and logs when it is null or allocation fails.
     std::vector<VkCommandBuffer> allocateCommandBuffer(LogicalDevice* logicalDevice, uint32_t count, VkCommandPool pool);
 
+    // Records `effects` into `commandBuffers` (every image, or only `imageIndex`)
+    // and binds each effect to the swapchain's depth capture targets, when it
+    // has them. Depth itself is captured by DepthCapture, never recorded here.
     void writeCommandBuffers(LogicalDevice*                                 logicalDevice,
                              LogicalSwapchain*                              logicalSwapchain,
                              const std::vector<std::shared_ptr<VkHook::Effect>>& effects,
                              const std::vector<VkCommandBuffer>&             commandBuffers,
-                             const DepthState&                              depthState,
                              uint32_t                                       imageIndex = UINT32_MAX);
-
-    // Reads the device's depth tracking maps: the caller holds the device
-    // stateLock. Only record outside application render scopes; layer-owned
-    // command buffers have no tracked application scope. Polls (never waits on)
-    // the image's fence before rewriting live descriptor sets.
-    void recordDepthResolveSnapshot(LogicalDevice*            logicalDevice,
-                                    LogicalSwapchain*         logicalSwapchain,
-                                    VkCommandBuffer           commandBuffer,
-                                    uint32_t                  imageIndex,
-                                    const DepthState&         depthState);
 
     std::vector<VkSemaphore> createSemaphores(LogicalDevice* logicalDevice, uint32_t count);
 } // namespace VkHook

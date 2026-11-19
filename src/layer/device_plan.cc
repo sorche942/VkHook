@@ -237,6 +237,17 @@ namespace VkHook
 
         // ---- feature chain ----
         const Chain chain(app.pNext);
+        // The application's own choice: the capture's layouts follow it and the
+        // layer never turns the feature on itself.
+        for (const VkBaseInStructure* node : chain.nodes)
+        {
+            if (node->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SEPARATE_DEPTH_STENCIL_LAYOUTS_FEATURES)
+                p.separateDepthStencilLayouts |=
+                    reinterpret_cast<const VkPhysicalDeviceSeparateDepthStencilLayoutsFeatures*>(node)->separateDepthStencilLayouts == VK_TRUE;
+            else if (node->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES)
+                p.separateDepthStencilLayouts |=
+                    reinterpret_cast<const VkPhysicalDeviceVulkan12Features*>(node)->separateDepthStencilLayouts == VK_TRUE;
+        }
         const int features2Index = chain.find(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2);
         const int faultIndex     = p.enableDeviceFault ? chain.find(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT) : -1;
         const int diagIndex      = p.enableNvDiagnosticsConfig ? chain.find(VK_STRUCTURE_TYPE_DEVICE_DIAGNOSTICS_CONFIG_CREATE_INFO_NV) : -1;
