@@ -1,4 +1,0 @@
-# actionlint 1.7 predates the ubuntu-26.04 runner image
-self-hosted-runner:
-  labels:
-    - ubuntu-26.04

@@ -25,15 +25,15 @@
 # (/tmp/xvfb-run.*/Xauthority*), or this script having re-exec'd itself under
 # xvfb-run. On a real display none of these hold and the environment is untouched.
 #
-# needs a display. on CI wrap it: xvfb-run -a src/tests/smoke_vkcube.sh
-# there is no GPU on a CI runner either, so point VK_ICD_FILENAMES at lavapipe
-# or the loader will find nothing to run on.
+# needs a display. headless: xvfb-run -a src/tests/smoke_vkcube.sh
+# without a GPU, point VK_ICD_FILENAMES at lavapipe or the loader will find
+# nothing to run on.
 
 set -euo pipefail
 
 # resolved from the script's own location rather than the cwd, so the shader
-# fixtures are found when this is invoked from anywhere -- CI in particular runs
-# it through xvfb-run from the repository root, and a cwd-relative path would
+# fixtures are found when this is invoked from anywhere (for example through
+# xvfb-run from the repository root), and a cwd-relative path would
 # quietly seed no effect at all, turning the run into a pass-through test that
 # looks like it passed.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -70,7 +70,7 @@ LIBRARY="$(cd "$(dirname "$LIBRARY")" && pwd)/$(basename "$LIBRARY")"
 if [[ -z "${DISPLAY:-}" && -z "${WAYLAND_DISPLAY:-}" ]]; then
     # A headless runner has no display at all and vkcube cannot open a window
     # without one. Re-exec under xvfb-run so the same command works on a
-    # developer desktop and on CI. The env marker keeps a broken xvfb-run from
+    # developer desktop and on a headless machine. The env marker keeps a broken xvfb-run from
     # turning this into an exec loop.
     if [[ -z "${VKHOOK_SMOKE_XVFB:-}" ]] && command -v xvfb-run >/dev/null 2>&1; then
         VKHOOK_SMOKE_XVFB=1 exec xvfb-run -a "$0" "$@"
@@ -294,10 +294,8 @@ fi
 # found, parsed, compiled and turned into render passes. An earlier version of
 # this assertion matched the destructor's trace instead, which was wrong -- a
 # trace from a destructor only appears if something tears the effect down, and
-# on a CI runner the normal ending is vkcube being killed by the timeout, so it
-# never got the chance. That assertion passed locally only because the resize
-# reload happened to destroy effects mid-run, and failed on CI for the same
-# reason inverted.
+# under xvfb the normal ending is vkcube being killed by the timeout, so it
+# never got the chance.
 #
 # passes= must be non-zero: zero would mean the effect object exists but never
 # got a pipeline, so it never drew.
@@ -306,9 +304,8 @@ if grep -qE '\[effect-built\] DisplayDepth\.fx\|DisplayDepth passes=[1-9]' "$LAY
 elif grep -q 'pass through only' "$LAYER_LOG"; then
     # The layer supports Wayland surfaces only. On X11 it deliberately does
     # nothing at all, so there is no effect to build and nothing to assert about
-    # the effect pipeline here. This is the CI configuration, which is why the
-    # run is a pass-through check on CI and a real one locally.
-    warn "non-Wayland surface: layer is pass-through, effect pipeline not exercised (CI runs this way)"
+    # the effect pipeline here, so the run is only a pass-through check.
+    warn "non-Wayland surface: layer is pass-through, effect pipeline not exercised"
 else
     printf '%s\n' "--- layer log ---" >&2
     cat "$LAYER_LOG" >&2

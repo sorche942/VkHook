@@ -1,17 +1,18 @@
 # workflows
 
-GitHub Actions (`.github/workflows/ci.yml`) runs these jobs on Ubuntu:
+There is no hosted CI. Before merging, run these checks locally:
 
-| Job | What it proves |
-| --- | --- |
-| build (clang, gcc) | the layer and every test build with both compilers and `meson test` is green; with clang it also compiles the whole ReShade shader corpus |
-| ASan + UBSan | the whole unit suite under AddressSanitizer and UndefinedBehaviorSanitizer (`-fno-sanitize-recover`) |
-| TSan | the `threaded` suite (persistence queue, retire queue, syncobj gate, overlay commands, config store and serializer caches, compile cache, depth copy state, present modes) under ThreadSanitizer |
-| smoke | the layer under `vkcube` on lavapipe + Xvfb with Khronos validation (`VKHOOK_SMOKE_VALIDATION=1`), then the `present pixels` readback test |
-| i686 | the Zig-built 32-bit layer and its tests (`scripts/build-i686.sh`) |
-| DLSS5 build | `-Ddlss5=enabled` compiles, against pinned Vulkan headers and glslang (compile only: the backend needs an NVIDIA GPU) |
+| Check | Command | What it proves |
+| --- | --- | --- |
+| build + tests (clang, gcc) | `meson compile -C build && meson test -C build` | the layer and every test build with both compilers and the unit suite is green |
+| ASan + UBSan | `just sanitize asan` | the whole unit suite under AddressSanitizer and UndefinedBehaviorSanitizer |
+| TSan | `just sanitize tsan` | the `threaded` suite (persistence queue, retire queue, syncobj gate, overlay commands, config store and serializer caches, compile cache, depth copy state, present modes) under ThreadSanitizer |
+| smoke | `VKHOOK_SMOKE_VALIDATION=1 xvfb-run -a src/tests/smoke_vkcube.sh` | the layer under `vkcube` with Khronos validation; `meson test` also runs the `present pixels` readback test |
+| shader corpus | `python3 src/tests/test_reshade_shaders.py --shader-check build/src/vkhook-shader-check` | every shader of the pinned packages compiles |
+| i686 | `scripts/build-i686.sh` | the Zig-built 32-bit layer and its tests |
+| formal models | `just formal` | the Lean/Veil models still check; see [formal models](#formal-models) |
 
-There is no GPU on a runner, so GPU-only paths (DLSS5 inference, the depth regression scripts) are not covered there; run them locally. `just formal` (the Lean/Veil models) is not run in CI either: it needs a built Veil checkout that a stock runner lacks. Run it before merging a change to a modeled protocol; see [formal models](#formal-models).
+GPU-only paths (DLSS5 inference, the depth regression scripts) need the real driver.
 
 ## vendor subtrees
 
@@ -359,7 +360,7 @@ with a green debug-status strip. A magenta checkerboard with Temporal enabled
 means the runtime path is unavailable, not that the image has no motion;
 check the `DLSS5 optical flow`/`DLSS5 temporal unavailable` startup messages.
 GPU inference requires the hardware above and locally extracted weights;
-lavapipe CI cannot prove it. These checks do not establish NVIDIA DLL parity.
+lavapipe cannot prove it. These checks do not establish NVIDIA DLL parity.
 
 ### Network performance
 
@@ -914,8 +915,8 @@ just sanitize asan    # clang, -Db_sanitize=address,undefined, the whole suite
 just sanitize tsan    # clang, -Db_sanitize=thread, --suite threaded
 ```
 
-These are the CI commands (`-Db_lundef=false` is required with sanitizers; CI also passes
-`-fno-sanitize-recover=undefined` for UBSan). TSan can abort at startup on kernels with a
+`-Db_lundef=false` is required with sanitizers; UBSan also runs with
+`-fno-sanitize-recover=undefined`. TSan can abort at startup on kernels with a
 high `vm.mmap_rnd_bits`; `sudo sysctl vm.mmap_rnd_bits=28` fixes it.
 
 ### formal models
@@ -927,7 +928,7 @@ discipline, present modes, chain rebuild, syncobj gate, persistence queue):
 1. Change the model first (`formal/VkHookFormal/<Model>.lean`); keep the header comment's
    action-to-C++ mapping current.
 2. `just formal` (`cd formal && lake build`). It needs a built Veil checkout at
-   `~/Development/veil` (or `VEIL_HOME`) and takes about a minute; it is not in CI.
+   `~/Development/veil` (or `VEIL_HOME`) and takes about a minute.
 3. Change the C++ and the unit test that drives it with random action sequences against the
    model's safety clauses (for example `retire queue`, `present modes`, `persistence queue`).
 4. Report `just formal` among the checks you ran.
@@ -980,7 +981,7 @@ This does not need a GPU: `vkhook-shader-check` runs the embedded reshadefx comp
 
 The manifest is the repository's own copy, so edits to `assets/EffectPackages.ini` are tested. Each package is
 downloaded at the commit pinned in `src/tests/fixtures/effect-package-pins.ini`, not from the moving branch
-archive the manifest names, so results are reproducible and an upstream push cannot break CI. A package without
+archive the manifest names, so results are reproducible and an upstream push cannot break the check. A package without
 a pin fails the run. After adding a package or deliberately moving to newer upstream shaders, run
 `python3 src/tests/test_reshade_shaders.py --update-pins`, review which shaders then fail, and commit the pins.
 
@@ -1005,7 +1006,7 @@ VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json \
   env -u WAYLAND_DISPLAY xvfb-run -a src/tests/smoke_vkcube.sh
 ```
 
-On a headless machine wrap it in `xvfb-run -a`, which is what CI does. The depth capture runs in the layer's own command buffer, so the smoke test also asserts that vkcube's depth image was tracked and selected as the capture source (including across the forced refreshes). `VKHOOK_SMOKE_VALIDATION=1` additionally enables the Khronos validation layer below VkHook, asserts the loader inserted it, and fails on any `Validation Error`; `VKHOOK_SMOKE_HEADLESS=1` (or running under `xvfb-run`) unsets `WAYLAND_DISPLAY` for vkcube.
+On a headless machine wrap it in `xvfb-run -a`. The depth capture runs in the layer's own command buffer, so the smoke test also asserts that vkcube's depth image was tracked and selected as the capture source (including across the forced refreshes). `VKHOOK_SMOKE_VALIDATION=1` additionally enables the Khronos validation layer below VkHook, asserts the loader inserted it, and fails on any `Validation Error`; `VKHOOK_SMOKE_HEADLESS=1` (or running under `xvfb-run`) unsets `WAYLAND_DISPLAY` for vkcube.
 Run it on a GPU display (no `xvfb-run`) to cover the real driver.
 
 ### pixel readback (`present pixels`)

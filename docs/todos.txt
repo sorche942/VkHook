@@ -15,46 +15,37 @@ EffectRegistry; Vulkan handle ownership via per-device serial-keyed RetireQueue
 drops effect-list entries that name no instance); monolith split (vkhook.cc and
 imgui_overlay.cc no longer exist; layer/, present/, depth/, control/, overlay/);
 the global audit (AGENTS.md catalog C1-C8, H1-H26, mostly S1/S2).
-Overhaul stage 3 (infra): vkhook_core static library, CI matrix (clang, gcc,
-ASan+UBSan, TSan, i686, DLSS5 compile), pinned shader corpus, pixel readback in
-the smoke tests, per-architecture-safe layer manifest, one VERSION source.
+Overhaul stage 3: depth capture rewrite (DepthTracker, barrier-tracked layouts,
+vkQueueSubmit2, no layer objects in game command buffers, one resolve shader),
+EffectId (every technique runs), per-device registry/config, compile worker,
+ping-pong chain images, vkhook_core static library, pinned shader corpus, pixel
+readback test, per-architecture-safe layer manifest, one VERSION source.
+All AGENTS.md catalog items C1-C8 and H1-H26 are closed.
 Dropped: porting built-in effects to .fx (the built-ins stay in
-assets/builtInShaders); tools/test-shaders.cc.
+assets/builtInShaders); tools/test-shaders.cc; hosted CI (checks run locally,
+see docs/WORKFLOWS.md).
 KeyUniform: sources "key", "mousebutton", "mousepoint", "mousedelta" are not
 implemented; they read back as zeros and the parser reports the zeroed sources
 (effects/reshade_uniforms.cc), so an effect no longer fails silently.
 
 ================================================
-Next: correctness and architecture (AGENTS.md catalog, still open)
+Next: correctness and architecture
 ================================================
-1. C4  Stop recording layer pipelines/descriptor sets/render passes into the game's
-   command buffers (depth snapshot): transfer-only copies into layer storage, or
-   ONE_TIME_SUBMIT only, with reset/free/pool-destroy tracking.
-2. H9/H10/H11  Depth: no vkCmdResolveImage on depth, separateDepthStencilLayouts for
-   DEPTH_READ_ONLY, both aspects in barriers, a vkQueueSubmit2 hook, barrier-tracked
-   layouts (DepthTracker rewrite).
-3. H14  Run every technique of a .fx file, not just techniques[0] (dh_uber_mask,
-   DH_UI_TextDetect need independently ordered BEFORE/AFTER techniques).
-4. H21  VRAM: imageCount x (maxEffects+1) full-resolution images and the silent
-   drop of effects beyond the cap; pool and alias intermediates.
-5. H2  done: the registry's parses and the chain compiles run on its worker (WORKFLOWS).
-6. Invariant 13: remaining process-global mutable state (baseConfig, config,
-   cachedEffects, activeProfile*, DLSS5 ModelCache, shader cache,
-   Wayland-interpose statics). Make them per-device/per-swapchain or LayerContext.
-7. Unify createRenderPass and createEffectRenderPass (different layouts, load ops,
+1. Invariant 13 remainder: DLSS5 ModelCache and the shader cache are process-wide
+   (keyed by device, documented); Wayland-interpose statics; the Wayland key
+   withhold is process-wide.
+2. Unify createRenderPass and createEffectRenderPass (different layouts, load ops,
    dependencies).
-8. Syncobj gate for a mixed faked/passthrough present uses only the first
-   swapchain's InputSession; ensurePersistentDepthStorage allocates under stateLock
-   in the submit hook.
+3. Mixed per-aspect depth/stencil layouts, vkCmdWaitEvents layout changes and
+   in-pass vkCmdClearAttachments are not tracked by the DepthTracker.
 
 ================================================
-Next: testing and infrastructure
+Next: testing
 ================================================
-1. Run the Wayland path of the pixel/smoke tests in CI (needs a headless compositor,
-   for example weston with the headless backend) and validate the overlay there.
-2. GPU-runner (self-hosted) job: DLSS5 temporal smoke, depth regression scripts,
-   pixel test on the real driver.
-3. Run `lake build` in CI once a Veil image/cache is available (see ci.yml).
+1. Wayland path of the pixel/smoke tests (needs a headless compositor, for example
+   weston with the headless backend) and the overlay there.
+2. Two-device test (per-device config/registry separation is untested).
+3. i686 smoke with a 32-bit vkcube; syncobj gate against a wedged driver present.
 4. Per-key invalidation test for the shader-manager config cache under real
    concurrent reload.
 5. DLSS5 on i686 is unavailable on current NVIDIA drivers (no CUDA kernel launch for

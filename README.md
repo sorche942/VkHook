@@ -175,11 +175,7 @@ Further checks, all described in [docs/WORKFLOWS.md](docs/WORKFLOWS.md):
   the packages in `assets/EffectPackages.ini` at pinned commits.
 - **Formal models:** `just formal` (`cd formal && lake build`) checks the Lean 4 +
   Veil models of the concurrency and lifetime protocols in `formal/`. It needs a
-  built Veil checkout, so CI does not run it; run it before merging a change to
-  a modeled protocol.
-- **CI** (`.github/workflows/ci.yml`): clang and gcc builds with tests, the shader
-  corpus, ASan+UBSan, TSan on the threaded tests, a smoke run on lavapipe with
-  validation plus the pixel test, an i686 build, and a `-Ddlss5=enabled` compile.
+  built Veil checkout; run it before merging a change to a modeled protocol.
 
 The `Justfile` has recipes for running a local build against `vkcube` without
 installing it. Vendor subtree maintenance and DLSS5 model extraction are in

@@ -163,7 +163,7 @@ def main(argv):
             return 1
 
     if not os.environ.get("DISPLAY"):
-        # No X display (headless CI, or a Wayland-only session without Xwayland): provide one.
+        # No X display (headless machine, or a Wayland-only session without Xwayland): provide one.
         if not os.environ.get("VKHOOK_PIXELS_XVFB") and shutil.which("xvfb-run"):
             env = dict(os.environ, VKHOOK_PIXELS_XVFB="1")
             os.execvpe("xvfb-run", ["xvfb-run", "-a", sys.executable, __file__, *argv[1:]], env)

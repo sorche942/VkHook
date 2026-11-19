@@ -166,7 +166,7 @@ the formal model on `main`. Large future efforts should reuse the same scheme:
 |---|---|
 | core | `src/{layer,gpu,present,depth,control,diag}/`, `src/render/{logical_device,logical_swapchain,fake_swapchain,vkdispatch,vkfuncs,command_buffer}*`, depth shaders |
 | effects | `src/effects/**`, `src/render/{image,image_view,buffer,memory,sampler,format,shader,graphics_pipeline,descriptor_set,framebuffer,dlss5_*}*` |
-| frontend/infra | `src/core/**`, `src/overlay/**`, `src/input/**`, build, CI, packaging, `scripts/`, `docs/` |
+| frontend/infra | `src/core/**`, `src/overlay/**`, `src/input/**`, build, packaging, `scripts/`, `docs/` |
 | formal | `formal/**` |
 
 Rules:
@@ -278,7 +278,7 @@ The status column uses three values:
 All addressed in stages 1–3: the monolith split, the `LogicalDevice` cleanup, hook templates, a
 single depth-resolve shader, the field-editor template, the persisted pipeline cache, batched
 uploads, lazy debug logging, dead-code removal, the shared build-manifest path, the git-sourced
-Flatpak, pinned CI shader archives, and a full CI matrix (gcc, sanitizers, i686).
+Flatpak, pinned shader archives, and local sanitizer/gcc/i686 checks.
 
 ### Found during the overhaul
 
@@ -290,7 +290,7 @@ Flatpak, pinned CI shader archives, and a full CI matrix (gcc, sanitizers, i686)
 | i686: `std::is_same_v` handle dispatch matched every non-dispatchable handle, so the old swapchain was destroyed with `vkDestroyFence` | S3 |
 | Syncobj gate 100 ms timeout escape allowed a commit to overlap a present (flaky test) | S3 |
 
-Open, all low: no 32-bit vkcube is available for the i686 smoke test; the no-timeout gate is untested against a wedged driver; the GitHub-hosted CI jobs have not run yet.
+Open, all low: no 32-bit vkcube is available for the i686 smoke test; the no-timeout gate is untested against a wedged driver. There is no hosted CI; §1 lists the checks to run locally.
 
 ---
 
