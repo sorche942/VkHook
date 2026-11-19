@@ -12,6 +12,8 @@
 #include <algorithm>
 #include <memory>
 
+#include <dlfcn.h>
+
 #define VK_USE_PLATFORM_WAYLAND_KHR
 #define VK_USE_PLATFORM_XLIB_KHR
 #define VK_USE_PLATFORM_XCB_KHR
@@ -26,6 +28,29 @@ namespace VkHook
 {
 namespace
 {
+#ifdef VKHOOK_DLSS5
+    // The instance version the loader supports. Asked of the loader itself: a layer may only
+    // call the next layer's vkGetInstanceProcAddr with a NULL instance for vkCreateInstance,
+    // and Mesa's device_select dereferences its (still empty) instance table for anything
+    // else. The application has loaded the loader already, so RTLD_NOLOAD finds it.
+    uint32_t loaderInstanceVersion()
+    {
+        for (const char* name : {"libvulkan.so.1", "libvulkan.so"})
+        {
+            void* loader = dlopen(name, RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD);
+            if (!loader)
+                continue;
+            auto enumerateVersion = reinterpret_cast<PFN_vkEnumerateInstanceVersion>(dlsym(loader, "vkEnumerateInstanceVersion"));
+            uint32_t version      = VK_API_VERSION_1_0;
+            if (!enumerateVersion || enumerateVersion(&version) != VK_SUCCESS)
+                version = VK_API_VERSION_1_0;
+            dlclose(loader);
+            return version;
+        }
+        return VK_API_VERSION_1_0;
+    }
+#endif
+
     VkResult VKAPI_CALL VkHook_CreateInstance(const VkInstanceCreateInfo*  pCreateInfo,
                                                 const VkAllocationCallbacks* pAllocator,
                                                 VkInstance*                  pInstance)
@@ -58,9 +83,7 @@ namespace
 
         InstanceCaps caps;
 #ifdef VKHOOK_DLSS5
-        auto enumerateVersion = reinterpret_cast<PFN_vkEnumerateInstanceVersion>(gpa(VK_NULL_HANDLE, "vkEnumerateInstanceVersion"));
-        if (!enumerateVersion || enumerateVersion(&caps.loaderApiVersion) != VK_SUCCESS)
-            caps.loaderApiVersion = VK_API_VERSION_1_0;
+        caps.loaderApiVersion = loaderInstanceVersion();
         caps.wantApi13 = true;
 #endif
 
