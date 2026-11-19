@@ -39,6 +39,18 @@ if not dlss5_requested.disabled()
     endif
 endif
 if dlss5_available
+    # VkHook's own DLSS5 compute shaders are built next to the vendored network kernels
+    # so a build tree has a single shader directory; the vendor file only sees these lists.
+    opendlss_nr_extra_shaders = files(
+        'effects/shaders/glsl/dlss5_preprocess.comp',
+        'effects/shaders/glsl/dlss5_composite.comp',
+        'effects/shaders/glsl/dlss5_reproject.comp',
+        'effects/shaders/glsl/dlss5_luma.comp',
+    )
+    opendlss_nr_extra_shader_deps = files(
+        'effects/shaders/glsl/dlss5_common.glsl',
+        'effects/shaders/glsl/dlss5_debug.glsl',
+    )
     subdir('vendor/opendlss_nr')
     dlss5_paths = configuration_data()
     dlss5_paths.set_quoted('DLSS5_SHADER_DIR', opendlss_nr_install_shader_dir)
@@ -84,6 +96,23 @@ overlay_src = [
     'overlay/params/field_editor.cc',
 ]
 
+# Config, logging, util and the preset model: everything the layer and the tests
+# share and that needs no Vulkan. Built once as vkhook_core; the tests link it
+# rather than recompiling the same files.
+core_src = [
+    'core/logger.cc',
+    'core/util.cc',
+    'core/config/ini.cc',
+    'core/config/config.cc',
+    'core/config/config_serializer.cc',
+    'core/config/config_serializer_profile.cc',
+    'core/config/persist.cc',
+    'core/config/store.cc',
+    'core/config/settings_schema.cc',
+    'core/config/migrate.cc',
+    'control/preset_model.cc',
+]
+
 VkHook_src = [
     'layer/entry.cc',
     'layer/registry.cc',
@@ -104,18 +133,9 @@ VkHook_src = [
     'control/frontend.cc',
     'control/commands_apply.cc',
     'control/preset_import.cc',
-    'control/preset_model.cc',
     'diag/gpu_crash.cc',
-    'core/config/persist.cc',
-    'core/config/ini.cc',
     'render/buffer.cc',
     'render/command_buffer.cc',
-    'core/config/config.cc',
-    'core/config/config_serializer.cc',
-    'core/config/config_serializer_profile.cc',
-    'core/config/store.cc',
-    'core/config/settings_schema.cc',
-    'core/config/migrate.cc',
     'render/descriptor_set.cc',
     'effects/effect_registry.cc',
     'effects/effect_reshade.cc',
@@ -135,7 +155,6 @@ VkHook_src = [
     'render/image.cc',
     'render/image_view.cc',
     'input/keyboard_input.cc',
-    'core/logger.cc',
     'render/logical_swapchain.cc',
     'render/memory.cc',
     'render/renderpass.cc',
@@ -144,7 +163,6 @@ VkHook_src = [
     'render/shader.cc',
     'vendor/stb/stb_image.c',
     'vendor/stb/stb_image_resize.c',
-    'core/util.cc',
     'render/vkdispatch.cc',
 ]
 
@@ -156,6 +174,8 @@ wayland_client_dep = dependency('wayland-client')
 xkbcommon_dep = dependency('xkbcommon')
 wayland_protocols_dep = dependency('wayland-protocols')
 wayland_scanner = find_program('wayland-scanner')
+threads_dep = dependency('threads')
+libdl_dep = cpp.find_library('dl', required : false)
 
 # wp_viewporter scales the 1x1 input-capture buffer to the hitbox
 wl_protocols_dir = wayland_protocols_dep.get_variable('pkgdatadir')
@@ -178,28 +198,54 @@ conf_paths.set_quoted('DATADIR', join_paths(get_option('prefix'), get_option('da
 configure_file(output: 'config_paths.hh',
                configuration : conf_paths)
 
-# the binary reports its own version, so it must not depend on its filename or
-# on the setup script dropping a version file next to the config.
-fs = import('fs')
-version_string = 'unknown'
-if fs.exists('../VERSION')
-    version_string = fs.read('../VERSION').strip()
-    if version_string == ''
-        version_string = 'unknown'
-    endif
-endif
-
+# The binary reports its own version, so it must not depend on its filename or
+# on the setup script dropping a version file next to the config. The root
+# VERSION file is the only place the number is written (project(), the layer
+# manifest and the Nix flake all read it).
 conf_version = configuration_data()
-conf_version.set_quoted('VKHOOK_VERSION', version_string)
+conf_version.set_quoted('VKHOOK_VERSION', vkhook_version)
 
 configure_file(output: 'version.hh',
                configuration : conf_version)
 
+imgui_inc = include_directories('vendor/imgui')
+core_inc = include_directories('core', 'core/config')
+input_inc = include_directories('input')
+render_inc = include_directories('render')
+effects_inc = include_directories('effects')
+# One include set for the layer, the core library and every test: the tree is a
+# single flat namespace of headers, so per-target lists only drifted.
+vkhook_inc = include_directories(
+    '.', 'core', 'core/config', 'input', 'render', 'effects', 'effects/params', 'effects/shaders',
+    'overlay', 'overlay/params', 'vendor', 'vendor/imgui', 'vendor/reshade', 'vendor/stb')
+
+# The XDG desktop portal is reached over the session bus through GIO, which is
+# present on the desktop and inside Flatpak runtimes. Optional: without it the
+# shader manager falls back to the in-overlay file browser.
+gio_dep = dependency('gio-2.0', required: false)
+core_deps = [threads_dep]
+core_cpp_args = []
+if gio_dep.found()
+    core_deps += gio_dep
+    core_cpp_args += '-DVKHOOK_HAVE_GIO=1'
+endif
+
+vkhook_core_lib = static_library('vkhook_core',
+    core_src,
+    include_directories : vkhook_inc,
+    cpp_args : core_cpp_args,
+    dependencies : core_deps,
+    gnu_symbol_visibility : 'hidden')
+vkhook_core_dep = declare_dependency(
+    link_with : vkhook_core_lib,
+    include_directories : vkhook_inc,
+    dependencies : core_deps)
+
 # X11/X.h library contains many definitions (e.g. None)
 # which conflicts with the rest codebase with with Meson --unity=on option
-keyboard_input_x11_lib = static_library('keyboard_input_x11', 'input/keyboard_input_x11.cc', include_directories: [include_directories('core', 'core/config')])
-mouse_input_lib = static_library('mouse_input', 'input/mouse_input.cc', include_directories: [include_directories('core', 'core/config')])
-input_blocker_lib = static_library('input_blocker', 'input/input_blocker.cc', include_directories: [include_directories('core', 'core/config')])
+keyboard_input_x11_lib = static_library('keyboard_input_x11', 'input/keyboard_input_x11.cc', include_directories: core_inc)
+mouse_input_lib = static_library('mouse_input', 'input/mouse_input.cc', include_directories: core_inc)
+input_blocker_lib = static_library('input_blocker', 'input/input_blocker.cc', include_directories: core_inc)
 
 # X11 input backend (X11Input). The class is implemented across three
 # translation units so that its connection, keyboard and mouse halves stay
@@ -207,10 +253,10 @@ input_blocker_lib = static_library('input_blocker', 'input/input_blocker.cc', in
 # core because X11/X.h defines symbols (None, ...) that collide with the codebase.
 x11_display_lib = static_library('x11_display',
     'input/x11_display.cc',
-    include_directories: [include_directories('core', 'core/config')])
+    include_directories: core_inc)
 mouse_input_x11_lib = static_library('mouse_input_x11',
     'input/mouse_input_x11.cc',
-    include_directories: [include_directories('core', 'core/config')])
+    include_directories: core_inc)
 
 # Wayland input backend (WaylandInput) — built as static libs to isolate wayland-client
 # headers. wayland_input_common holds the seat/queue/capture surface shared by keyboard and mouse.
@@ -218,22 +264,22 @@ wayland_input_common_lib = static_library('wayland_input_common',
     'input/wayland_input_common.cc',
     viewporter_code, viewporter_client_h,
     dependencies: [wayland_client_dep],
-    include_directories: [include_directories('core', 'core/config')])
+    include_directories: core_inc)
 keyboard_input_wayland_lib = static_library('keyboard_input_wayland',
     'input/keyboard_input_wayland.cc',
     link_with: [wayland_input_common_lib],
     dependencies: [wayland_client_dep, xkbcommon_dep],
-    include_directories: [include_directories('core', 'core/config')])
+    include_directories: core_inc)
 mouse_input_wayland_lib = static_library('mouse_input_wayland',
     'input/mouse_input_wayland.cc',
     link_with: [wayland_input_common_lib],
     dependencies: [wayland_client_dep],
-    include_directories: [include_directories('core', 'core/config')])
+    include_directories: core_inc)
 # Explicit-sync commit gate for the wayland interpose: keeps a foreign window
 # commit out of an open linux-drm-syncobj point sequence.
 wayland_syncobj_gate_lib = static_library('wayland_syncobj_gate',
     'input/wayland_syncobj_gate.cc',
-    include_directories: [include_directories('core', 'core/config')])
+    include_directories: core_inc)
 # Wayland event interposition — wraps game's pointer/keyboard listeners to
 # suppress events when overlay has input blocked. Needs default visibility
 # for the wl_proxy_add_listener symbol override.
@@ -243,37 +289,23 @@ wayland_interpose_lib = static_library('wayland_interpose',
     dependencies: [wayland_client_dep],
     c_args: ['-fvisibility=default'],
     cpp_args: ['-fvisibility=default'],
-    include_directories: [include_directories('core', 'core/config')])
+    include_directories: core_inc)
 
 # InputSession and the free-function facade over the current session. Includes no
 # X11 or wayland-client header; it reaches the backends through x11_input.hh and
 # wayland_input.hh, whose libraries the final link supplies.
 input_session_lib = static_library('input_session',
     'input/input_session.cc', 'input/wayland_display.cc',
-    include_directories: [include_directories('core', 'core/config')])
+    include_directories: core_inc)
 
-imgui_inc = include_directories('vendor/imgui')
-overlay_inc = include_directories('overlay')
-effects_inc = include_directories('effects')
-effects_params_inc = include_directories('effects/params')
-core_inc = include_directories('core', 'core/config')
-input_inc = include_directories('input')
-render_inc = include_directories('render')
-vendor_inc = include_directories('vendor')
-source_inc = include_directories('.', 'core', 'core/config', 'input', 'render', 'effects', 'overlay')
-stb_inc = include_directories('vendor/stb')
-shader_asset_inc = include_directories('effects/shaders')
+# Every input backend library, in link order, for targets that use InputSession.
+input_backend_libs = [input_session_lib, input_blocker_lib, mouse_input_lib,
+    x11_display_lib, keyboard_input_x11_lib, mouse_input_x11_lib,
+    wayland_input_common_lib, keyboard_input_wayland_lib, mouse_input_wayland_lib]
+input_backend_deps = [x11_dep, xi_dep, xtst_dep, wayland_client_dep, xkbcommon_dep]
 
-# The XDG desktop portal is reached over the session bus through GIO, which is
-# present on the desktop and inside Flatpak runtimes. Optional: without it the
-# shader manager falls back to the in-overlay file browser.
-gio_dep = dependency('gio-2.0', required: false)
-vkhook_deps = [x11_dep, xi_dep, xtst_dep, wayland_client_dep, xkbcommon_dep, reshade_dep] + dlss5_dependencies
-vkhook_cpp_args = ['-DIMGUI_IMPL_VULKAN_NO_PROTOTYPES'] + dlss5_args
-if gio_dep.found()
-    vkhook_deps += gio_dep
-    vkhook_cpp_args += '-DVKHOOK_HAVE_GIO=1'
-endif
+vkhook_deps = [vkhook_core_dep, reshade_dep] + input_backend_deps + dlss5_dependencies
+vkhook_cpp_args = ['-DIMGUI_IMPL_VULKAN_NO_PROTOTYPES'] + dlss5_args + core_cpp_args
 
 vkhook_lib = shared_library('vkhook',
     VkHook_src, overlay_src, imgui_src, shader_include, dlss5_sources,
@@ -282,7 +314,7 @@ vkhook_lib = shared_library('vkhook',
                 x11_display_lib, mouse_input_x11_lib,
                 wayland_input_common_lib, keyboard_input_wayland_lib, mouse_input_wayland_lib,
                 wayland_interpose_lib],
-    include_directories : [VkHook_include_path, imgui_inc, overlay_inc, effects_inc, effects_params_inc, core_inc, input_inc, render_inc, vendor_inc, include_directories('vendor/reshade'), stb_inc, shader_asset_inc, source_inc],
+    include_directories : vkhook_inc,
     cpp_args : vkhook_cpp_args,
     dependencies : vkhook_deps,
     gnu_symbol_visibility: 'hidden',
@@ -293,20 +325,7 @@ shader_check = executable('vkhook-shader-check',
     'effects/shader_check.cc',
     'effects/reshade_parser.cc',
     'effects/reshade_compile.cc',
-    'vendor/reshade/effect_codegen_spirv.cc',
-    'vendor/reshade/effect_expression.cc',
-    'vendor/reshade/effect_lexer.cc',
-    'vendor/reshade/effect_parser.cc',
-    'vendor/reshade/effect_preprocessor.cc',
-    'vendor/reshade/effect_symbol_table.cc',
-    'core/config/config.cc',
-    'core/config/config_serializer.cc',
-    'core/config/config_serializer_profile.cc',
-    'core/config/ini.cc',
-    'core/logger.cc',
-    'core/util.cc',
-    include_directories : [VkHook_include_path, imgui_inc, overlay_inc, effects_inc, effects_params_inc, core_inc, input_inc, render_inc, vendor_inc, include_directories('vendor/reshade'), stb_inc, source_inc],
-    dependencies : [reshade_dep],
+    dependencies : [vkhook_core_dep, reshade_dep],
     install : true)
 
 spirv_validator = find_program('spirv-val', native : true, required : false)
@@ -321,55 +340,34 @@ endif
 
 config_serializer_tests = executable('vkhook-config-serializer-tests',
     'tests/config_serializer_test.cc',
-    'control/preset_model.cc',
-    'core/config/config_serializer.cc',
-    'core/config/config_serializer_profile.cc',
-    'core/config/config.cc',
-    'core/config/ini.cc',
-    'core/logger.cc',
-    'core/util.cc',
-    include_directories : [core_inc, render_inc, effects_inc, effects_params_inc, vendor_inc, source_inc, imgui_inc])
+    dependencies : vkhook_core_dep)
 test('config serializer', config_serializer_tests)
 
 # The preset model (parse/serialize of ReShade presets plus the VkHook sidecar) is
 # pure: golden files in tests/fixtures/presets pin the on-disk format.
 preset_model_tests = executable('vkhook-preset-model-tests',
     'tests/preset_model_test.cc',
-    'control/preset_model.cc',
-    include_directories : [source_inc])
+    dependencies : vkhook_core_dep)
 test('preset model', preset_model_tests,
     args : [meson.current_source_dir() / 'tests/fixtures'])
-
-# The variable-font extension to stb_truetype is pure but invisible to CI: a bad
-# download or a gvar/HVAR regression would only show as wrong-looking text. This
-# links the header directly and checks the axes, outlines and advances.
-variable_font_tests = executable('vkhook-variable-font-tests',
-    'tests/variable_font_test.cc',
-    include_directories : [imgui_inc])
-test('variable font', variable_font_tests)
 
 # X11 input blocking: notification hitboxes remain non-modal, but an interactive
 # menu owns pointer and keyboard for its whole lifetime. Held keys are handed
 # back on close. Uses the real blocker and synthesises input on a display:
 # opt in with VKHOOK_X11_INPUT_TEST=1.
-libdl_dep = meson.get_compiler('cpp').find_library('dl', required : false)
 x11_input_handoff_tests = executable('vkhook-x11-input-handoff-tests',
     'tests/x11_input_handoff_test.cc',
-    'core/logger.cc',
-    link_with : [input_session_lib, input_blocker_lib, mouse_input_lib, x11_display_lib, keyboard_input_x11_lib, mouse_input_x11_lib,
-                 wayland_input_common_lib, keyboard_input_wayland_lib, mouse_input_wayland_lib],
-    dependencies : [dependency('threads'), x11_dep, xi_dep, xtst_dep, wayland_client_dep, xkbcommon_dep],
-    include_directories : [core_inc, input_inc, source_inc])
+    link_with : input_backend_libs,
+    dependencies : [vkhook_core_dep] + input_backend_deps)
 test('x11 input handoff', x11_input_handoff_tests)
 
 # DepthCopyState serializes the CmdEndRenderPass* -> QueueSubmit handoff and the
 # copy ring against DestroyDevice. A missing lock only shows as an intermittent
 # device loss under load, so the state is hammered directly here.
-threads_dep = dependency('threads')
 depth_copy_state_tests = executable('vkhook-depth-copy-state-tests',
     'render/depth_copy_state_test.cc',
-    dependencies : [threads_dep],
-    include_directories : [render_inc, source_inc])
+    dependencies : threads_dep,
+    include_directories : vkhook_inc)
 test('depth copy state', depth_copy_state_tests)
 
 # RetireQueue + Timeline (formal/VkHookFormal/RetireQueue.lean): seeded random
@@ -378,8 +376,7 @@ retire_tests = executable('vkhook-retire-tests',
     'gpu/retire_test.cc',
     'gpu/retire.cc',
     'gpu/timeline.cc',
-    'core/logger.cc',
-    include_directories : [core_inc, render_inc, source_inc])
+    dependencies : vkhook_core_dep)
 test('retire queue', retire_tests)
 
 if dlss5_available
@@ -387,16 +384,14 @@ if dlss5_available
         'tests/dlss5_device_test.cc',
         'render/dlss5_device.cc',
         dlss5_chain,
-        dependencies : [opendlss_nr_dep],
-        include_directories : [core_inc, render_inc, source_inc])
+        dependencies : [vkhook_core_dep, opendlss_nr_dep])
     test('DLSS5 device feature preservation', dlss5_device_tests)
     dlss5_temporal_gpu = executable('vkhook-dlss5-temporal-gpu-smoke',
         'tests/dlss5_temporal_gpu_smoke.cc',
         'render/dlss5_device.cc',
         'render/dlss5_optical_flow.cc',
         dlss5_chain,
-        dependencies : [opendlss_nr_dep, libdl_dep],
-        include_directories : [core_inc, render_inc, effects_inc, source_inc],
+        dependencies : [vkhook_core_dep, opendlss_nr_dep, libdl_dep],
         link_depends : dlss5_assets)
     test('DLSS5 optical-flow temporal GPU', dlss5_temporal_gpu,
         args : [opendlss_nr_build_shader_dir], timeout : 120)
@@ -408,7 +403,7 @@ endif
 
 # Pure device/instance create planning (AGENTS.md invariant 9): no GPU needed.
 device_plan_sources = ['tests/device_plan_test.cc', 'layer/device_plan.cc']
-device_plan_deps = []
+device_plan_deps = [vkhook_core_dep]
 if dlss5_available
     device_plan_sources += ['render/dlss5_device.cc', dlss5_chain]
     device_plan_deps += opendlss_nr_dep
@@ -416,8 +411,7 @@ endif
 device_plan_tests = executable('vkhook-device-plan-tests',
     device_plan_sources,
     cpp_args : dlss5_args,
-    dependencies : device_plan_deps,
-    include_directories : [core_inc, render_inc, source_inc])
+    dependencies : device_plan_deps)
 test('device plan', device_plan_tests)
 
 # Present mode chooser and semaphore accounting, driven through the production
@@ -427,9 +421,7 @@ present_mode_tests = executable('vkhook-present-mode-tests',
     'present/present_mode.cc',
     'gpu/queue.cc',
     'gpu/timeline.cc',
-    'core/logger.cc',
-    dependencies : [threads_dep],
-    include_directories : [core_inc, render_inc, source_inc])
+    dependencies : vkhook_core_dep)
 test('present modes', present_mode_tests,
     env : ['VKHOOK_LOG_LEVEL=none'])
 
@@ -443,28 +435,19 @@ depth_snapshot_scope_tests = executable('vkhook-depth-snapshot-scope-tests',
     'render/logical_swapchain.cc',
     'gpu/retire.cc',
     'gpu/timeline.cc',
-    'core/logger.cc',
-    'core/config/settings_schema.cc',
-    'core/config/ini.cc',
     cpp_args : ['-ffunction-sections', '-fdata-sections'],
     link_args : ['-Wl,--gc-sections'],
-    dependencies : [threads_dep],
-    include_directories : [core_inc, render_inc, effects_inc, source_inc])
+    dependencies : vkhook_core_dep)
 test('depth snapshot scope', depth_snapshot_scope_tests,
     env : ['VKHOOK_LOG_LEVEL=none'])
 
-# The compile cache is what stops a chain reload from re-parsing every ReShade
-# effect. Its keying and bound are the contract, and a missing lock would only
-# show as a rare corrupt module under load, so it is hammered directly.
 # The explicit-sync gate's hold-and-release ordering is invisible until a
 # compositor kills the connection over a racing commit, so its state machine
 # is driven directly with threads.
 wayland_syncobj_gate_tests = executable('vkhook-wayland-syncobj-gate-tests',
     'tests/wayland_syncobj_gate_test.cc',
     'input/wayland_syncobj_gate.cc',
-    'core/logger.cc',
-    dependencies : [threads_dep],
-    include_directories : [core_inc, input_inc, source_inc])
+    dependencies : vkhook_core_dep)
 test('wayland syncobj gate', wayland_syncobj_gate_tests)
 
 # The marshal patcher parses live ELF state; reading one dynamic-section
@@ -472,9 +455,7 @@ test('wayland syncobj gate', wayland_syncobj_gate_tests)
 wayland_interpose_patch_tests = executable('vkhook-wayland-interpose-patch-tests',
     'tests/wayland_interpose_patch_test.cc',
     'input/wayland_interpose_patch.cc',
-    'core/logger.cc',
-    dependencies : [threads_dep, wayland_client_dep],
-    include_directories : [core_inc, input_inc, source_inc])
+    dependencies : [vkhook_core_dep, wayland_client_dep])
 test('wayland interpose patch', wayland_interpose_patch_tests)
 
 # The capture subsurface must follow the game's surface when the game recreates
@@ -483,7 +464,7 @@ test('wayland interpose patch', wayland_interpose_patch_tests)
 # driven here without a compositor.
 wayland_capture_tests = executable('vkhook-wayland-capture-tests',
     'tests/wayland_capture_test.cc',
-    include_directories : [input_inc])
+    include_directories : input_inc)
 test('wayland capture attachment and teardown order', wayland_capture_tests)
 
 # InputSession: the registry's "current session" policy, per-session blocking
@@ -492,11 +473,8 @@ test('wayland capture attachment and teardown order', wayland_capture_tests)
 # process-wide dlsym override.
 input_session_tests = executable('vkhook-input-session-tests',
     'tests/input_session_test.cc',
-    'core/logger.cc',
-    link_with : [input_session_lib, input_blocker_lib, x11_display_lib, keyboard_input_x11_lib, mouse_input_x11_lib,
-                 wayland_input_common_lib, keyboard_input_wayland_lib, mouse_input_wayland_lib],
-    dependencies : [threads_dep, x11_dep, xi_dep, xtst_dep, wayland_client_dep, xkbcommon_dep],
-    include_directories : [core_inc, input_inc, source_inc])
+    link_with : input_backend_libs,
+    dependencies : [vkhook_core_dep] + input_backend_deps)
 test('input session', input_session_tests)
 
 # WaylandInput against a real libwayland client and an in-process fake server:
@@ -506,10 +484,8 @@ wayland_server_dep = dependency('wayland-server', required: false)
 if wayland_server_dep.found()
     wayland_input_teardown_tests = executable('vkhook-wayland-input-teardown-tests',
         'tests/wayland_input_teardown_test.cc',
-        'core/logger.cc',
         link_with : [wayland_input_common_lib, keyboard_input_wayland_lib, mouse_input_wayland_lib],
-        dependencies : [threads_dep, wayland_client_dep, wayland_server_dep, xkbcommon_dep],
-        include_directories : [core_inc, input_inc, source_inc])
+        dependencies : [vkhook_core_dep, wayland_client_dep, wayland_server_dep, xkbcommon_dep])
     test('wayland input teardown', wayland_input_teardown_tests)
 endif
 
@@ -522,20 +498,7 @@ reshade_compile_tests = executable('vkhook-reshade-compile-tests',
     'effects/reshade_parser.cc',
     'effects/reshade_compile.cc',
     'effects/reshade_module_io.cc',
-    'vendor/reshade/effect_codegen_spirv.cc',
-    'vendor/reshade/effect_expression.cc',
-    'vendor/reshade/effect_lexer.cc',
-    'vendor/reshade/effect_parser.cc',
-    'vendor/reshade/effect_preprocessor.cc',
-    'vendor/reshade/effect_symbol_table.cc',
-    'core/config/config.cc',
-    'core/config/config_serializer.cc',
-    'core/config/config_serializer_profile.cc',
-    'core/config/ini.cc',
-    'core/logger.cc',
-    'core/util.cc',
-    include_directories : [VkHook_include_path, imgui_inc, overlay_inc, effects_inc, effects_params_inc, core_inc, input_inc, render_inc, vendor_inc, include_directories('vendor/reshade'), stb_inc, source_inc],
-    dependencies : [reshade_dep])
+    dependencies : [vkhook_core_dep, reshade_dep])
 test('reshade compile setup', reshade_compile_tests,
     args : [meson.current_source_dir() / 'tests/fixtures'],
     env : ['VKHOOK_LOG_LEVEL=none'])
@@ -546,17 +509,17 @@ texture_convert_tests = executable('vkhook-texture-convert-tests',
     'effects/texture_convert_test.cc',
     'effects/texture_convert.cc',
     'vendor/stb/stb_image_resize.c',
-    include_directories : [render_inc, effects_inc, stb_inc, source_inc])
+    include_directories : vkhook_inc)
 test('texture convert', texture_convert_tests)
 
+# The compile cache is what stops a chain reload from re-parsing every ReShade
+# effect. Its keying and bound are the contract, and a missing lock would only
+# show as a rare corrupt module under load, so it is hammered directly.
 compile_cache_tests = executable('vkhook-compile-cache-tests',
     'effects/compile_cache_test.cc',
     'effects/shader_cache.cc',
     'effects/reshade_module_io.cc',
-    'core/config/persist.cc',
-    'core/logger.cc',
-    dependencies : [threads_dep],
-    include_directories : [core_inc, effects_inc, effects_params_inc, vendor_inc, include_directories('vendor/reshade'), source_inc])
+    dependencies : vkhook_core_dep)
 test('compile cache', compile_cache_tests)
 
 # Uniform ring layout, descriptor budgets, the forwarding decision, the shared
@@ -573,8 +536,7 @@ effect_plan_tests = executable('vkhook-effect-plan-tests',
     'gpu/retire.cc',
     'gpu/retire_device.cc',
     'gpu/timeline.cc',
-    'core/logger.cc',
-    include_directories : [core_inc, render_inc, effects_inc, effects_params_inc, vendor_inc, include_directories('vendor/reshade'), source_inc])
+    dependencies : vkhook_core_dep)
 test('effect plan', effect_plan_tests)
 
 reshade_texture_pool_tests = executable('vkhook-reshade-texture-pool-tests',
@@ -583,67 +545,41 @@ reshade_texture_pool_tests = executable('vkhook-reshade-texture-pool-tests',
     'render/format.cc',
     'gpu/retire.cc',
     'gpu/timeline.cc',
-    'core/logger.cc',
-    include_directories : [core_inc, render_inc, effects_inc, source_inc])
+    dependencies : vkhook_core_dep)
 test('reshade texture pool', reshade_texture_pool_tests)
 
 # Temporal ReShade shaders may declare framecount as float, int or uint.
 reshade_uniform_tests = executable('vkhook-reshade-uniform-tests',
     'effects/reshade_uniforms_test.cc',
     'effects/reshade_uniforms.cc',
-    'core/logger.cc',
     cpp_args : ['-ffunction-sections', '-fdata-sections'],
     link_args : ['-Wl,--gc-sections'],
-    include_directories : [core_inc, effects_inc, vendor_inc, source_inc])
+    dependencies : vkhook_core_dep)
 test('reshade uniform sources', reshade_uniform_tests)
 
 # The one INI tokenizer, the bool parser and the persistence queue's ordering
 # rules (coalescing, delete-vs-autosave, shutdown) are pure and headless.
 persist_tests = executable('vkhook-persist-tests',
     'tests/persist_test.cc',
-    'control/preset_model.cc',
-    'core/config/persist.cc',
-    'core/config/store.cc',
-    'core/config/settings_schema.cc',
-    'core/config/migrate.cc',
-    'core/config/ini.cc',
-    'core/config/config_serializer.cc',
-    'core/config/config_serializer_profile.cc',
-    'core/config/config.cc',
-    'core/logger.cc',
-    'core/util.cc',
-    dependencies : [threads_dep],
-    include_directories : [core_inc, render_inc, effects_inc, effects_params_inc, vendor_inc, source_inc, imgui_inc])
+    dependencies : vkhook_core_dep)
 test('persistence queue', persist_tests)
 
 # The settings schema (defaults, clamping, file round trip), the published
 # snapshots and the config-directory migrations.
 config_store_tests = executable('vkhook-config-store-tests',
     'tests/config_store_test.cc',
-    'core/config/store.cc',
-    'core/config/settings_schema.cc',
-    'core/config/migrate.cc',
-    'core/config/persist.cc',
-    'core/config/config.cc',
-    'core/config/config_serializer.cc',
-    'core/config/config_serializer_profile.cc',
-    'core/config/ini.cc',
-    'core/logger.cc',
-    'core/util.cc',
-    dependencies : [threads_dep],
-    include_directories : [core_inc, render_inc, effects_inc, effects_params_inc, vendor_inc, source_inc, imgui_inc])
+    dependencies : vkhook_core_dep)
 test('config store', config_store_tests)
 
 # the overlay's command queue and the SetParam value copy
 overlay_commands_tests = executable('vkhook-overlay-commands-tests',
     'tests/overlay_commands_test.cc',
     'overlay/commands.cc',
-    dependencies : [threads_dep],
-    include_directories : [core_inc, render_inc, effects_inc, effects_params_inc, vendor_inc, source_inc, imgui_inc])
+    dependencies : vkhook_core_dep)
 test('overlay commands', overlay_commands_tests)
 
 # the numeric field editors parse with std::from_chars; the grammar is pinned here
 field_parse_tests = executable('vkhook-field-parse-tests',
     'tests/field_parse_test.cc',
-    include_directories : [include_directories('overlay/params')])
+    include_directories : include_directories('overlay/params'))
 test('field parse', field_parse_tests)

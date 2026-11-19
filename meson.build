@@ -1,8 +1,13 @@
-project('VkHook', ['c', 'cpp'], meson_version: '>=1.3.0', default_options: ['c_std=c11', 'cpp_std=c++2a'])
+# VERSION is the single source of the version number: the layer manifest, the
+# version baked into the library, the Nix flake and the Flatpak all read it.
+project('VkHook', ['c', 'cpp'],
+    version : files('VERSION'),
+    meson_version : '>=1.3.0',
+    default_options : ['c_std=c11', 'cpp_std=c++2a'])
 
 cpp = meson.get_compiler('cpp')
 
-VkHook_include_path = ''
+vkhook_version = meson.project_version().strip()
 
 lib_dir = get_option('libdir')
 
@@ -18,14 +23,9 @@ if get_option('with_json')
     subdir('packaging/meson-config')
 endif
 
-# Everything redistributed here is licensed text that has to travel with a
-# system install: the fonts (fetched at install time, but shipped by packagers),
-# ImGui and reshade.
+# Licensed text that has to travel with a system install. The overlay uses ImGui's
+# built-in font, so there are no font licenses to ship.
 install_data(
-    'assets/font/LICENSE',
-    'assets/font/LICENSE-Apache-2.0.txt',
-    'assets/font/LICENSE-SIL-OFL-1.1.txt',
-    'assets/font/LICENSE-GoogleSansFlex-OFL.txt',
     'src/vendor/reshade/LICENSE.md',
     'src/vendor/imgui/LICENSE.txt',
     install_dir : get_option('datadir') / 'licenses' / 'vkhook',

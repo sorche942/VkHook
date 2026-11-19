@@ -1,8 +1,1 @@
-src/vendor/stb/*.h linguist-vendored
-src/effects/shaders/AreaTex.h linguist-generated
-src/effects/shaders/SearchTex.h linguist-generated
-
-src/vendor/reshade/* linguist-vendored
-
-src/effects/shaders/glsl/smaa.h linguist-vendored
-src/effects/shaders/glsl/fxaa3_11.h linguist-vendored
+src/vendor/** linguist-vendored
