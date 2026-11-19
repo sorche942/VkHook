@@ -1,5 +1,6 @@
 #include "keyboard_input.hh"
 
+#include "input_blocker.hh"
 #include "logger.hh"
 #include "wayland_display.hh"
 
@@ -37,6 +38,14 @@ namespace VkHook
 
     bool isKeyPressed(uint32_t ks)
     {
+        if (isOverlayConsumingKeys())
+        {
+            // the keystrokes belong to the text field; forget them so they do
+            // not fire the hotkey the moment the field closes
+            if (isWayland())
+                discardWaylandKeyPresses();
+            return false;
+        }
         if (isWayland())
             return isKeyPressedWayland(ks);
         if (isX11())

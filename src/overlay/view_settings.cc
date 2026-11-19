@@ -146,8 +146,9 @@ namespace VkHook
         {
             maxEffectsVal = std::clamp(maxEffectsVal, 1, 200);
             settingsManager.setMaxEffects(maxEffectsVal);
-            saveSettings();
         }
+        if (ImGui::IsItemDeactivatedAfterEdit())
+            saveSettings();
         float bytesPerSlot = 2.0f * currentWidth * currentHeight * 4.0f;
         int estimatedVramMB = static_cast<int>((maxEffectsVal * bytesPerSlot) / (1024.0f * 1024.0f));
         ImGui::SameLine();

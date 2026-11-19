@@ -1,6 +1,7 @@
 #include "config_serializer.hh"
 #include "default_config.hh"
-#include "config_paths.hh"
+#include "ini.hh"
+#include "paths.hh"
 #include "c_resource.hh"
 #include "logger.hh"
 #include "util.hh"
@@ -23,6 +24,7 @@
 #include <climits>
 #include <cerrno>
 #include <cctype>
+#include <charconv>
 #include <cmath>
 
 namespace VkHook
@@ -36,13 +38,7 @@ namespace VkHook
 
     std::string ConfigSerializer::getBaseConfigDir()
     {
-        if (const char* xdgConfig = std::getenv("XDG_CONFIG_HOME"))
-            return std::string(xdgConfig) + "/VkHook";
-
-        if (const char* home = std::getenv("HOME"))
-            return std::string(home) + "/.config/VkHook";
-
-        return "";
+        return Paths::baseConfigDir();
     }
 
     std::string ConfigSerializer::getConfigsDir()
@@ -83,7 +79,7 @@ namespace VkHook
                 result += ":";
             result += effects[i];
         }
-        return result;
+        return Ini::formatValue(result);
     }
 
     bool ConfigSerializer::saveConfig(
@@ -168,110 +164,211 @@ namespace VkHook
         return configName;
     }
 
+    namespace
+    {
+        bool parseInt(const std::string& text, int& out)
+        {
+            int parsed = 0;
+            const char* end = text.data() + text.size();
+            auto [ptr, ec] = std::from_chars(text.data(), end, parsed);
+            if (ec != std::errc() || ptr != end)
+                return false;
+            out = parsed;
+            return true;
+        }
+
+        void applyBool(const std::string& key, const std::string& value, bool& target)
+        {
+            if (const auto parsed = Ini::parseBool(value))
+                target = *parsed;
+            else
+                Logger::err("invalid " + key + " value: " + value);
+        }
+
+        void applyInt(const std::string& key, const std::string& value, int lo, int hi, int& target)
+        {
+            int parsed = 0;
+            if (parseInt(value, parsed))
+                target = std::clamp(parsed, lo, hi);
+            else
+                Logger::err("invalid " + key + " value: " + value);
+        }
+
+        // One owned key, in file order, with the comment that explains it.
+        struct SettingEntry
+        {
+            const char* heading;  // section banner written before this key in a fresh file
+            const char* comment;  // lines written right above the key; may be empty
+            const char* key;
+            std::string value;
+        };
+
+        std::string flag(bool value) { return value ? "true" : "false"; }
+
+        std::vector<SettingEntry> settingEntries(const VkBasaltSettings& settings)
+        {
+            const int clampedMaxEffects = std::clamp(settings.maxEffects, MIN_MAX_EFFECTS, MAX_MAX_EFFECTS);
+            std::ostringstream scale;
+            scale << (std::isfinite(settings.uiScale) && settings.uiScale > 0.0f
+                          ? std::clamp(settings.uiScale, 0.75f, 3.0f) : 0.0f);
+            return {
+                {"Overlay settings", "", "overlayBlockInput", flag(settings.overlayBlockInput)},
+                {"", "", "usePortalIntegration", flag(settings.usePortalIntegration)},
+                {"", "# uiScale: 0 = automatic; manual range 0.75 to 3.0\n", "uiScale", scale.str()},
+                {"", "", "maxEffects", std::to_string(clampedMaxEffects)},
+                {"", "", "autoApply", flag(settings.autoApply)},
+                {"", "", "autoApplyDelay", std::to_string(settings.autoApplyDelay)},
+                {"Key bindings", "", "toggleKey", Ini::formatValue(settings.toggleKey)},
+                {"", "", "reloadKey", Ini::formatValue(settings.reloadKey)},
+                {"", "", "overlayKey", Ini::formatValue(settings.overlayKey)},
+                {"Startup behavior", "", "enableOnLaunch", flag(settings.enableOnLaunch)},
+                {"", "", "depthCapture", settings.depthCapture ? "on" : "off"},
+                {"Debug", "", "showDebugWindow", flag(settings.showDebugWindow)},
+                {"Overlay layout", "", "separateEffectParams", flag(settings.separateEffectParams)},
+                {"Advanced (depth buffer)",
+                 "# depthResolveMode: 0=auto (prefer average), 1=sample-zero, 2=average\n",
+                 "depthResolveMode", std::to_string(settings.depthResolveMode)},
+                {"", "# depthRebuildMode: 0=safe (idle the queue before rebuilding), 1=fast (fence-gated)\n",
+                 "depthRebuildMode", std::to_string(settings.depthRebuildMode)},
+                {"", "", "depthManualPin", Ini::formatValue(settings.depthManualPin)},
+                {"", "", "depthTransientWorkaround", flag(settings.depthTransientWorkaround)},
+                {"", "# depthCaptureMethod: 0=off, 1=renderpass-end (recommended), 2=queue-submit (robust fallback)\n",
+                 "depthCaptureMethod", std::to_string(settings.depthCaptureMethod)},
+                {"Alternative depth buffer handling",
+                 "# depthSourceChannel mode selection:\n"
+                 "#   0 = Luminance/Red (standard Vulkan depth)\n"
+                 "#   1 = Alpha (alpha-encoded depth)\n"
+                 "#   2 = Packed RGB (depth in RGB channels)\n"
+                 "#   3 = Logarithmic (log-encoded depth)\n"
+                 "#   4 = View-space Z (raw view-space Z)\n"
+                 "#   5 = NDC (Normalized Device Coordinates)\n"
+                 "#   6 = Reversed-Z (inverted for precision)\n",
+                 "depthSourceChannel", std::to_string(settings.depthSourceChannel)},
+                {"", "# depthInvert: invert depth values (flips near/far planes)\n",
+                 "depthInvert", flag(settings.depthInvert)},
+                {"", "# depthFlip/depthFlop: mirror the depth image vertically/horizontally\n",
+                 "depthFlip", flag(settings.depthFlip)},
+                {"", "", "depthFlop", flag(settings.depthFlop)},
+            };
+        }
+
+        std::string freshSettingsText(const std::vector<SettingEntry>& entries)
+        {
+            std::string text = "# VkHook configuration\n";
+            for (const SettingEntry& entry : entries)
+            {
+                if (*entry.heading)
+                    text += std::string("\n# ") + entry.heading + "\n";
+                text += entry.comment;
+                text += std::string(entry.key) + " = " + entry.value + "\n";
+            }
+            return text;
+        }
+
+        // Rewrites the owned keys of `existing` in place and appends the ones it
+        // lacks. Everything else (unknown keys, comments, blank lines, order,
+        // CRLF endings) is copied through untouched.
+        std::string mergeSettingsText(const std::string& existing, const std::vector<SettingEntry>& entries)
+        {
+            std::map<std::string, const SettingEntry*> owned;
+            for (const SettingEntry& entry : entries)
+                owned[entry.key] = &entry;
+
+            std::set<std::string> written;
+            std::string out;
+            size_t pos = 0;
+            while (pos < existing.size())
+            {
+                size_t eol = existing.find('\n', pos);
+                const bool hasNewline = eol != std::string::npos;
+                if (!hasNewline)
+                    eol = existing.size();
+                std::string line = existing.substr(pos, eol - pos);
+                pos = hasNewline ? eol + 1 : eol;
+
+                const Ini::Line parsed = Ini::tokenize(line);
+                const auto it = parsed.kind == Ini::LineKind::Pair ? owned.find(parsed.key) : owned.end();
+                if (it == owned.end())
+                {
+                    out += line;
+                }
+                else
+                {
+                    out += std::string(it->second->key) + " = " + it->second->value;
+                    if (!line.empty() && line.back() == '\r')
+                        out += '\r';
+                    written.insert(it->first);
+                }
+                if (hasNewline)
+                    out += '\n';
+            }
+
+            std::string added;
+            for (const SettingEntry& entry : entries)
+            {
+                if (written.count(entry.key))
+                    continue;
+                added += entry.comment;
+                added += std::string(entry.key) + " = " + entry.value + "\n";
+            }
+            if (!added.empty())
+            {
+                if (!out.empty() && out.back() != '\n')
+                    out += '\n';
+                out += "\n# Added by VkHook\n" + added;
+            }
+            return out;
+        }
+
+        std::string slurp(const std::string& path)
+        {
+            std::ifstream file(path, std::ios::binary);
+            return std::string((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+        }
+    } // namespace
+
     VkBasaltSettings ConfigSerializer::loadSettings()
     {
         VkBasaltSettings settings = DefaultConfig::appSettings();
 
-        // Check user config first, then fall back to system paths (same order as Config)
-        std::string userConfig = getBaseConfigDir() + "/VkHook.conf";
-
-        const std::array<std::string, 3> configPaths = {
-            userConfig,
-            std::string(SYSCONFDIR) + "/VkHook/VkHook.conf",
-            std::string(SYSCONFDIR) + "/VkHook.conf",
-        };
-
-        std::string configPath;
-        for (const auto& path : configPaths)
-        {
-            std::ifstream test(path);
-            if (test.is_open())
-            {
-                configPath = path;
-                break;
-            }
-        }
-
+        const std::string configPath = Paths::findSettingsFile();
         if (configPath.empty())
-        {
             return settings;
-        }
 
         Logger::info("SettingsManager loading from: " + configPath);
 
-        std::ifstream file(configPath);
-        if (!file.is_open())
-        {
+        std::vector<std::pair<std::string, std::string>> entries;
+        if (!Ini::readFile(configPath, entries))
             return settings;
-        }
 
-        std::string line;
-        while (std::getline(file, line))
+        for (const auto& [key, value] : entries)
         {
-            // Skip comments and empty lines
-            size_t start = line.find_first_not_of(" \t");
-            if (start == std::string::npos || line[start] == '#')
-                continue;
-
-            size_t eq = line.find('=');
-            if (eq == std::string::npos)
-                continue;
-
-            std::string key = line.substr(0, eq);
-            std::string value = line.substr(eq + 1);
-
-            // Trim whitespace
-            auto trimWs = [](std::string& s) {
-                size_t start = s.find_first_not_of(" \t");
-                size_t end = s.find_last_not_of(" \t");
-                s = (start == std::string::npos) ? "" : s.substr(start, end - start + 1);
-            };
-            trimWs(key);
-            trimWs(value);
-
             if (key == "maxEffects")
             {
-                try
-                {
-                    int parsed = std::stoi(value);
-                    if (parsed < 0)
-                    {
-                        Logger::err("invalid maxEffects value (negative): " + value);
-                    }
-                    else
-                    {
-                        settings.maxEffects = std::clamp(parsed, MIN_MAX_EFFECTS, MAX_MAX_EFFECTS);
-                        if (settings.maxEffects != parsed)
-                        {
-                            Logger::warn("clamped maxEffects from " + std::to_string(parsed) + " to "
-                                         + std::to_string(settings.maxEffects));
-                        }
-                    }
-                }
-                catch (...)
+                int parsed = 0;
+                if (!parseInt(value, parsed) || parsed < 0)
                 {
                     Logger::err("invalid maxEffects value: " + value);
+                    continue;
                 }
+                settings.maxEffects = std::clamp(parsed, MIN_MAX_EFFECTS, MAX_MAX_EFFECTS);
+                if (settings.maxEffects != parsed)
+                    Logger::warn("clamped maxEffects from " + std::to_string(parsed) + " to "
+                                 + std::to_string(settings.maxEffects));
             }
             else if (key == "overlayBlockInput")
-                settings.overlayBlockInput = (value == "true" || value == "1");
+                applyBool(key, value, settings.overlayBlockInput);
             else if (key == "usePortalIntegration")
-                settings.usePortalIntegration = (value == "true" || value == "1");
+                applyBool(key, value, settings.usePortalIntegration);
             else if (key == "uiScale")
             {
-                try
-                {
-                    size_t consumed = 0;
-                    const float scale = std::stof(value, &consumed);
-                    if (consumed != value.size() || !std::isfinite(scale) || scale < 0.0f)
-                        Logger::err("invalid uiScale value: " + value);
-                    else
-                        settings.uiScale = scale == 0.0f ? 0.0f : std::clamp(scale, 0.75f, 3.0f);
-                }
-                catch (...)
-                {
+                float scale = 0.0f;
+                const char* end = value.data() + value.size();
+                auto [ptr, ec] = std::from_chars(value.data(), end, scale);
+                if (ec != std::errc() || ptr != end || !std::isfinite(scale) || scale < 0.0f)
                     Logger::err("invalid uiScale value: " + value);
-                }
+                else
+                    settings.uiScale = scale == 0.0f ? 0.0f : std::clamp(scale, 0.75f, 3.0f);
             }
             else if (key == "toggleKey")
                 settings.toggleKey = value;
@@ -280,67 +377,47 @@ namespace VkHook
             else if (key == "overlayKey")
                 settings.overlayKey = value;
             else if (key == "enableOnLaunch")
-            {
-                std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
-                    return static_cast<char>(std::tolower(c));
-                });
-                settings.enableOnLaunch = (value == "true" || value == "1" || value == "on");
-            }
+                applyBool(key, value, settings.enableOnLaunch);
             else if (key == "depthCapture")
-                settings.depthCapture = (value == "on");
+                applyBool(key, value, settings.depthCapture);
             else if (key == "autoApply")
-                settings.autoApply = (value == "true" || value == "1");
+                applyBool(key, value, settings.autoApply);
             else if (key == "autoApplyDelay")
             {
-                try { settings.autoApplyDelay = std::stoi(value); }
-                catch (...) { Logger::err("invalid autoApplyDelay value: " + value); }
+                int parsed = 0;
+                if (parseInt(value, parsed))
+                    settings.autoApplyDelay = parsed;
+                else
+                    Logger::err("invalid autoApplyDelay value: " + value);
             }
             else if (key == "showDebugWindow")
-                settings.showDebugWindow = (value == "true" || value == "1");
+                applyBool(key, value, settings.showDebugWindow);
             else if (key == "separateEffectParams")
-                settings.separateEffectParams = (value == "true" || value == "1");
+                applyBool(key, value, settings.separateEffectParams);
             else if (key == "depthResolveMode")
             {
-                try { settings.depthResolveMode = std::stoi(value); }
-                catch (...) { Logger::err("invalid depthResolveMode value: " + value); }
+                int parsed = 0;
+                if (parseInt(value, parsed))
+                    settings.depthResolveMode = parsed;
+                else
+                    Logger::err("invalid depthResolveMode value: " + value);
             }
             else if (key == "depthRebuildMode")
-            {
-                try { settings.depthRebuildMode = std::clamp(std::stoi(value), 0, 1); }
-                catch (...) { Logger::err("invalid depthRebuildMode value: " + value); }
-            }
+                applyInt(key, value, 0, 1, settings.depthRebuildMode);
             else if (key == "depthManualPin")
                 settings.depthManualPin = value;
             else if (key == "depthTransientWorkaround")
-                settings.depthTransientWorkaround = (value == "true" || value == "1");
+                applyBool(key, value, settings.depthTransientWorkaround);
             else if (key == "depthCaptureMethod")
-            {
-                try
-                {
-                    int parsed = std::stoi(value);
-                    settings.depthCaptureMethod = std::clamp(parsed, 0, 2);
-                }
-                catch (...) { Logger::err("invalid depthCaptureMethod value: " + value); }
-            }
+                applyInt(key, value, 0, 2, settings.depthCaptureMethod);
             else if (key == "depthSourceChannel")
-            {
-                try
-                {
-                    int parsed = std::stoi(value);
-                    settings.depthSourceChannel = std::clamp(parsed, 0, 6); // Support modes 0-6
-                }
-                catch (...) { Logger::err("invalid depthSourceChannel value: " + value); }
-            }
+                applyInt(key, value, 0, 6, settings.depthSourceChannel);
             else if (key == "depthInvert")
-            {
-                settings.depthInvert = (value == "true" || value == "1");
-            }
+                applyBool(key, value, settings.depthInvert);
             else if (key == "depthFlip")
-            {
-                settings.depthFlip = (value == "true" || value == "1");
-            }
+                applyBool(key, value, settings.depthFlip);
             else if (key == "depthFlop")
-                settings.depthFlop = (value == "true" || value == "1");
+                applyBool(key, value, settings.depthFlop);
         }
 
         return settings;
@@ -348,103 +425,37 @@ namespace VkHook
 
     bool ConfigSerializer::saveSettings(const VkBasaltSettings& settings)
     {
-        std::string baseDir = getBaseConfigDir();
+        const std::string baseDir = getBaseConfigDir();
         if (baseDir.empty())
         {
             Logger::err("Could not determine config directory");
             return false;
         }
 
-        mkdir(baseDir.c_str(), 0755);
+        std::error_code ec;
+        std::filesystem::create_directories(baseDir, ec);
 
-        std::string configPath = baseDir + "/VkHook.conf";
-        std::ostringstream file;
+        // read-modify-write: the file belongs to the user, who may keep keys of
+        // their own in it (reshadeIncludePath, extra effect definitions, notes)
+        const std::string configPath = Paths::userSettingsFile();
+        const bool userFileExists = std::filesystem::exists(configPath, ec);
+        const std::string loadedFrom = userFileExists ? configPath : Paths::findSettingsFile();
+        const std::string existing = loadedFrom.empty() ? std::string() : slurp(loadedFrom);
 
-        // Write settings with comments
-        file << "# VkHook configuration\n\n";
+        const std::vector<SettingEntry> entries = settingEntries(settings);
+        const std::string text = loadedFrom.empty() ? freshSettingsText(entries) : mergeSettingsText(existing, entries);
 
-        file << "# Overlay settings\n";
-        const int clampedMaxEffects = std::clamp(settings.maxEffects, MIN_MAX_EFFECTS, MAX_MAX_EFFECTS);
+        if (userFileExists && text == existing)
+            return true;  // nothing changed: leave the file and its mtime alone
 
-        file << "overlayBlockInput = " << (settings.overlayBlockInput ? "true" : "false") << "\n";
-        file << "usePortalIntegration = " << (settings.usePortalIntegration ? "true" : "false") << "\n";
-        file << "# uiScale: 0 = automatic; manual range 0.75 to 3.0\n";
-        file << "uiScale = " << (std::isfinite(settings.uiScale) && settings.uiScale > 0.0f
-            ? std::clamp(settings.uiScale, 0.75f, 3.0f) : 0.0f) << "\n";
-        file << "maxEffects = " << clampedMaxEffects << "\n";
-        file << "autoApply = " << (settings.autoApply ? "true" : "false") << "\n";
-        file << "autoApplyDelay = " << settings.autoApplyDelay << "\n";
-
-        file << "\n# Key bindings\n";
-        file << "toggleKey = " << settings.toggleKey << "\n";
-        file << "reloadKey = " << settings.reloadKey << "\n";
-        file << "overlayKey = " << settings.overlayKey << "\n";
-
-        file << "\n# Startup behavior\n";
-        file << "enableOnLaunch = " << (settings.enableOnLaunch ? "true" : "false") << "\n";
-        file << "depthCapture = " << (settings.depthCapture ? "on" : "off") << "\n";
-
-        file << "\n# Debug\n";
-        file << "showDebugWindow = " << (settings.showDebugWindow ? "true" : "false") << "\n";
-
-        file << "\n# Overlay layout\n";
-        file << "separateEffectParams = " << (settings.separateEffectParams ? "true" : "false") << "\n";
-
-        file << "\n# Advanced (depth buffer)\n";
-        file << "# depthResolveMode: 0=auto (prefer average), 1=sample-zero, 2=average\n";
-        file << "depthResolveMode = " << settings.depthResolveMode << "\n";
-        file << "# depthRebuildMode: 0=safe (idle the queue before rebuilding), 1=fast (fence-gated)\n";
-        file << "depthRebuildMode = " << settings.depthRebuildMode << "\n";
-        file << "depthManualPin = " << settings.depthManualPin << "\n";
-        file << "depthTransientWorkaround = " << (settings.depthTransientWorkaround ? "true" : "false") << "\n";
-        file << "# depthCaptureMethod: 0=off, 1=renderpass-end (recommended), 2=queue-submit (robust fallback)\n";
-        file << "depthCaptureMethod = " << settings.depthCaptureMethod << "\n";
-
-        file << "\n# Alternative depth buffer handling\n";
-        file << "# depthSourceChannel mode selection:\n";
-        file << "#   0 = Luminance/Red (standard Vulkan depth)\n";
-        file << "#   1 = Alpha (alpha-encoded depth)\n";
-        file << "#   2 = Packed RGB (depth in RGB channels)\n";
-        file << "#   3 = Logarithmic (log-encoded depth)\n";
-        file << "#   4 = View-space Z (raw view-space Z)\n";
-        file << "#   5 = NDC (Normalized Device Coordinates)\n";
-        file << "#   6 = Reversed-Z (inverted for precision)\n";
-        file << "depthSourceChannel = " << settings.depthSourceChannel << "\n";
-        file << "# depthInvert: invert depth values (flips near/far planes)\n";
-        file << "depthInvert = " << (settings.depthInvert ? "true" : "false") << "\n";
-        file << "# depthFlip/depthFlop: mirror the depth image vertically/horizontally\n";
-        file << "depthFlip = " << (settings.depthFlip ? "true" : "false") << "\n";
-        file << "depthFlop = " << (settings.depthFlop ? "true" : "false") << "\n";
-
-        if (!file.good() || !writeAtomically(configPath, file.str()))
+        if (!writeAtomically(configPath, text))
         {
             Logger::err("Could not write VkHook.conf: " + configPath);
             return false;
         }
 
-        Logger::info("Saved settings to: " + configPath);
+        Logger::debug("Saved settings to: " + configPath);
         return true;
-    }
-
-    void ConfigSerializer::ensureConfigExists()
-    {
-        std::string baseDir = getBaseConfigDir();
-        if (baseDir.empty())
-            return;
-
-        // Create directory if needed
-        mkdir(baseDir.c_str(), 0755);
-
-        std::string configPath = baseDir + "/VkHook.conf";
-
-        // Only create if no user config exists
-        struct stat st;
-        if (stat(configPath.c_str(), &st) == 0)
-            return;
-
-        VkBasaltSettings defaults = DefaultConfig::appSettings();
-        saveSettings(defaults);
-        Logger::info("Created default VkHook.conf");
     }
 
     bool ConfigSerializer::ensureVersionFile()
@@ -693,31 +704,33 @@ namespace VkHook
 
     ShaderManagerConfig ConfigSerializer::loadShaderManagerConfig()
     {
-        static ShaderManagerConfig cachedConfig;
-        static std::filesystem::file_time_type cachedModifiedTime;
-        static std::string cachedConfigPath;
-        static bool cacheValid = false;
+        // Loading is a pure read: it never writes the file or creates
+        // directories. Callers that want a refreshed scan persisted call
+        // saveShaderManagerConfig through the PersistenceQueue.
+        struct Cache
+        {
+            std::mutex mutex;
+            ShaderManagerConfig config;
+            std::filesystem::file_time_type modifiedTime{};
+            std::string path;
+            bool exists = false;
+            bool valid = false;
+        };
+        static Cache cache;
+
+        const std::string configPath = getBaseConfigDir() + "/shader_manager.conf";
+        std::error_code timestampError;
+        const auto modifiedTime = std::filesystem::last_write_time(configPath, timestampError);
+        const bool exists = !timestampError;
+
+        {
+            std::lock_guard<std::mutex> lock(cache.mutex);
+            if (cache.valid && cache.path == configPath && cache.exists == exists
+                && (!exists || cache.modifiedTime == modifiedTime))
+                return cache.config;
+        }
 
         ShaderManagerConfig config;
-        std::string configPath = getBaseConfigDir() + "/shader_manager.conf";
-
-        std::error_code timestampError;
-        auto modifiedTime = std::filesystem::last_write_time(configPath, timestampError);
-        if (cacheValid && !timestampError && configPath == cachedConfigPath &&
-            modifiedTime == cachedModifiedTime)
-            return cachedConfig;
-
-        auto rememberConfig = [&]() {
-            std::error_code ec;
-            auto time = std::filesystem::last_write_time(configPath, ec);
-            if (!ec)
-            {
-                cachedConfig = config;
-                cachedConfigPath = configPath;
-                cachedModifiedTime = time;
-                cacheValid = true;
-            }
-        };
 
         auto refreshDiscoveredPaths = [&]() {
             std::set<std::string> shaderPaths;
@@ -754,90 +767,44 @@ namespace VkHook
             config.discoveredTexturePaths.assign(texturePaths.begin(), texturePaths.end());
         };
 
-        std::ifstream file(configPath);
-        if (!file.is_open())
+        std::vector<std::pair<std::string, std::string>> entries;
+        if (!exists || !Ini::readFile(configPath, entries))
         {
-            // Config file doesn't exist - set up defaults
-            std::string defaultReshadeDir = getBaseConfigDir() + "/reshade";
-
-            // Create directories if they don't exist
-            mkdir(defaultReshadeDir.c_str(), 0755);
-            mkdir((defaultReshadeDir + "/Shaders").c_str(), 0755);
-            mkdir((defaultReshadeDir + "/Textures").c_str(), 0755);
-
-            config.parentDirectories.push_back(defaultReshadeDir);
-
-            // Auto-scan to discover paths
-            scanDirectoryForShaders(defaultReshadeDir,
-                config.discoveredShaderPaths, config.discoveredTexturePaths);
-
-            refreshDiscoveredPaths();
-
-            // Save the config so it persists
-            saveShaderManagerConfig(config);
-            Logger::info("Created default shader manager config with reshade directory");
-            rememberConfig();
-            return config;
+            // No file yet: the default reshade directory is the only parent
+            config.parentDirectories.push_back(getBaseConfigDir() + "/reshade");
         }
-
-        // File exists - parse it. Older setup versions wrote all discovered
-        // paths on one comma-separated line, so accept both that format and
-        // the current one-path-per-line format.
-        auto appendPathList = [](const std::string& value, std::vector<std::string>& paths) {
-            std::stringstream stream(value);
-            std::string path;
-            while (std::getline(stream, path, ','))
+        else
+        {
+            // Older setup versions wrote all discovered paths on one
+            // comma-separated line, so accept that and one path per line.
+            for (const auto& [key, value] : entries)
             {
-                size_t start = path.find_first_not_of(" \t");
-                size_t end = path.find_last_not_of(" \t");
-                if (start != std::string::npos)
-                    paths.push_back(path.substr(start, end - start + 1));
+                if (value.empty())
+                    continue;
+                if (key == "parentDir")
+                    config.parentDirectories.push_back(value);
+                else if (key == "shaderPath")
+                {
+                    for (auto& path : Ini::splitList(value, ','))
+                        config.discoveredShaderPaths.push_back(std::move(path));
+                }
+                else if (key == "texturePath")
+                {
+                    for (auto& path : Ini::splitList(value, ','))
+                        config.discoveredTexturePaths.push_back(std::move(path));
+                }
             }
-        };
-
-        std::string line;
-        while (std::getline(file, line))
-        {
-            // Skip comments and empty lines
-            size_t start = line.find_first_not_of(" \t");
-            if (start == std::string::npos || line[start] == '#')
-                continue;
-
-            size_t eq = line.find('=');
-            if (eq == std::string::npos)
-                continue;
-
-            std::string key = line.substr(0, eq);
-            std::string value = line.substr(eq + 1);
-
-            // Trim whitespace
-            auto trimWs = [](std::string& s) {
-                size_t start = s.find_first_not_of(" \t");
-                size_t end = s.find_last_not_of(" \t");
-                s = (start == std::string::npos) ? "" : s.substr(start, end - start + 1);
-            };
-            trimWs(key);
-            trimWs(value);
-
-            if (key == "parentDir" && !value.empty())
-                config.parentDirectories.push_back(value);
-            else if (key == "shaderPath" && !value.empty())
-                appendPathList(value, config.discoveredShaderPaths);
-            else if (key == "texturePath" && !value.empty())
-                appendPathList(value, config.discoveredTexturePaths);
         }
-
-        const auto previousShaderPaths = config.discoveredShaderPaths;
-        const auto previousTexturePaths = config.discoveredTexturePaths;
         refreshDiscoveredPaths();
-        if (config.discoveredShaderPaths != previousShaderPaths ||
-            config.discoveredTexturePaths != previousTexturePaths)
-        {
-            saveShaderManagerConfig(config);
-            Logger::info("ShaderManager: refreshed discovered shader and texture paths");
-        }
 
-        rememberConfig();
+        {
+            std::lock_guard<std::mutex> lock(cache.mutex);
+            cache.config = config;
+            cache.path = configPath;
+            cache.exists = exists;
+            cache.modifiedTime = exists ? modifiedTime : std::filesystem::file_time_type{};
+            cache.valid = true;
+        }
         return config;
     }
 
@@ -860,15 +827,15 @@ namespace VkHook
 
         file << "# Parent directories (user-added)\n";
         for (const auto& dir : config.parentDirectories)
-            file << "parentDir = " << dir << "\n";
+            file << "parentDir = " << Ini::formatValue(dir) << "\n";
 
         file << "\n# Discovered shader paths (auto-generated on scan)\n";
         for (const auto& path : config.discoveredShaderPaths)
-            file << "shaderPath = " << path << "\n";
+            file << "shaderPath = " << Ini::formatValue(path) << "\n";
 
         file << "\n# Discovered texture paths (auto-generated on scan)\n";
         for (const auto& path : config.discoveredTexturePaths)
-            file << "texturePath = " << path << "\n";
+            file << "texturePath = " << Ini::formatValue(path) << "\n";
 
         if (!file.good() || !writeAtomically(configPath, file.str()))
         {
@@ -876,7 +843,7 @@ namespace VkHook
             return false;
         }
 
-        Logger::info("Saved shader manager config to: " + configPath);
+        Logger::debug("Saved shader manager config to: " + configPath);
         return true;
     }
 
@@ -906,14 +873,14 @@ namespace VkHook
             file << "# " << effectName << "\n";
             auto pathIt = effectPaths.find(effectName);
             if (pathIt != effectPaths.end() && !pathIt->second.empty())
-                file << effectName << " = " << pathIt->second << "\n";
+                file << effectName << " = " << Ini::formatValue(pathIt->second) << "\n";
             for (const auto* param : effectParams)
-                file << param->effectName << "." << param->paramName << " = " << param->value << "\n";
+                file << param->effectName << "." << param->paramName << " = " << Ini::formatValue(param->value) << "\n";
             auto defsIt = defsByEffect.find(effectName);
             if (defsIt != defsByEffect.end())
             {
                 for (const auto* def : defsIt->second)
-                    file << def->effectName << "@" << def->name << " = " << def->value << "\n";
+                    file << def->effectName << "@" << def->name << " = " << Ini::formatValue(def->value) << "\n";
             }
             file << "\n";
         }
@@ -926,9 +893,9 @@ namespace VkHook
             file << "# " << effectName << "\n";
             auto pathIt = effectPaths.find(effectName);
             if (pathIt != effectPaths.end() && !pathIt->second.empty())
-                file << effectName << " = " << pathIt->second << "\n";
+                file << effectName << " = " << Ini::formatValue(pathIt->second) << "\n";
             for (const auto* def : effectDefs)
-                file << def->effectName << "@" << def->name << " = " << def->value << "\n";
+                file << def->effectName << "@" << def->name << " = " << Ini::formatValue(def->value) << "\n";
             file << "\n";
         }
 
@@ -940,7 +907,7 @@ namespace VkHook
                 defsByEffect.find(effectName) == defsByEffect.end())
             {
                 file << "# " << effectName << "\n";
-                file << effectName << " = " << path << "\n\n";
+                file << effectName << " = " << Ini::formatValue(path) << "\n\n";
             }
         }
 

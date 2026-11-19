@@ -115,16 +115,45 @@ namespace VkHook
 
     namespace
     {
-        std::string getGameShaderProfilePath(const std::string& gameName, const std::string& profileName)
+        // A macro value may itself contain commas (float3(1,0,0)), and the
+        // list separator is ", ", so a literal comma is written doubled.
+        void appendEscapedMacroValue(std::string& out, const std::string& value)
         {
-            const std::string base = ConfigSerializer::getBaseConfigDir();
-            if (base.empty() || gameName.empty() || profileName.empty() ||
-                gameName.find('/') != std::string::npos || gameName.find('\\') != std::string::npos ||
-                profileName.find('/') != std::string::npos || profileName.find('\\') != std::string::npos ||
-                gameName == "." || gameName == ".." || profileName == "." || profileName == "..")
-                return "";
-            return base + "/configs/shaders/" + gameName + "@" + profileName + ".ini";
+            for (const char c : value)
+            {
+                out += c;
+                if (c == ',')
+                    out += ',';
+            }
         }
+    }
+
+    std::string ConfigSerializer::getGameShaderProfilePath(const std::string& gameName, const std::string& profileName)
+    {
+        const std::string base = ConfigSerializer::getBaseConfigDir();
+        if (base.empty() || gameName.empty() || profileName.empty() ||
+            gameName.find('/') != std::string::npos || gameName.find('\\') != std::string::npos ||
+            profileName.find('/') != std::string::npos || profileName.find('\\') != std::string::npos ||
+            gameName == "." || gameName == ".." || profileName == "." || profileName == "..")
+            return "";
+        return base + "/configs/shaders/" + gameName + "@" + profileName + ".ini";
+    }
+
+    std::string ConfigSerializer::getRenamedShaderProfilePath(const std::string& gameName, const std::string& oldName,
+                                                              const std::string& newName)
+    {
+        const std::string oldPath = getShaderProfilePath(gameName, oldName);
+        if (oldPath.empty())
+            return "";
+        const std::filesystem::path oldFilePath(oldPath);
+        const std::string prefix = gameName + "@";
+        const bool gameSpecific = oldFilePath.filename().string().compare(0, prefix.size(), prefix) == 0;
+        return oldFilePath.parent_path().string() + "/" + (gameSpecific ? prefix + newName : newName) + ".ini";
+    }
+
+    std::string ConfigSerializer::getImportedShaderProfilePath(const std::string& name)
+    {
+        return getBaseConfigDir() + "/configs/shaders/" + name + ".ini";
     }
 
     std::vector<std::string> ConfigSerializer::listShaderProfilesForGame(const std::string& gameName)
@@ -279,10 +308,8 @@ namespace VkHook
         // an imported global preset stays global
         const std::filesystem::path oldFilePath(oldPath);
         const std::string dir = oldFilePath.parent_path().string();
-        const std::string oldFilename = oldFilePath.filename().string();
         const std::string prefix = gameName + "@";
-        const bool gameSpecific = oldFilename.compare(0, prefix.size(), prefix) == 0;
-        const std::string newPath = dir + "/" + (gameSpecific ? prefix + newName : newName) + ".ini";
+        const std::string newPath = getRenamedShaderProfilePath(gameName, oldName, newName);
 
         // a name is taken when either kind would collide, not just the same kind
         ec.clear();
@@ -361,7 +388,7 @@ namespace VkHook
                 break;
             name = base + "-" + std::to_string(suffix);
         }
-        if (!writeAtomically(shaderDir + "/" + name + ".ini", contents))
+        if (!writeAtomically(getImportedShaderProfilePath(name), contents))
             return "";
         return name;
     }
@@ -492,12 +519,9 @@ namespace VkHook
             {
                 if (!first) file << ", ";
                 file << name << '=';
-                for (const char c : macroValue)
-                {
-                    file << c;
-                    if (c == ',')
-                        file << ',';
-                }
+                std::string escaped;
+                appendEscapedMacroValue(escaped, macroValue);
+                file << escaped;
                 first = false;
             }
             file << '\n';
@@ -566,8 +590,10 @@ namespace VkHook
         {
             if (!key.second.empty() && key.second.front() == '@')
             {
+                std::string escaped;
+                appendEscapedMacroValue(escaped, value);
                 sidecar << '[' << key.first << "]\nPreprocessorDefinitions="
-                        << key.second.substr(1) << '=' << value << "\n\n";
+                        << key.second.substr(1) << '=' << escaped << "\n\n";
             }
             else
                 sidecar << '[' << key.first << "]\n" << key.second << '=' << value << "\n\n";
@@ -579,12 +605,9 @@ namespace VkHook
             {
                 if (!first) sidecar << ", ";
                 sidecar << name << '=';
-                for (const char c : value)
-                {
-                    sidecar << c;
-                    if (c == ',')
-                        sidecar << ',';
-                }
+                std::string escaped;
+                appendEscapedMacroValue(escaped, value);
+                sidecar << escaped;
                 first = false;
             }
             sidecar << '\n';

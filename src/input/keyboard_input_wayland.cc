@@ -15,6 +15,7 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <unordered_set>
+#include <vector>
 
 namespace VkHook
 {
@@ -42,13 +43,7 @@ namespace VkHook
     // Accumulated state between getKeyboardState calls
     static std::string typedCharsAccumulator;
     static std::string lastKeyNameAccumulator;
-    static bool backspacePressed = false;
-    static bool deletePressed = false;
-    static bool enterPressed = false;
-    static bool leftPressed = false;
-    static bool rightPressed = false;
-    static bool homePressed = false;
-    static bool endPressed = false;
+    static std::vector<NavKey> navAccumulator;
 
     static bool initialized = false;
 
@@ -89,29 +84,41 @@ namespace VkHook
                 lastKeyNameAccumulator = nameBuf;
         }
 
-        // Handle special keys
-        if (keysym == XKB_KEY_BackSpace)
-            backspacePressed = true;
-        else if (keysym == XKB_KEY_Delete)
-            deletePressed = true;
-        else if (keysym == XKB_KEY_Return || keysym == XKB_KEY_KP_Enter)
-            enterPressed = true;
-        else if (keysym == XKB_KEY_Left)
-            leftPressed = true;
-        else if (keysym == XKB_KEY_Right)
-            rightPressed = true;
-        else if (keysym == XKB_KEY_Home)
-            homePressed = true;
-        else if (keysym == XKB_KEY_End)
-            endPressed = true;
-        else
+        // Navigation and editing keys
+        NavKey nav = NavKey::Count;
+        switch (keysym)
         {
-            // Get UTF-8 text for the key
-            char buf[8];
-            int len = xkb_state_key_get_utf8(xkbState, xkbKeycode, buf, sizeof(buf));
-            if (len > 0 && buf[0] >= 0x20) // Skip control characters
-                typedCharsAccumulator += std::string(buf, len);
+            case XKB_KEY_BackSpace: nav = NavKey::Backspace; break;
+            case XKB_KEY_Delete: case XKB_KEY_KP_Delete: nav = NavKey::Delete; break;
+            case XKB_KEY_Return: case XKB_KEY_KP_Enter: nav = NavKey::Enter; break;
+            case XKB_KEY_Left: nav = NavKey::Left; break;
+            case XKB_KEY_Right: nav = NavKey::Right; break;
+            case XKB_KEY_Up: nav = NavKey::Up; break;
+            case XKB_KEY_Down: nav = NavKey::Down; break;
+            case XKB_KEY_Home: nav = NavKey::Home; break;
+            case XKB_KEY_End: nav = NavKey::End; break;
+            case XKB_KEY_Prior: nav = NavKey::PageUp; break;
+            case XKB_KEY_Next: nav = NavKey::PageDown; break;
+            case XKB_KEY_Tab: case XKB_KEY_ISO_Left_Tab: nav = NavKey::Tab; break;
+            case XKB_KEY_Escape: nav = NavKey::Escape; break;
+            default: break;
         }
+        if (nav != NavKey::Count)
+        {
+            if (navAccumulator.size() < kMaxNavPresses)
+                navAccumulator.push_back(nav);
+            return;
+        }
+
+        // Ctrl/Alt/Super chords are shortcuts, not text
+        if (xkb_state_mod_name_is_active(xkbState, XKB_MOD_NAME_CTRL, XKB_STATE_MODS_EFFECTIVE) > 0 ||
+            xkb_state_mod_name_is_active(xkbState, XKB_MOD_NAME_ALT, XKB_STATE_MODS_EFFECTIVE) > 0 ||
+            xkb_state_mod_name_is_active(xkbState, XKB_MOD_NAME_LOGO, XKB_STATE_MODS_EFFECTIVE) > 0)
+            return;
+
+        const uint32_t cp = xkb_state_key_get_utf32(xkbState, xkbKeycode);
+        if (cp >= 0x20 && cp != 0x7F)
+            appendUtf8(typedCharsAccumulator, cp);
     }
 
     // Wayland keyboard listener callbacks
@@ -179,6 +186,7 @@ namespace VkHook
         std::lock_guard<std::mutex> lock(keyboardMutex);
         pressedKeys.clear();
         keyPressEvents.clear();  // Prevent stale keysyms surviving focus loss
+        navAccumulator.clear();
     }
 
     static void keyboardKey(void* /*data*/, wl_keyboard* /*keyboard*/,
@@ -288,6 +296,9 @@ namespace VkHook
 
             pressedKeys.clear();
             keyPressEvents.clear();
+            typedCharsAccumulator.clear();
+            lastKeyNameAccumulator.clear();
+            navAccumulator.clear();
             initialized = false;
         }
 
@@ -341,6 +352,12 @@ namespace VkHook
         return false;
     }
 
+    void discardWaylandKeyPresses()
+    {
+        std::lock_guard<std::mutex> lock(keyboardMutex);
+        keyPressEvents.clear();
+    }
+
     KeyboardState getKeyboardStateWayland()
     {
         KeyboardState state;
@@ -354,24 +371,21 @@ namespace VkHook
 
         state.typedChars = std::move(typedCharsAccumulator);
         state.lastKeyName = std::move(lastKeyNameAccumulator);
-        state.backspace = backspacePressed;
-        state.del = deletePressed;
-        state.enter = enterPressed;
-        state.left = leftPressed;
-        state.right = rightPressed;
-        state.home = homePressed;
-        state.end = endPressed;
+        state.navPresses = std::move(navAccumulator);
+        if (xkbState)
+        {
+            auto active = [](const char* name) {
+                return xkb_state_mod_name_is_active(xkbState, name, XKB_STATE_MODS_EFFECTIVE) > 0;
+            };
+            state.shift = active(XKB_MOD_NAME_SHIFT);
+            state.ctrl = active(XKB_MOD_NAME_CTRL);
+            state.alt = active(XKB_MOD_NAME_ALT);
+            state.super = active(XKB_MOD_NAME_LOGO);
+        }
 
-        // Reset accumulators (moved-from strings are already empty or valid-but-unspecified)
         typedCharsAccumulator.clear();
         lastKeyNameAccumulator.clear();
-        backspacePressed = false;
-        deletePressed = false;
-        enterPressed = false;
-        leftPressed = false;
-        rightPressed = false;
-        homePressed = false;
-        endPressed = false;
+        navAccumulator.clear();
 
         return state;
     }

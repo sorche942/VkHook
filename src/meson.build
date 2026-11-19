@@ -80,19 +80,13 @@ overlay_src = [
     'overlay/view_shader_test.cc',
     'overlay/view_main.cc',
     'overlay/params/field_editor.cc',
-    'overlay/params/fields/field_bool.cc',
-    'overlay/params/fields/field_float.cc',
-    'overlay/params/fields/field_floatvec.cc',
-    'overlay/params/fields/field_int.cc',
-    'overlay/params/fields/field_intvec.cc',
-    'overlay/params/fields/field_uint.cc',
-    'overlay/params/fields/field_uintvec.cc',
 ]
 
 VkHook_src = [
     'core/vkhook.cc',
     'core/vkhook_depth.cc',
-    'core/async_writer.cc',
+    'core/config/persist.cc',
+    'core/config/ini.cc',
     'render/buffer.cc',
     'render/command_buffer.cc',
     'render/vk_handle.cc',
@@ -136,18 +130,18 @@ xkbcommon_dep = dependency('xkbcommon')
 wayland_protocols_dep = dependency('wayland-protocols')
 wayland_scanner = find_program('wayland-scanner')
 
-# Generate pointer-constraints-unstable-v1 protocol code
+# wp_viewporter scales the 1x1 input-capture buffer to the hitbox
 wl_protocols_dir = wayland_protocols_dep.get_variable('pkgdatadir')
-pointer_constraints_xml = join_paths(wl_protocols_dir, 'unstable', 'pointer-constraints', 'pointer-constraints-unstable-v1.xml')
+viewporter_xml = join_paths(wl_protocols_dir, 'stable', 'viewporter', 'viewporter.xml')
 
-pointer_constraints_client_h = custom_target('pointer-constraints-client-header',
-    input: pointer_constraints_xml,
-    output: 'pointer-constraints-unstable-v1-client-protocol.h',
+viewporter_client_h = custom_target('viewporter-client-header',
+    input: viewporter_xml,
+    output: 'viewporter-client-protocol.h',
     command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'])
 
-pointer_constraints_code = custom_target('pointer-constraints-code',
-    input: pointer_constraints_xml,
-    output: 'pointer-constraints-unstable-v1-protocol.c',
+viewporter_code = custom_target('viewporter-code',
+    input: viewporter_xml,
+    output: 'viewporter-protocol.c',
     command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
 
 conf_paths = configuration_data()
@@ -195,6 +189,7 @@ mouse_input_x11_lib = static_library('mouse_input_x11',
 # wayland_input_common provides a shared seat/queue used by both keyboard and mouse.
 wayland_input_common_lib = static_library('wayland_input_common',
     'input/wayland_input_common.cc', 'input/wayland_display.cc',
+    viewporter_code, viewporter_client_h,
     dependencies: [wayland_client_dep],
     include_directories: [include_directories('core', 'core/config')])
 keyboard_input_wayland_lib = static_library('keyboard_input_wayland',
@@ -204,12 +199,6 @@ keyboard_input_wayland_lib = static_library('keyboard_input_wayland',
     include_directories: [include_directories('core', 'core/config')])
 mouse_input_wayland_lib = static_library('mouse_input_wayland',
     'input/mouse_input_wayland.cc',
-    link_with: [wayland_input_common_lib],
-    dependencies: [wayland_client_dep],
-    include_directories: [include_directories('core', 'core/config')])
-wayland_pointer_constraints_lib = static_library('wayland_pointer_constraints',
-    'input/wayland_pointer_constraints.cc', pointer_constraints_code,
-    pointer_constraints_client_h,
     link_with: [wayland_input_common_lib],
     dependencies: [wayland_client_dep],
     include_directories: [include_directories('core', 'core/config')])
@@ -258,7 +247,7 @@ vkhook_lib = shared_library('vkhook',
     link_with: [keyboard_input_x11_lib, mouse_input_lib, input_blocker_lib,
                 x11_display_lib, mouse_input_x11_lib,
                 wayland_input_common_lib, keyboard_input_wayland_lib, mouse_input_wayland_lib,
-                wayland_pointer_constraints_lib, wayland_interpose_lib],
+                wayland_interpose_lib],
     include_directories : [VkHook_include_path, imgui_inc, overlay_inc, effects_inc, effects_params_inc, core_inc, input_inc, render_inc, vendor_inc, include_directories('vendor/reshade'), stb_inc, shader_asset_inc, source_inc],
     cpp_args : vkhook_cpp_args,
     dependencies : vkhook_deps,
@@ -279,6 +268,7 @@ shader_check = executable('vkhook-shader-check',
     'core/config/config.cc',
     'core/config/config_serializer.cc',
     'core/config/config_serializer_profile.cc',
+    'core/config/ini.cc',
     'core/logger.cc',
     'core/util.cc',
     include_directories : [VkHook_include_path, imgui_inc, overlay_inc, effects_inc, effects_params_inc, core_inc, input_inc, render_inc, vendor_inc, include_directories('vendor/reshade'), stb_inc, source_inc],
@@ -300,6 +290,7 @@ config_serializer_tests = executable('vkhook-config-serializer-tests',
     'core/config/config_serializer.cc',
     'core/config/config_serializer_profile.cc',
     'core/config/config.cc',
+    'core/config/ini.cc',
     'core/logger.cc',
     'core/util.cc',
     include_directories : [core_inc, render_inc, effects_inc, effects_params_inc, vendor_inc, source_inc, imgui_inc])
@@ -432,13 +423,24 @@ reshade_uniform_tests = executable('vkhook-reshade-uniform-tests',
     include_directories : [core_inc, effects_inc, vendor_inc, source_inc])
 test('reshade uniform sources', reshade_uniform_tests)
 
-# AsyncWriter is what keeps profile/settings writes off the present thread. Its
-# FIFO order and idle barrier are the contract, and its thread lifetime is the
-# part a mistake would crash on, so it is exercised headless.
-async_writer_tests = executable('vkhook-async-writer-tests',
-    'core/async_writer_test.cc',
-    'core/async_writer.cc',
+# The one INI tokenizer, the bool parser and the persistence queue's ordering
+# rules (coalescing, delete-vs-autosave, shutdown) are pure and headless.
+persist_tests = executable('vkhook-persist-tests',
+    'tests/persist_test.cc',
+    'core/config/persist.cc',
+    'core/config/settings_manager.cc',
+    'core/config/ini.cc',
+    'core/config/config_serializer.cc',
+    'core/config/config_serializer_profile.cc',
+    'core/config/config.cc',
     'core/logger.cc',
+    'core/util.cc',
     dependencies : [threads_dep],
-    include_directories : [core_inc, source_inc])
-test('async writer', async_writer_tests)
+    include_directories : [core_inc, render_inc, effects_inc, effects_params_inc, vendor_inc, source_inc, imgui_inc])
+test('persistence queue', persist_tests)
+
+# the numeric field editors parse with std::from_chars; the grammar is pinned here
+field_parse_tests = executable('vkhook-field-parse-tests',
+    'tests/field_parse_test.cc',
+    include_directories : [include_directories('overlay/params')])
+test('field parse', field_parse_tests)

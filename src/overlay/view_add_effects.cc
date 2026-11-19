@@ -164,14 +164,13 @@ namespace VkHook
         };
 
         // Session-scoped recents, so frequently used shaders are one click away.
-        static std::vector<std::string> recent;
         auto pushRecent = [&](const std::string& type) {
-            auto it = std::find(recent.begin(), recent.end(), type);
-            if (it != recent.end())
-                recent.erase(it);
-            recent.insert(recent.begin(), type);
-            if (recent.size() > 8)
-                recent.resize(8);
+            auto it = std::find(recentEffects.begin(), recentEffects.end(), type);
+            if (it != recentEffects.end())
+                recentEffects.erase(it);
+            recentEffects.insert(recentEffects.begin(), type);
+            if (recentEffects.size() > 8)
+                recentEffects.resize(8);
         };
         auto queueEffect = [&](const std::string& effectType) {
             if (atLimit || isPending(effectType))
@@ -223,10 +222,9 @@ namespace VkHook
         // Rebuilding and re-sorting 300+ shaders every frame is wasted when the
         // inputs rarely move, so cache the result until state, search or package
         // tab actually changes.
-        static std::string filterPackage;  // empty = All
         if (overlayStateVersion != addEffectsCacheVersion
             || std::string(addEffectsSearch) != addEffectsCacheSearch
-            || filterPackage != addEffectsCacheFilter)
+            || addEffectsFilterPackage != addEffectsCacheFilter)
         {
             addEffectsEntries.clear();
 
@@ -275,13 +273,13 @@ namespace VkHook
             }
 
             // a tab can vanish when the install changes; fall back to All
-            if (!filterPackage.empty() &&
-                std::find(addEffectsPackages.begin(), addEffectsPackages.end(), filterPackage) == addEffectsPackages.end())
-                filterPackage.clear();
+            if (!addEffectsFilterPackage.empty() &&
+                std::find(addEffectsPackages.begin(), addEffectsPackages.end(), addEffectsFilterPackage) == addEffectsPackages.end())
+                addEffectsFilterPackage.clear();
 
-            if (!filterPackage.empty())
+            if (!addEffectsFilterPackage.empty())
                 addEffectsEntries.erase(std::remove_if(addEffectsEntries.begin(), addEffectsEntries.end(),
-                                                       [&](const AddEffectsEntry& e) { return e.package != filterPackage; }),
+                                                       [&](const AddEffectsEntry& e) { return e.package != addEffectsFilterPackage; }),
                                         addEffectsEntries.end());
 
             // group results by their effect package, keeping search relevance first
@@ -297,7 +295,7 @@ namespace VkHook
 
             // the All tab, with no active search, shows a dimmed header per package
             addEffectsRows.clear();
-            const bool groupHeads = filterPackage.empty() && addEffectsSearch[0] == '\0';
+            const bool groupHeads = addEffectsFilterPackage.empty() && addEffectsSearch[0] == '\0';
             std::string currentPackage;
             for (int i = 0; i < static_cast<int>(addEffectsEntries.size()); i++)
             {
@@ -311,7 +309,7 @@ namespace VkHook
 
             addEffectsCacheVersion = overlayStateVersion;
             addEffectsCacheSearch = addEffectsSearch;
-            addEffectsCacheFilter = filterPackage;
+            addEffectsCacheFilter = addEffectsFilterPackage;
         }
         const std::vector<AddEffectsEntry>& entries = addEffectsEntries;
         const std::vector<AddEffectsRow>& rows = addEffectsRows;
@@ -344,19 +342,19 @@ namespace VkHook
                                  addEffectsSearch, sizeof(addEffectsSearch),
                                  ImGuiInputTextFlags_AutoSelectAll);
         ImGui::SetNextItemWidth(ImGui::GetFontSize() * 22.0f);
-        if (ImGui::BeginCombo("Package", filterPackage.empty() ? "All" : filterPackage.c_str()))
+        if (ImGui::BeginCombo("Package", addEffectsFilterPackage.empty() ? "All" : addEffectsFilterPackage.c_str()))
         {
-            if (ImGui::Selectable("All", filterPackage.empty()))
-                filterPackage.clear();
+            if (ImGui::Selectable("All", addEffectsFilterPackage.empty()))
+                addEffectsFilterPackage.clear();
             for (const auto& package : addEffectsPackages)
-                if (ImGui::Selectable(package.c_str(), filterPackage == package))
-                    filterPackage = package;
+                if (ImGui::Selectable(package.c_str(), addEffectsFilterPackage == package))
+                    addEffectsFilterPackage = package;
             ImGui::EndCombo();
         }
         ImGui::TextDisabled("%zu results", entries.size());
-        if (!hasSearch && !recent.empty() && ImGui::BeginCombo("Recent", "Choose a recent effect"))
+        if (!hasSearch && !recentEffects.empty() && ImGui::BeginCombo("Recent", "Choose a recent effect"))
         {
-            for (const auto& effect : recent)
+            for (const auto& effect : recentEffects)
             {
                 if (ImGui::Selectable(effect.c_str()))
                 {

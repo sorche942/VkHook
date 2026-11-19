@@ -1,4 +1,5 @@
 #include "imgui_overlay.hh"
+#include "persist.hh"
 #include "config_serializer.hh"
 #include "overlay/ui_theme.hh"
 
@@ -36,14 +37,18 @@ namespace VkHook
             ImGui::BeginDisabled(isDefault);
             if (ImGui::Button("Set default"))
             {
-                if (ConfigSerializer::setDefaultConfig(cfg))
+                if (PersistenceQueue::instance().write(ConfigSerializer::getDefaultConfigPath(), [cfg] {
+                        return ConfigSerializer::setDefaultConfig(cfg);
+                    }).get())
                     configListDefault = cfg;
             }
             ImGui::EndDisabled();
             ImGui::SameLine();
             if (ImGui::Button("Delete"))
             {
-                ConfigSerializer::deleteConfig(cfg);
+                PersistenceQueue::instance().remove(ConfigSerializer::getConfigsDir() + "/" + cfg + ".conf", [cfg] {
+                    return ConfigSerializer::deleteConfig(cfg);
+                }).wait();
                 configListRefreshPending = true;
                 ImGui::PopID();
                 continue;

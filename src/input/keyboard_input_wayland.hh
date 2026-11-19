@@ -10,6 +10,9 @@ namespace VkHook
     bool     isKeyPressedWayland(uint32_t ks);
     KeyboardState getKeyboardStateWayland();
 
+    // Drops accumulated hotkey edges (see isKeyPressed in keyboard_input.hh)
+    void discardWaylandKeyPresses();
+
     // Initialize Wayland keyboard from a captured wl_display
     bool initWaylandKeyboard();
 

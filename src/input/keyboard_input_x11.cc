@@ -7,73 +7,119 @@
 #include <X11/keysym.h>
 #include <X11/XKBlib.h>
 
+#include <algorithm>
 #include <limits>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace VkHook
 {
     static std::string typedCharsAccumulator;
     static std::string lastKeyNameAccumulator;
-    static bool backspacePressed = false;
-    static bool deletePressed = false;
-    static bool enterPressed = false;
-    static bool leftPressed = false;
-    static bool rightPressed = false;
-    static bool homePressed = false;
-    static bool endPressed = false;
+    static std::vector<NavKey> navAccumulator;
+    // modifier key counts (left + right), kept from the key events themselves so
+    // no server query is needed to know what is held
+    static int shiftDown = 0;
+    static int ctrlDown = 0;
+    static int altDown = 0;
+    static int superDown = 0;
     static uint64_t keymapFrameId = 0;
     static uint64_t lastQueriedKeymapFrame = std::numeric_limits<uint64_t>::max();
     static char cachedKeymap[32] = {};
     static std::unordered_map<uint32_t, KeyCode> keysymToKeycodeCache;
 
-    static void processKeycode(KeyCode keycode, unsigned int state)
+    static bool isModifierKeysym(KeySym keysym)
+    {
+        return keysym == XK_Shift_L || keysym == XK_Shift_R || keysym == XK_Control_L || keysym == XK_Control_R ||
+               keysym == XK_Alt_L || keysym == XK_Alt_R || keysym == XK_Super_L || keysym == XK_Super_R ||
+               keysym == XK_Meta_L || keysym == XK_Meta_R || keysym == XK_ISO_Level3_Shift;
+    }
+
+    static void trackModifier(KeySym keysym, bool pressed)
+    {
+        const int delta = pressed ? 1 : -1;
+        int* counter = nullptr;
+        if (keysym == XK_Shift_L || keysym == XK_Shift_R) counter = &shiftDown;
+        else if (keysym == XK_Control_L || keysym == XK_Control_R) counter = &ctrlDown;
+        else if (keysym == XK_Alt_L || keysym == XK_Alt_R || keysym == XK_Meta_L || keysym == XK_Meta_R) counter = &altDown;
+        else if (keysym == XK_Super_L || keysym == XK_Super_R) counter = &superDown;
+        if (counter)
+            *counter = std::max(0, *counter + delta);
+    }
+
+    static bool navKeyFor(KeySym keysym, NavKey& out)
+    {
+        switch (keysym)
+        {
+            case XK_BackSpace: out = NavKey::Backspace; return true;
+            case XK_Delete: case XK_KP_Delete: out = NavKey::Delete; return true;
+            case XK_Return: case XK_KP_Enter: out = NavKey::Enter; return true;
+            case XK_Left: out = NavKey::Left; return true;
+            case XK_Right: out = NavKey::Right; return true;
+            case XK_Up: out = NavKey::Up; return true;
+            case XK_Down: out = NavKey::Down; return true;
+            case XK_Home: out = NavKey::Home; return true;
+            case XK_End: out = NavKey::End; return true;
+            case XK_Prior: out = NavKey::PageUp; return true;
+            case XK_Next: out = NavKey::PageDown; return true;
+            case XK_Tab: case XK_ISO_Left_Tab: out = NavKey::Tab; return true;
+            case XK_Escape: out = NavKey::Escape; return true;
+            default: return false;
+        }
+    }
+
+    // Latin-1 and Unicode keysyms map straight to code points; anything else
+    // (function keys, dead keys) types nothing.
+    static uint32_t codepointFor(KeySym keysym)
+    {
+        if ((keysym >= 0x20 && keysym <= 0x7E) || (keysym >= 0xA0 && keysym <= 0xFF))
+            return static_cast<uint32_t>(keysym);
+        if (keysym >= 0x01000100 && keysym <= 0x0110FFFF)
+            return static_cast<uint32_t>(keysym - 0x01000000);
+        if (keysym >= XK_KP_0 && keysym <= XK_KP_9)
+            return static_cast<uint32_t>('0' + (keysym - XK_KP_0));
+        return 0;
+    }
+
+    static void processKey(KeyCode keycode, bool pressed)
     {
         Display* display = x11Display();
         if (!display)
             return;
 
-        const KeySym keysym = XkbKeycodeToKeysym(display, keycode, 0, 0);
+        const KeySym base = XkbKeycodeToKeysym(display, keycode, 0, 0);
+        trackModifier(base, pressed);
+        if (!pressed)
+            return;
 
         // capture the key name for the keybind editor, skipping modifiers.
-        if (keysym != XK_Shift_L && keysym != XK_Shift_R &&
-            keysym != XK_Control_L && keysym != XK_Control_R &&
-            keysym != XK_Alt_L && keysym != XK_Alt_R &&
-            keysym != XK_Super_L && keysym != XK_Super_R)
+        if (!isModifierKeysym(base))
         {
-            const char* keyName = XKeysymToString(keysym);
-            if (keyName)
+            if (const char* keyName = XKeysymToString(base))
                 lastKeyNameAccumulator = keyName;
         }
 
-        if (keysym == XK_BackSpace) backspacePressed = true;
-        else if (keysym == XK_Delete) deletePressed = true;
-        else if (keysym == XK_Return || keysym == XK_KP_Enter) enterPressed = true;
-        else if (keysym == XK_Left) leftPressed = true;
-        else if (keysym == XK_Right) rightPressed = true;
-        else if (keysym == XK_Home) homePressed = true;
-        else if (keysym == XK_End) endPressed = true;
-        else
+        NavKey nav;
+        if (navKeyFor(base, nav))
         {
-            bool shifted = (state & ShiftMask) != 0;
-            if (!shifted)
-            {
-                const KeyCode shiftL = XKeysymToKeycode(display, XK_Shift_L);
-                const KeyCode shiftR = XKeysymToKeycode(display, XK_Shift_R);
-                shifted = (cachedKeymap[shiftL >> 3] & (1 << (shiftL & 7))) ||
-                          (cachedKeymap[shiftR >> 3] & (1 << (shiftR & 7)));
-            }
-
-            const KeySym actualSym = XkbKeycodeToKeysym(display, keycode, 0, shifted ? 1 : 0);
-            if (actualSym >= 0x20 && actualSym <= 0x7E)
-                typedCharsAccumulator += (char)actualSym;
+            if (navAccumulator.size() < kMaxNavPresses)
+                navAccumulator.push_back(nav);
+            return;
         }
+
+        // Ctrl/Alt/Super chords are shortcuts, not text
+        if (ctrlDown || altDown || superDown)
+            return;
+
+        const KeySym actual = XkbKeycodeToKeysym(display, keycode, 0, shiftDown ? 1 : 0);
+        if (const uint32_t cp = codepointFor(actual))
+            appendUtf8(typedCharsAccumulator, cp);
     }
 
     static void onRawKey(uint32_t keycode, bool pressed)
     {
-        if (pressed)
-            processKeycode((KeyCode)keycode, 0);
+        processKey(static_cast<KeyCode>(keycode), pressed);
     }
 
     static void ensureRegistered()
@@ -109,6 +155,12 @@ namespace VkHook
 
         ensureRegistered();
 
+        // hotkeys belong to the game window: polling the keyboard from here
+        // would otherwise fire them while another application has the focus.
+        // x11GameFocused() answers from a cache, so this costs no round trip.
+        if (!x11GameFocused())
+            return false;
+
         if (lastQueriedKeymapFrame != keymapFrameId)
         {
             XQueryKeymap(display, cachedKeymap);
@@ -142,23 +194,15 @@ namespace VkHook
 
         state.typedChars = std::move(typedCharsAccumulator);
         state.lastKeyName = std::move(lastKeyNameAccumulator);
-        state.backspace = backspacePressed;
-        state.del = deletePressed;
-        state.enter = enterPressed;
-        state.left = leftPressed;
-        state.right = rightPressed;
-        state.home = homePressed;
-        state.end = endPressed;
+        state.navPresses = std::move(navAccumulator);
+        state.shift = shiftDown > 0;
+        state.ctrl = ctrlDown > 0;
+        state.alt = altDown > 0;
+        state.super = superDown > 0;
 
         typedCharsAccumulator.clear();
         lastKeyNameAccumulator.clear();
-        backspacePressed = false;
-        deletePressed = false;
-        enterPressed = false;
-        leftPressed = false;
-        rightPressed = false;
-        homePressed = false;
-        endPressed = false;
+        navAccumulator.clear();
 
         return state;
     }

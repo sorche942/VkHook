@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstdio>
 #include <thread>
+#include <vector>
 
 using namespace VkHook::WaylandSyncobjGate;
 using Clock = std::chrono::steady_clock;
@@ -21,6 +22,12 @@ namespace
             ++failures;
             std::fprintf(stderr, "FAIL:%d: %s\n", line, what);
         }
+    }
+
+    // one commit send, as the marshal hook brackets it
+    void commitOnce(uint32_t surface)
+    {
+        CommitScope scope(surface);
     }
 
     uint64_t microsSince(Clock::time_point start)
@@ -39,7 +46,7 @@ int main()
     {
         resetForTests();
         auto start = Clock::now();
-        beginCommit(SURFACE);
+        commitOnce(SURFACE);
         CHECK(microsSince(start) < 5000);
         CHECK(heldCount() == 0);
     }
@@ -49,7 +56,7 @@ int main()
         resetForTests();
         beginPresent(SURFACE);
         auto start = Clock::now();
-        beginCommit(SURFACE);
+        commitOnce(SURFACE);
         CHECK(microsSince(start) < 5000);
         CHECK(heldCount() == 0);
         endPresent(SURFACE);
@@ -75,7 +82,7 @@ int main()
 
         std::thread foreign([&] {
             auto start = Clock::now();
-            beginCommit(SURFACE);
+            commitOnce(SURFACE);
             foreignWait.store(microsSince(start));
             CHECK(presentFinished.load()); // released only after the bracket closed
         });
@@ -88,7 +95,7 @@ int main()
 
         // and once closed, commits pass instantly
         auto start = Clock::now();
-        beginCommit(SURFACE);
+        commitOnce(SURFACE);
         CHECK(microsSince(start) < 5000);
     }
 
@@ -115,7 +122,7 @@ int main()
 
         std::thread foreign([&] {
             auto start = Clock::now();
-            beginCommit(SURFACE);
+            commitOnce(SURFACE);
             waited.store(microsSince(start));
         });
         foreign.join();
@@ -137,14 +144,14 @@ int main()
 
         std::thread a([&] {
             auto start = Clock::now();
-            beginCommit(SURFACE);
+            commitOnce(SURFACE);
             first.store(microsSince(start));
         });
         a.join();
 
         std::thread b([&] {
             auto start = Clock::now();
-            beginCommit(SURFACE);
+            commitOnce(SURFACE);
             second.store(microsSince(start));
         });
         b.join();
@@ -156,6 +163,64 @@ int main()
         CHECK(heldCount() == 2);
 
         resetForTests();
+    }
+
+    // surfaces are independent: a present on one never holds a commit on another
+    {
+        resetForTests();
+        beginPresent(SURFACE);
+        auto start = Clock::now();
+        std::thread other([&] { commitOnce(SURFACE + 1); });
+        other.join();
+        CHECK(microsSince(start) < 5000);
+        CHECK(heldCount() == 0);
+        endPresent(SURFACE);
+    }
+
+    // the check-then-act window: no commit may be mid-send while a present
+    // bracket is open, however the threads interleave. A gate that only
+    // checked "is a present open?" before sending lets a commit begin just
+    // before beginPresent and still be in flight inside it.
+    {
+        resetForTests();
+        std::atomic<bool> stop{false};
+        std::atomic<int> inSend{0};
+        std::atomic<int> violations{0};
+        std::atomic<uint64_t> commits{0};
+
+        std::vector<std::thread> committers;
+        for (int i = 0; i < 4; ++i)
+        {
+            committers.emplace_back([&] {
+                while (!stop.load())
+                {
+                    CommitScope scope(SURFACE);
+                    inSend.fetch_add(1);
+                    std::this_thread::yield();
+                    inSend.fetch_sub(1);
+                    commits.fetch_add(1);
+                }
+            });
+        }
+
+        for (int i = 0; i < 3000; ++i)
+        {
+            beginPresent(SURFACE);
+            if (inSend.load() != 0)
+                violations.fetch_add(1);
+            std::this_thread::yield();
+            if (inSend.load() != 0)
+                violations.fetch_add(1);
+            endPresent(SURFACE);
+            std::this_thread::yield();
+        }
+        stop.store(true);
+        for (auto& t : committers)
+            t.join();
+
+        CHECK(violations.load() == 0);
+        CHECK(commits.load() > 0);
+        CHECK(!anyPresentOpen());
     }
 
     if (failures)

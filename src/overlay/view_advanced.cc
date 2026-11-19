@@ -7,32 +7,11 @@
 #include <algorithm>
 #include <cstdio>
 #include <sstream>
-#include <atomic>
 
 #include "vendor/imgui/imgui.h"
 
 namespace VkHook
 {
-    // Dirty flag for deferred saving — avoids blocking the UI thread with
-    // synchronous disk I/O on every single checkbox/radio/combo change.
-    // The actual save happens once per frame in renderAdvancedView().
-    static std::atomic<bool> g_settingsDirty{false};
-    
-    // Mark settings as needing save (call from UI callbacks)
-    static inline void markSettingsDirty()
-    {
-        g_settingsDirty.store(true, std::memory_order_relaxed);
-    }
-    
-    // Perform deferred save if dirty (call once per frame)
-    static inline void flushSettingsSaveIfNeeded()
-    {
-        if (g_settingsDirty.exchange(false, std::memory_order_acq_rel))
-        {
-            settingsManager.save();
-        }
-    }
-
     // window-sized first (exact or titlebar-inset), then the swapchain-linked
     // candidate; the busiest buffer can be the wrong size
     static VkImageView defaultPinCandidateForSwapchain(const DepthInfo& info)
@@ -323,12 +302,11 @@ namespace VkHook
         const float d = ImGui::GetFontSize() / 16.0f;
         ImGui::SeparatorText("Depth buffer");
         // Capture hooks are armed at startup, so this setting requires a restart.
-        static const bool s_depthCaptureAtStartup = settingsManager.getDepthCapture();
-        bool depthCapture = settingsManager.getDepthCapture();
+                bool depthCapture = settingsManager.getDepthCapture();
         if (ImGui::Checkbox("Capture depth buffer (requires restart)", &depthCapture))
         {
             settingsManager.setDepthCapture(depthCapture);
-            markSettingsDirty();
+            settingsDirty = true;
             Logger::info(std::string("depth capture ") + (depthCapture ? "enabled" : "disabled") +
                          " (saved; takes effect on restart)");
             pushToast(LogLevel::Info, depthCapture
@@ -336,7 +314,7 @@ namespace VkHook
                 : "Depth buffer capture off. Restart to apply.");
         }
         ImGui::TextDisabled("%s", describeActiveDepth(depthInfo).c_str());
-        if (depthCapture != s_depthCaptureAtStartup)
+        if (depthCapture != depthCaptureAtStartup)
         {
             ImGui::TextDisabled("Requires restart");
         }
@@ -402,7 +380,7 @@ namespace VkHook
             {
                 settingsManager.setDepthSourceChannel(kChannels[index]);
                 depthTransformPending = true;
-                markSettingsDirty();
+                settingsDirty = true;
             }
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("%s", hints[index]);
@@ -446,7 +424,7 @@ namespace VkHook
             if (changed)
             {
                 depthTransformPending = true;
-                markSettingsDirty();
+                settingsDirty = true;
             }
         }
 
@@ -467,7 +445,7 @@ namespace VkHook
             if (ImGui::Combo("##depth_rebuild_mode", &index, labels, 2))
             {
                 settingsManager.setDepthRebuildMode(index);
-                markSettingsDirty();
+                settingsDirty = true;
             }
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("%s", hints[index]);
@@ -489,7 +467,7 @@ namespace VkHook
             ImGui::SetTooltip("Clear the active buffer, the best candidate and any pin.\nThe layer re-evaluates every render pass next frame.");
 
         // --- Deferred save ---
-        flushSettingsSaveIfNeeded();
+        flushSettingsSave();
     }
 
     // --- Pushed page: every tracked depth buffer -------------------------------
@@ -534,7 +512,7 @@ namespace VkHook
         if (depthInfo.candidates.empty())
         {
             UI::TextSupport("No depth views tracked yet. Render a frame with depth.");
-            flushSettingsSaveIfNeeded();
+            flushSettingsSave();
             return;
         }
 
@@ -552,7 +530,7 @@ namespace VkHook
         }
         ImGui::EndChild();
 
-        flushSettingsSaveIfNeeded();
+        flushSettingsSave();
     }
 
 } // namespace VkHook

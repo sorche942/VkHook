@@ -1,8 +1,8 @@
 #include "imgui_overlay.hh"
+#include "persist.hh"
 #include "effects/effect_registry.hh"
 #include "settings_manager.hh"
 #include "config_serializer.hh"
-#include "async_writer.hh"
 #include "params/field_editor.hh"
 #include "logger.hh"
 #include "overlay/ui_theme.hh"
@@ -84,25 +84,27 @@ namespace VkHook
             return changed;
         }
 
-        // Fallback picker when the xdg portal is unavailable; mirrors the
-        // Shaders tab. only displayed while the main view is the active tab.
-        ImGui::FileBrowser presetBrowser(ImGuiFileBrowserFlags_CloseOnEsc);
-
     } // anonymous namespace
 
     // keyboard is part of the shared view signature; this particular view reads no
     // key state directly, so the name is omitted here.
     void ImGuiOverlay::renderMainView(const KeyboardState& /* keyboard */)
     {
+        // Fallback picker when the xdg portal is unavailable; mirrors the
+        // Shaders tab. only displayed while the main view is the active tab.
+        if (!presetBrowser)
+            presetBrowser = std::make_shared<ImGui::FileBrowser>(ImGuiFileBrowserFlags_CloseOnEsc);
+        ImGui::FileBrowser& browser = *presetBrowser;
+
         if (!effectRegistry)
             return;
 
         auto openPresetBrowser = [&]() {
-            presetBrowser.SetTitle("Import ReShade preset");
-            presetBrowser.SetTypeFilters({".ini"});
+            browser.SetTitle("Import ReShade preset");
+            browser.SetTypeFilters({".ini"});
             const char* home = std::getenv("HOME");
-            presetBrowser.SetPwd(home ? home : "/");
-            presetBrowser.Open();
+            browser.SetPwd(home ? home : "/");
+            browser.Open();
         };
 
         // Harvest a completed portal import. a request started from another tab
@@ -198,9 +200,6 @@ namespace VkHook
             }
             if (ImGui::Button("New preset"))
                 ImGui::OpenPopup("New shader preset");
-            static std::string deleteProfileTarget;
-            static std::string renameProfileTarget;
-            static char renameShaderProfileName[64] = "";
             if (!activeShaderProfileName.empty())
             {
                 ImGui::SameLine();
@@ -247,13 +246,13 @@ namespace VkHook
                             // run the rename on the writer thread so a queued
                             // save can't race the files, then update the UI's
                             // name/path only after it has landed
-                            auto renamed = std::make_shared<std::atomic<bool>>(false);
-                            AsyncWriter::instance().submit([game = activeGameName, oldName, newName, renamed]() {
-                                renamed->store(ConfigSerializer::renameShaderProfile(game, oldName, newName),
-                                               std::memory_order_relaxed);
-                            });
-                            AsyncWriter::instance().waitForIdle();
-                            if (renamed->load(std::memory_order_relaxed))
+                            const bool renamed = PersistenceQueue::instance().rename(
+                                ConfigSerializer::getShaderProfilePath(activeGameName, oldName),
+                                ConfigSerializer::getRenamedShaderProfilePath(activeGameName, oldName, newName),
+                                [game = activeGameName, oldName, newName]() {
+                                    return ConfigSerializer::renameShaderProfile(game, oldName, newName);
+                                }).get();
+                            if (renamed)
                             {
                                 if (activeShaderProfileName == oldName)
                                     setActiveShaderProfile(newName);
@@ -296,7 +295,13 @@ namespace VkHook
                         action = 1;
                     if (action == 1)
                     {
-                        if (!ConfigSerializer::deleteShaderProfile(activeGameName, deleteProfileTarget))
+                        // queued behind any pending autosave of this preset, which the
+                        // queue cancels, so the file cannot come back after the delete
+                        if (!PersistenceQueue::instance().remove(
+                                ConfigSerializer::getShaderProfilePath(activeGameName, deleteProfileTarget),
+                                [game = activeGameName, target = deleteProfileTarget]() {
+                                    return ConfigSerializer::deleteShaderProfile(game, target);
+                                }).get())
                             pushToast(LogLevel::Error, "Could not delete the shader profile.");
                         else
                         {
@@ -329,7 +334,7 @@ namespace VkHook
                 }
             }
             ImGui::SameLine();
-            ImGui::BeginDisabled(fileDialogPending() || presetBrowser.IsOpened());
+            ImGui::BeginDisabled(fileDialogPending() || browser.IsOpened());
             if (ImGui::Button("Import preset"))
             {
                 if (!settingsManager.getUsePortalIntegration()
@@ -339,7 +344,6 @@ namespace VkHook
             ImGui::EndDisabled();
             if (ImGui::BeginPopupModal("New shader preset", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
             {
-                static char newShaderProfileName[64] = "";
                 ImGui::TextDisabled("Name");
                 ImGui::SetNextItemWidth(ImGui::GetFontSize() * 20.0f);
                 ImGui::InputText("##newshaderprofilename", newShaderProfileName, sizeof(newShaderProfileName));
@@ -357,8 +361,12 @@ namespace VkHook
                 {
                     if (!autoSaveProfile(true))
                         pushToast(LogLevel::Error, "Could not save the active shader profile.");
-                    else if (ConfigSerializer::createShaderProfile(activeGameName, newShaderProfileName,
-                                                                   activeShaderProfileName))
+                    else if (PersistenceQueue::instance().create(
+                                 ConfigSerializer::getGameShaderProfilePath(activeGameName, newShaderProfileName),
+                                 [game = activeGameName, name = std::string(newShaderProfileName),
+                                  from = activeShaderProfileName]() {
+                                     return ConfigSerializer::createShaderProfile(game, name, from);
+                                 }).get())
                     {
                         switchShaderProfile(newShaderProfileName);
                         refreshShaderProfiles();
@@ -430,7 +438,6 @@ namespace VkHook
             ImGui::EndPopup();
         }
 
-        static std::string paramsActiveEffect;
         bool selectParamsTab = false;
         bool chainChanged = false;
         std::string removeEffect;
@@ -498,8 +505,7 @@ namespace VkHook
                 if (ImGui::MenuItem("Reset to defaults"))
                 {
                     for (auto* param : effectRegistry->getParametersForEffect(effectName))
-                        if (FieldEditor* editor = FieldEditorFactory::instance().getEditor(param->getType()))
-                            editor->resetToDefault(*param);
+                        param->resetToDefault();
                     paramsDirty = true;
                     profileDirty = true;
                     lastChangeTime = std::chrono::steady_clock::now();
@@ -593,17 +599,30 @@ namespace VkHook
         // Note: Auto-apply is handled globally in imgui_overlay.cpp
 
         // The fallback picker is modal and must be displayed every frame.
-        presetBrowser.Display();
-        if (presetBrowser.HasSelected())
+        browser.Display();
+        if (browser.HasSelected())
         {
-            importShaderPreset(presetBrowser.GetSelected().string());
-            presetBrowser.ClearSelected();
+            importShaderPreset(browser.GetSelected().string());
+            browser.ClearSelected();
         }
     }
 
     void ImGuiOverlay::importShaderPreset(const std::string& sourcePath)
     {
-        const std::string imported = ConfigSerializer::importShaderProfile(sourcePath);
+        // the import picks a free name inside the job, so the queue is told
+        // about the created file from there
+        const std::string imported = [&] {
+            std::string name;
+            PersistenceQueue::instance().submit({PersistenceQueue::Kind::Other, "import:" + sourcePath, {},
+                [&name, sourcePath]() {
+                    name = ConfigSerializer::importShaderProfile(sourcePath);
+                    if (name.empty())
+                        return false;
+                    PersistenceQueue::instance().noteCreated(ConfigSerializer::getImportedShaderProfilePath(name));
+                    return true;
+                }}).get();
+            return name;
+        }();
         if (imported.empty())
         {
             pushToast(LogLevel::Error, "Could not import the shader preset.");

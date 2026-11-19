@@ -1,22 +1,31 @@
 #include "logger.hh"
 
-#include <cstdlib>
-#include <filesystem>
-#include <chrono>
-#include <ctime>
-#include <iomanip>
+#include "paths.hh"
 
-#include <sstream>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <ctime>
+#include <filesystem>
+#include <new>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 namespace VkHook
 {
-    Logger Logger::s_instance;
-
-    Logger::Logger() : minLevel(getMinLogLevel())
+    Logger& Logger::instance()
     {
-        if (minLevel != LogLevel::None)
+        // Leaked on purpose; see the class comment. Function-local so the first
+        // user, whichever static initialiser that is, constructs it.
+        static Logger* logger = new Logger();
+        return *logger;
+    }
+
+    Logger::Logger() : minLevel(static_cast<uint32_t>(getMinLogLevel()))
+    {
+        if (static_cast<LogLevel>(minLevel.load()) != LogLevel::None)
         {
-            std::string filename = getFileName();
+            const std::string filename = Paths::logFile();
             if (filename == "stderr")
             {
                 outStream = {&std::cerr, {false}};
@@ -51,120 +60,56 @@ namespace VkHook
         }
     }
 
-    Logger::~Logger()
+    void Logger::emit(LogLevel level, std::string_view message)
     {
-    }
-
-    void Logger::trace(const std::string& message)
-    {
-        s_instance.emitMsg(LogLevel::Trace, message);
-    }
-
-    void Logger::debug(const std::string& message)
-    {
-        s_instance.emitMsg(LogLevel::Debug, message);
-    }
-
-    void Logger::info(const std::string& message)
-    {
-        s_instance.emitMsg(LogLevel::Info, message);
-    }
-
-    void Logger::warn(const std::string& message)
-    {
-        s_instance.emitMsg(LogLevel::Warn, message);
-    }
-
-    void Logger::err(const std::string& message)
-    {
-        s_instance.emitMsg(LogLevel::Error, message);
-    }
-
-    void Logger::log(LogLevel level, const std::string& message)
-    {
-        s_instance.emitMsg(level, message);
-    }
-
-    void Logger::emitMsg(LogLevel level, const std::string& message)
-    {
-        // Early-out before taking lock if nothing to do
-        if (level < minLevel && !historyEnabled)
+        if (!outStream || level == LogLevel::None)
             return;
 
-        std::lock_guard<std::mutex> lock(mutex);
+        static constexpr std::array<const char*, 5> prefixes = {
+            {"VkHook trace: ", "VkHook debug: ", "VkHook info:  ", "VkHook warn:  ", "VkHook err:   "}};
+        const char* prefix = prefixes.at(static_cast<uint32_t>(level));
 
-        // Store in history only if enabled (to save memory when debug window is off)
-        if (historyEnabled)
+        const auto now = std::chrono::system_clock::now();
+        const auto time = std::chrono::system_clock::to_time_t(now);
+        const auto milliseconds =
+            std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count() % 1000;
+        std::tm localTime{};
+        localtime_r(&time, &localTime);
+
+        char stamp[48];
+        const size_t stampLength = std::strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", &localTime);
+
+        static thread_local const long tid = static_cast<long>(syscall(SYS_gettid));
+        char origin[64];
+        std::snprintf(origin, sizeof(origin), ".%03d [%d:%ld] ", static_cast<int>(milliseconds),
+                      static_cast<int>(getpid()), tid);
+
+        // one string per message, one write under the lock: lines from
+        // different threads never interleave
+        std::string text;
+        text.reserve(message.size() + 96);
+        size_t begin = 0;
+        while (begin <= message.size())
         {
-            history.push_back({level, message});
-            if (history.size() > MAX_HISTORY_SIZE)
-                history.pop_front();
-            ++historyVersionCounter;
-        }
-
-        if (level >= minLevel)
-        {
-            static std::array<const char*, 5> s_prefixes = {
-                {"VkHook trace: ", "VkHook debug: ", "VkHook info:  ", "VkHook warn:  ", "VkHook err:   "}};
-
-            const char* prefix = s_prefixes.at(static_cast<uint32_t>(level));
-
-            const auto now = std::chrono::system_clock::now();
-            const auto time = std::chrono::system_clock::to_time_t(now);
-            const auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count() % 1000;
-            std::tm localTime{};
-            localtime_r(&time, &localTime);
-
-            std::stringstream stream(message);
-            std::string       line;
-
-            while (std::getline(stream, line, '\n'))
+            size_t end = message.find('\n', begin);
+            if (end == std::string_view::npos)
+                end = message.size();
+            if (end > begin || begin == 0)
             {
-                *outStream << std::put_time(&localTime, "%Y-%m-%d %H:%M:%S")
-                             << '.' << std::setfill('0') << std::setw(3) << milliseconds
-                             << ' ' << prefix << line << '\n';
+                text.append(stamp, stampLength).append(origin).append(prefix);
+                text.append(message.substr(begin, end - begin)).push_back('\n');
             }
-            outStream->flush();
+            begin = end + 1;
         }
-    }
 
-    std::vector<LogEntry> Logger::getHistory()
-    {
-        std::lock_guard<std::mutex> lock(s_instance.mutex);
-        return std::vector<LogEntry>(s_instance.history.begin(), s_instance.history.end());
-    }
-
-    uint64_t Logger::historyVersion()
-    {
-        std::lock_guard<std::mutex> lock(s_instance.mutex);
-        return s_instance.historyVersionCounter;
-    }
-
-    void Logger::clearHistory()
-    {
-        std::lock_guard<std::mutex> lock(s_instance.mutex);
-        s_instance.history.clear();
-        ++s_instance.historyVersionCounter;
-    }
-
-    void Logger::setHistoryEnabled(bool enabled)
-    {
-        std::lock_guard<std::mutex> lock(s_instance.mutex);
-        s_instance.historyEnabled = enabled;
-        if (!enabled)
-            s_instance.history.clear();  // Free memory when disabled
-        ++s_instance.historyVersionCounter;
-    }
-
-    bool Logger::isHistoryEnabled()
-    {
-        std::lock_guard<std::mutex> lock(s_instance.mutex);
-        return s_instance.historyEnabled;
+        std::lock_guard<std::mutex> lock(mutex);
+        outStream->write(text.data(), static_cast<std::streamsize>(text.size()));
+        outStream->flush();
     }
 
     const char* Logger::levelName(LogLevel level)
     {
-        static std::array<const char*, 5> names = {{"TRACE", "DEBUG", "INFO", "WARN", "ERROR"}};
+        static constexpr std::array<const char*, 5> names = {{"TRACE", "DEBUG", "INFO", "WARN", "ERROR"}};
         uint32_t idx = static_cast<uint32_t>(level);
         if (idx < names.size())
             return names[idx];
@@ -182,9 +127,7 @@ namespace VkHook
             {"none", LogLevel::None},
         }};
 
-        const char* envVar = getenv("VKHOOK_LOG_LEVEL");
-
-        const std::string logLevelStr = envVar ? envVar : "";
+        const std::string logLevelStr = Paths::env("VKHOOK_LOG_LEVEL");
 
         for (const auto& [name, level] : logLevels)
         {
@@ -193,27 +136,6 @@ namespace VkHook
         }
 
         return LogLevel::Info;
-    }
-
-    std::string Logger::getFileName()
-    {
-        const char* envVar = getenv("VKHOOK_LOG_FILE");
-
-        std::string filename = envVar ? envVar : "";
-
-        if (filename.empty())
-        {
-            const char* configHome = getenv("XDG_CONFIG_HOME");
-            const char* home = getenv("HOME");
-            if (configHome && *configHome)
-                filename = std::string(configHome) + "/VkHook/vkhook.log";
-            else if (home && *home)
-                filename = std::string(home) + "/.config/VkHook/vkhook.log";
-            else
-                filename = "stderr";
-        }
-
-        return filename;
     }
 
 } // namespace VkHook

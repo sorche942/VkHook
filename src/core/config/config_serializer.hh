@@ -149,16 +149,17 @@ namespace VkHook
         static std::string getDefaultConfig();
         static std::string getDefaultConfigPath();
 
-        // Global settings management (VkHook.conf)
+        // Global settings management (VkHook.conf). saveSettings is a
+        // read-modify-write: it rewrites the keys VkHook owns, appends the ones
+        // the file lacks and leaves everything else (unknown keys, comments,
+        // ordering) as the user wrote it. Callers off the main thread go through
+        // SettingsManager::save, which queues it on the PersistenceQueue.
         static VkBasaltSettings loadSettings();
         static bool saveSettings(const VkBasaltSettings& settings);
 
-        // Shader Manager config (shader_manager.conf)
+        // Shader Manager config (shader_manager.conf). Loading never writes.
         static ShaderManagerConfig loadShaderManagerConfig();
         static bool saveShaderManagerConfig(const ShaderManagerConfig& config);
-
-        // Ensure VkHook.conf exists with defaults (call early at startup)
-        static void ensureConfigExists();
 
         // Write the running layer version to <config>/version. Keeps the config
         // dir identifiable when the setup script did not seed it, and refreshes
@@ -196,6 +197,15 @@ namespace VkHook
         // never reads it, so the .ini stays cross-compatible.
         static std::string getShaderProfileSidecarPath(const std::string& path);
 
+        // Path createShaderProfile would write for this game and name; unlike
+        // getShaderProfilePath it never resolves to an imported global preset.
+        static std::string getGameShaderProfilePath(const std::string& gameName, const std::string& profileName);
+
+        // Where renameShaderProfile moves a preset: the same kind (game-specific
+        // or imported global), under the new name. Empty when oldName is unknown.
+        static std::string getRenamedShaderProfilePath(const std::string& gameName, const std::string& oldName,
+                                                       const std::string& newName);
+
         static std::vector<std::string> listShaderProfilesForGame(const std::string& gameName);
         static bool setLastShaderProfile(const std::string& gameName, const std::string& profileName);
         static std::string getLastShaderProfile(const std::string& gameName);
@@ -218,6 +228,8 @@ namespace VkHook
         // (game-agnostic) <name>.ini. never overwrites: an existing name gets a
         // numeric suffix. returns the imported profile name, or empty on failure.
         static std::string importShaderProfile(const std::string& sourcePath);
+        // Path importShaderProfile writes for an imported preset called `name`
+        static std::string getImportedShaderProfilePath(const std::string& name);
         static bool saveShaderProfile(const std::string& path, const std::vector<ConfigParam>& params,
                                       const std::vector<std::string>& effects = {},
                                       const std::vector<std::string>& disabledEffects = {},

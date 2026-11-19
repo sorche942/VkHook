@@ -1,71 +1,48 @@
 #include "config.hh"
-#include "config_paths.hh"
 
-#include <sstream>
-#include <locale>
-#include <array>
+#include "ini.hh"
+#include "logger.hh"
+#include "paths.hh"
+#include "util.hh"
+
+#include <charconv>
+#include <climits>
 
 namespace VkHook
 {
     Config::Config()
     {
-        // Find VkHook.conf in standard locations
-        const char* homeEnv = std::getenv("HOME");
-        std::string homePath = homeEnv ? homeEnv : "/tmp";
-
-        const char* tmpHomeEnv     = std::getenv("XDG_DATA_HOME");
-        std::string userConfigFile = tmpHomeEnv ? std::string(tmpHomeEnv) + "/VkHook/VkHook.conf"
-                                                : homePath + "/.local/share/VkHook/VkHook.conf";
-
-        const char* tmpConfigEnv      = std::getenv("XDG_CONFIG_HOME");
-        std::string userXdgConfigFile = tmpConfigEnv ? std::string(tmpConfigEnv) + "/VkHook/VkHook.conf"
-                                                     : homePath + "/.config/VkHook/VkHook.conf";
-
-        const std::array<std::string, 5> configPaths = {
-            userXdgConfigFile,
-            userConfigFile,
-            std::string(SYSCONFDIR) + "/VkHook.conf",
-            std::string(SYSCONFDIR) + "/VkHook/VkHook.conf",
-            std::string(DATADIR) + "/VkHook/VkHook.conf",
-        };
-
-        for (const auto& path : configPaths)
+        const std::string path = Paths::findSettingsFile();
+        if (path.empty())
         {
-            std::ifstream file(path);
-            if (file.good())
-            {
-                Logger::info("base config: " + path);
-                configFilePath = path;
-                readConfigFile(file);
-                updateLastModifiedTime();
-                return;
-            }
+            Logger::err("no VkHook.conf found");
+            return;
         }
-
-        Logger::err("no VkHook.conf found");
+        Logger::info("base config: " + path);
+        load(path);
     }
 
     Config::Config(const std::string& path)
     {
-        std::ifstream file(path);
-        if (!file.good())
+        if (!load(path))
         {
             Logger::err("failed to load config: " + path);
             return;
         }
-
         Logger::info("config: " + path);
-        configFilePath = path;
-        readConfigFile(file);
-        updateLastModifiedTime();
     }
 
-    Config::Config(const Config& other)
+    bool Config::load(const std::string& path)
     {
-        this->options          = other.options;
-        this->overrides        = other.overrides;
-        this->configFilePath   = other.configFilePath;
-        this->lastModifiedTime = other.lastModifiedTime;
+        std::vector<std::pair<std::string, std::string>> entries;
+        if (!Ini::readFile(path, entries))
+            return false;
+        configFilePath = path;
+        options.clear();
+        for (auto& [key, value] : entries)
+            options[std::move(key)] = std::move(value);
+        updateLastModifiedTime();
+        return true;
     }
 
     void Config::updateLastModifiedTime()
@@ -75,12 +52,21 @@ namespace VkHook
 
         struct stat fileStat;
         if (stat(configFilePath.c_str(), &fileStat) == 0)
-            lastModifiedTime = fileStat.st_mtime;
+            lastModified = fileStat.st_mtim;
+    }
+
+    const std::string* Config::findLocal(const std::string& option) const
+    {
+        if (auto it = overrides.find(option); it != overrides.end())
+            return &it->second;
+        if (auto it = options.find(option); it != options.end())
+            return &it->second;
+        return nullptr;
     }
 
     bool Config::hasOptionKey(const std::string& option) const
     {
-        if (overrides.find(option) != overrides.end() || options.find(option) != options.end())
+        if (findLocal(option))
             return true;
         return fallback ? fallback->hasOptionKey(option) : false;
     }
@@ -91,7 +77,6 @@ namespace VkHook
             return false;
 
         // Throttle stat() syscall to every 500ms instead of every frame.
-        // At 240 FPS this avoids ~479 syscalls/sec.
         auto now = std::chrono::steady_clock::now();
         if (std::chrono::duration_cast<std::chrono::milliseconds>(now - lastConfigCheckTime).count() < 500)
             return false;
@@ -101,7 +86,15 @@ namespace VkHook
         if (stat(configFilePath.c_str(), &fileStat) != 0)
             return false;
 
-        return fileStat.st_mtime != lastModifiedTime;
+        if (fileStat.st_mtim.tv_sec == lastModified.tv_sec && fileStat.st_mtim.tv_nsec == lastModified.tv_nsec)
+            return false;
+
+        if (isOwnWrite(configFilePath))
+        {
+            lastModified = fileStat.st_mtim;
+            return false;
+        }
+        return true;
     }
 
     void Config::reload()
@@ -109,158 +102,83 @@ namespace VkHook
         if (configFilePath.empty())
             return;
 
-        std::ifstream file(configFilePath);
-        if (!file.good())
+        // Parse into a scratch map first so a failed read keeps what we have
+        std::vector<std::pair<std::string, std::string>> entries;
+        if (!Ini::readFile(configFilePath, entries))
         {
             Logger::err("failed to reload config: " + configFilePath);
             return;
         }
 
-        // Read into temporary map first, then swap — avoids data loss if read fails partway
         Logger::info("reloading config: " + configFilePath);
-        auto oldOptions = std::move(options);
-        options.clear();
-        readConfigFile(file);
-
-        if (options.empty() && !oldOptions.empty())
+        if (entries.empty() && !options.empty())
         {
-            Logger::warn("config reload produced empty options, restoring previous");
-            options = std::move(oldOptions);
+            Logger::warn("config reload produced empty options, keeping previous");
+            updateLastModifiedTime();
             return;
         }
 
+        options.clear();
+        for (auto& [key, value] : entries)
+            options[std::move(key)] = std::move(value);
         updateLastModifiedTime();
     }
 
-    void Config::readConfigFile(std::ifstream& stream)
+    void Config::parseValue(const std::string& text, int32_t& result, const std::string& option)
     {
-        std::string line;
-        while (std::getline(stream, line))
-            readConfigLine(line);
+        const std::string value = Ini::trim(text);
+        int32_t parsed = 0;
+        const char* end = value.data() + value.size();
+        auto [ptr, ec] = std::from_chars(value.data(), end, parsed);
+        if (ec == std::errc() && ptr == end)
+            result = parsed;
+        else
+            Logger::warn("invalid int32_t value for: " + option);
     }
 
-    void Config::readConfigLine(std::string line)
+    void Config::parseValue(const std::string& text, uint32_t& result, const std::string& option)
     {
-        std::string key;
-        std::string value;
-        bool inQuotes    = false;
-        bool foundEquals = false;
-
-        auto appendChar = [&key, &value, &foundEquals](const char& c) {
-            if (foundEquals)
-                value += c;
-            else
-                key += c;
-        };
-
-        for (const char& c : line)
-        {
-            if (inQuotes)
-            {
-                if (c == '"')
-                    inQuotes = false;
-                else
-                    appendChar(c);
-                continue;
-            }
-            switch (c)
-            {
-                case '#': goto DONE;
-                case '"': inQuotes = true; break;
-                case '\t':
-                case ' ': break;
-                case '=': foundEquals = true; break;
-                default: appendChar(c); break;
-            }
-        }
-
-    DONE:
-        const bool allowEmptyValue = (key == "effects" || key == "disabledEffects");
-        if (!key.empty() && (allowEmptyValue || !value.empty()))
-        {
-            Logger::info(key + " = " + value);
-            options[key] = value;
-        }
+        const std::string value = Ini::trim(text);
+        uint32_t parsed = 0;
+        const char* end = value.data() + value.size();
+        auto [ptr, ec] = std::from_chars(value.data(), end, parsed);
+        if (ec == std::errc() && ptr == end)
+            result = parsed;
+        else
+            Logger::warn("invalid uint32_t value for: " + option);
     }
 
-    void Config::parseOption(const std::string& option, int32_t& result)
+    void Config::parseValue(const std::string& text, float& result, const std::string& option)
     {
-        auto found = options.find(option);
-        if (found != options.end())
-        {
-            try { result = std::stoi(found->second); }
-            catch (...) { Logger::warn("invalid int32_t value for: " + option); }
-        }
+        std::string value = Ini::trim(text);
+        // ReShade-style literals carry an optional 'f' suffix
+        if (!value.empty() && (value.back() == 'f' || value.back() == 'F'))
+            value.pop_back();
+        float parsed = 0.0f;
+        const char* end = value.data() + value.size();
+        auto [ptr, ec] = std::from_chars(value.data(), end, parsed);
+        if (ec == std::errc() && ptr == end)
+            result = parsed;
+        else
+            Logger::warn("invalid float value for: " + option);
     }
 
-    void Config::parseOption(const std::string& option, uint32_t& result)
+    void Config::parseValue(const std::string& text, bool& result, const std::string& option)
     {
-        auto found = options.find(option);
-        if (found != options.end())
-        {
-            try { result = static_cast<uint32_t>(std::stoul(found->second)); }
-            catch (...) { Logger::warn("invalid uint32_t value for: " + option); }
-        }
+        if (const auto parsed = Ini::parseBool(text))
+            result = *parsed;
+        else
+            Logger::warn("invalid bool value for: " + option);
     }
 
-    void Config::parseOption(const std::string& option, float& result)
+    void Config::parseValue(const std::string& text, std::string& result, const std::string&)
     {
-        auto found = options.find(option);
-        if (found != options.end())
-        {
-            std::stringstream ss(found->second);
-            ss.imbue(std::locale("C"));
-            float value;
-            ss >> value;
-
-            if (ss.fail())
-            {
-                Logger::warn("invalid float value for: " + option);
-                return;
-            }
-
-            // Check for trailing content (allow optional 'f' suffix)
-            std::string rest;
-            ss >> rest;
-            if (!rest.empty() && rest != "f")
-                Logger::warn("invalid float value for: " + option);
-            else
-                result = value;
-        }
+        result = text;
     }
 
-    void Config::parseOption(const std::string& option, bool& result)
+    void Config::parseValue(const std::string& text, std::vector<std::string>& result, const std::string&)
     {
-        auto found = options.find(option);
-        if (found != options.end())
-        {
-            if (found->second == "True" || found->second == "true" || found->second == "1")
-                result = true;
-            else if (found->second == "False" || found->second == "false" || found->second == "0")
-                result = false;
-            else
-                Logger::warn("invalid bool value for: " + option);
-        }
-    }
-
-    void Config::parseOption(const std::string& option, std::string& result)
-    {
-        auto found = options.find(option);
-        if (found != options.end())
-            result = found->second;
-    }
-
-    void Config::parseOption(const std::string& option, std::vector<std::string>& result)
-    {
-        auto found = options.find(option);
-        if (found != options.end())
-        {
-            result = {};
-            std::stringstream ss(found->second);
-            std::string item;
-            while (std::getline(ss, item, ':'))
-                result.push_back(item);
-        }
+        result = Ini::splitList(text, ':');
     }
 
     void Config::setOverride(const std::string& option, const std::string& value)
@@ -271,54 +189,6 @@ namespace VkHook
     void Config::clearOverrides()
     {
         overrides.clear();
-    }
-
-    void Config::parseOverride(const std::string& value, int32_t& result)
-    {
-        try { result = std::stoi(value); }
-        catch (...) { Logger::warn("invalid int32_t override value"); }
-    }
-
-    void Config::parseOverride(const std::string& value, uint32_t& result)
-    {
-        try { result = static_cast<uint32_t>(std::stoul(value)); }
-        catch (...) { Logger::warn("invalid uint32_t override value"); }
-    }
-
-    void Config::parseOverride(const std::string& value, float& result)
-    {
-        std::stringstream ss(value);
-        ss.imbue(std::locale("C"));
-        float parsed;
-        ss >> parsed;
-        if (!ss.fail())
-            result = parsed;
-        else
-            Logger::warn("invalid float override value");
-    }
-
-    void Config::parseOverride(const std::string& value, bool& result)
-    {
-        if (value == "True" || value == "true" || value == "1")
-            result = true;
-        else if (value == "False" || value == "false" || value == "0")
-            result = false;
-        else
-            Logger::warn("invalid bool override value");
-    }
-
-    void Config::parseOverride(const std::string& value, std::string& result)
-    {
-        result = value;
-    }
-
-    void Config::parseOverride(const std::string& value, std::vector<std::string>& result)
-    {
-        result = {};
-        std::stringstream ss(value);
-        std::string item;
-        while (std::getline(ss, item, ':'))
-            result.push_back(item);
     }
 
     std::unordered_map<std::string, std::string> Config::getEffectDefinitions() const
